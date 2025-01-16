@@ -25,16 +25,14 @@ import (
 	"flag"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
+	"gvisor.dev/gvisor/pkg/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
-	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/link/tun"
 	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -44,7 +42,7 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-var tap = flag.Bool("tap", false, "use tap istead of tun")
+var tap = flag.Bool("tap", false, "use tap instead of tun")
 var mac = flag.String("mac", "aa:00:01:01:01:01", "mac address to use in tap device")
 
 type endpointWriter struct {
@@ -87,13 +85,17 @@ func echo(wq *waiter.Queue, ep tcpip.Endpoint) {
 	}
 
 	for {
-		_, err := ep.Read(&w, tcpip.ReadOptions{})
-		if err != nil {
+		var buf bytes.Buffer
+		if _, err := ep.Read(&buf, tcpip.ReadOptions{}); err != nil {
 			if _, ok := err.(*tcpip.ErrWouldBlock); ok {
 				<-notifyCh
 				continue
 			}
 
+			return
+		}
+
+		if _, err := w.Write(buf.Bytes()); err != nil {
 			return
 		}
 	}
@@ -108,8 +110,6 @@ func main() {
 	tunName := flag.Arg(0)
 	addrName := flag.Arg(1)
 	portName := flag.Arg(2)
-
-	rand.Seed(time.Now().UnixNano())
 
 	// Parse the mac address.
 	maddr, err := net.ParseMAC(*mac)

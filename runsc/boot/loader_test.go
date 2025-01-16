@@ -41,8 +41,7 @@ import (
 
 func init() {
 	log.SetLevel(log.Debug)
-	rand.Seed(time.Now().UnixNano())
-	if err := fsgofer.OpenProcSelfFD(); err != nil {
+	if err := fsgofer.OpenProcSelfFD("/proc/self/fd"); err != nil {
 		panic(err)
 	}
 }
@@ -116,19 +115,20 @@ func createLoader(conf *config.Config, spec *specs.Spec) (*Loader, func(), error
 	sock := fmt.Sprintf("\x00loader-test.%010d", rand.Int())
 	fd, err := server.CreateSocket(sock)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("failed to create socket: %w", err)
 	}
 	sandEnd, cleanup, err := startGofer(spec.Root.Path, conf)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("failed to start gofer: %w", err)
 	}
 
 	// Loader takes ownership of stdio.
 	var stdio []int
 	for _, f := range []*os.File{os.Stdin, os.Stdout, os.Stderr} {
-		newFd, err := unix.Dup(int(f.Fd()))
+		fd := int(f.Fd())
+		newFd, err := unix.Dup(fd)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("failed to dup FD %d: %w", fd, err)
 		}
 		stdio = append(stdio, newFd)
 	}
@@ -139,15 +139,16 @@ func createLoader(conf *config.Config, spec *specs.Spec) (*Loader, func(), error
 		Conf:            conf,
 		ControllerFD:    fd,
 		GoferFDs:        []int{sandEnd},
+		DevGoferFD:      -1,
 		StdioFDs:        stdio,
-		OverlayMediums:  []OverlayMedium{NoOverlay},
+		GoferMountConfs: []GoferMountConf{{Lower: Lisafs, Upper: NoOverlay}},
 		PodInitConfigFD: -1,
 		ExecFD:          -1,
 	}
 	l, err := New(args)
 	if err != nil {
 		cleanup()
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("boot.New: %w", err)
 	}
 	return l, cleanup, nil
 }
@@ -244,7 +245,7 @@ func TestStartSignal(t *testing.T) {
 func TestHostnetWithRawSockets(t *testing.T) {
 	// Drop CAP_NET_RAW from effective capabilities, if we have it.
 	pid := os.Getpid()
-	caps, err := capability.NewPid2(os.Getpid())
+	caps, err := capability.NewPid2(0)
 	if err != nil {
 		t.Fatalf("error getting capabilities for pid %d: %v", pid, err)
 	}
@@ -272,9 +273,12 @@ func TestHostnetWithRawSockets(t *testing.T) {
 
 	// Creating loader should fail.
 	l, err := New(Args{
-		ID:   "should-fail",
-		Spec: testSpec(),
-		Conf: conf,
+		ID:              "should-fail",
+		Spec:            testSpec(),
+		Conf:            conf,
+		DevGoferFD:      -1,
+		PodInitConfigFD: -1,
+		ExecFD:          -1,
 	})
 	if err == nil {
 		l.Destroy()
@@ -475,14 +479,12 @@ func TestCreateMountNamespace(t *testing.T) {
 			defer l.Destroy()
 			defer loaderCleanup()
 
-			if err := l.processHints(l.root.conf, l.root.procArgs.Credentials); err != nil {
-				t.Fatalf("failed process hints: %v", err)
-			}
+			l.mu.Lock()
+			defer l.mu.Unlock()
 			mntr := newContainerMounter(&l.root, l.k, l.mountHints, l.sharedMounts, "", l.sandboxID)
-
 			ctx := l.k.SupervisorContext()
 			creds := auth.NewRootCredentials(l.root.procArgs.Credentials.UserNamespace)
-			mns, err := mntr.mountAll(ctx, creds, l.root.conf, &l.root.procArgs)
+			mns, err := mntr.mountAll(ctx, creds, l.root.spec, l.root.conf, &l.root.procArgs)
 			if err != nil {
 				t.Fatalf("mountAll: %v", err)
 			}

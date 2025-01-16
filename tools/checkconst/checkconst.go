@@ -25,7 +25,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
-	"io/ioutil"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -141,6 +141,7 @@ func extractFacts(pass *analysis.Pass) {
 
 	// Accumulate all facts.
 	c.walkScope(pass, make([]string, 0, 128), pass.Pkg.Scope())
+
 	pass.ExportPackageFact(&c)
 }
 
@@ -260,7 +261,7 @@ func checkAssembly(pass *analysis.Pass) error {
 		if !strings.HasSuffix(filename, ".s") {
 			continue
 		}
-		content, err := ioutil.ReadFile(filename)
+		content, err := os.ReadFile(filename)
 		if err != nil {
 			return fmt.Errorf("unable to read assembly file: %w", err)
 		}

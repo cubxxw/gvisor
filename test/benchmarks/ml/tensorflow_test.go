@@ -21,6 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/test/benchmarks/harness"
 	"gvisor.dev/gvisor/test/benchmarks/tools"
+	"gvisor.dev/gvisor/test/metricsviz"
 )
 
 func BenchmarkTensorflowDashboard(b *testing.B) {
@@ -36,7 +37,6 @@ func BenchmarkTensorflowDashboard(b *testing.B) {
 // See: https://github.com/aymericdamien/TensorFlow-Examples
 func BenchmarkTensorflow(b *testing.B) {
 	workloads := map[string]string{
-		"GradientDecisionTree": "2_BasicModels/gradient_boosted_decision_tree.py",
 		"Kmeans":               "2_BasicModels/kmeans.py",
 		"LogisticRegression":   "2_BasicModels/logistic_regression.py",
 		"NearestNeighbor":      "2_BasicModels/nearest_neighbor.py",
@@ -71,22 +71,27 @@ func doTensorflowTest(b *testing.B, workloads map[string]string) {
 			b.StopTimer()
 
 			for i := 0; i < b.N; i++ {
-				container := machine.GetContainer(ctx, b)
-				defer container.CleanUp(ctx)
-				if err := harness.DropCaches(machine); err != nil {
-					b.Skipf("failed to drop caches: %v. You probably need root.", err)
-				}
+				func() {
+					container := machine.GetContainer(ctx, b)
+					defer container.CleanUp(ctx)
+					if i == 0 {
+						defer metricsviz.FromContainerLogs(ctx, b, container)
+					}
+					if err := harness.DropCaches(machine); err != nil {
+						b.Skipf("failed to drop caches: %v. You probably need root.", err)
+					}
 
-				// Run tensorflow.
-				b.StartTimer()
-				if out, err := container.Run(ctx, dockerutil.RunOpts{
-					Image:   "benchmarks/tensorflow",
-					Env:     []string{"PYTHONPATH=$PYTHONPATH:/TensorFlow-Examples/examples"},
-					WorkDir: "/TensorFlow-Examples/examples",
-				}, "python", file); err != nil {
-					b.Errorf("failed to run container: %v logs: %s", err, out)
-				}
-				b.StopTimer()
+					// Run tensorflow.
+					b.StartTimer()
+					if out, err := container.Run(ctx, dockerutil.RunOpts{
+						Image:   "benchmarks/tensorflow",
+						Env:     []string{"PYTHONPATH=$PYTHONPATH:/TensorFlow-Examples/examples"},
+						WorkDir: "/TensorFlow-Examples/examples",
+					}, "python", file); err != nil {
+						b.Errorf("failed to run container: %v logs: %s", err, out)
+					}
+					b.StopTimer()
+				}()
 			}
 		})
 	}

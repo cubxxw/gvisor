@@ -1,6 +1,6 @@
+load("//pkg/sync/locking:locking.bzl", "declare_mutex")
 load("//tools:defs.bzl", "go_library", "go_test", "proto_library")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
-load("//pkg/sync/locking:locking.bzl", "declare_mutex")
 
 package(default_applicable_licenses = ["//:license"])
 
@@ -61,6 +61,18 @@ go_template_instance(
     template = "//pkg/ilist:generic_ring",
     types = {
         "Container": "*Mount",
+    },
+)
+
+go_template_instance(
+    name = "mount_list",
+    out = "mount_list.go",
+    package = "vfs",
+    prefix = "follower",
+    template = "//pkg/ilist:generic_list",
+    types = {
+        "Element": "*Mount",
+        "Linker": "*Mount",
     },
 )
 
@@ -141,6 +153,7 @@ go_library(
         "inotify_mutex.go",
         "lock.go",
         "mount.go",
+        "mount_list.go",
         "mount_namespace_refs.go",
         "mount_ring.go",
         "mount_unsafe.go",
@@ -178,7 +191,7 @@ go_library(
         "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/fsmetric",
         "//pkg/sentry/kernel/auth",
-        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/limits",
         "//pkg/sentry/memmap",
         "//pkg/sentry/socket/unix/transport",

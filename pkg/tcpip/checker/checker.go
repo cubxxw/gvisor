@@ -18,7 +18,7 @@ package checker
 
 import (
 	"encoding/binary"
-	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -463,7 +463,7 @@ func Raw(want []byte) NetworkChecker {
 	return func(t *testing.T, h []header.Network) {
 		t.Helper()
 
-		if got := h[len(h)-1].Payload(); !reflect.DeepEqual(got, want) {
+		if got := h[len(h)-1].Payload(); !slices.Equal(got, want) {
 			t.Errorf("Wrong payload, got %v, want %v", got, want)
 		}
 	}
@@ -917,7 +917,7 @@ func TCPSACKBlockChecker(sackBlocks []header.SACKBlock) TransportChecker {
 			}
 		}
 
-		if !reflect.DeepEqual(gotSACKBlocks, sackBlocks) {
+		if !slices.Equal(gotSACKBlocks, sackBlocks) {
 			t.Errorf("SACKBlocks are not equal, got = %v, want = %v", gotSACKBlocks, sackBlocks)
 		}
 	}
@@ -928,7 +928,7 @@ func Payload(want []byte) TransportChecker {
 	return func(t *testing.T, h header.Transport) {
 		t.Helper()
 
-		if got := h.Payload(); !reflect.DeepEqual(got, want) {
+		if got := h.Payload(); !slices.Equal(got, want) {
 			t.Errorf("Wrong payload, got %v, want %v", got, want)
 		}
 	}
@@ -1254,7 +1254,7 @@ func MLDMulticastAddressUnordered(expectedGroups map[tcpip.Address]struct{}) Tra
 // containing a valid MLD message as far as the size is concerned.
 func MLDMulticastAddress(want tcpip.Address) TransportChecker {
 	return MLDMulticastAddressUnordered(map[tcpip.Address]struct{}{
-		want: struct{}{},
+		want: {},
 	})
 }
 
@@ -1626,7 +1626,7 @@ func IGMPGroupAddressUnordered(expectedGroups map[tcpip.Address]struct{}) Transp
 // IGMPGroupAddress creates a checker that checks the IGMP Group Address field.
 func IGMPGroupAddress(want tcpip.Address) TransportChecker {
 	return IGMPGroupAddressUnordered(map[tcpip.Address]struct{}{
-		want: struct{}{},
+		want: {},
 	})
 }
 
@@ -1878,6 +1878,20 @@ func IPv6HopByHopExtensionHeader(checkers ...IPv6ExtHdrOptionChecker) IPv6ExtHdr
 			if uo, ok := opt.(*header.IPv6UnknownExtHdrOption); ok {
 				uo.Data.Release()
 			}
+		}
+	}
+}
+
+// IPv6ExperimentHeader checks the extension header is an Experiment extension
+// header and validates the value.
+func IPv6ExperimentHeader(want uint16) IPv6ExtHdrChecker {
+	return func(t *testing.T, payloadHeader header.IPv6PayloadHeader) {
+		h, ok := payloadHeader.(header.IPv6ExperimentExtHdr)
+		if !ok {
+			t.Errorf("got = %T, want = header.IPv6UnknownExtHdrOption", payloadHeader)
+		}
+		if h.Value != want {
+			t.Errorf("got = %d, want = %d", h.Value, want)
 		}
 	}
 }

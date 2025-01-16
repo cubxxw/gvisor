@@ -18,11 +18,11 @@ package testutil
 
 import (
 	"fmt"
-	"math/rand"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -34,7 +34,7 @@ import (
 // to it and can mock errors.
 type MockLinkEndpoint struct {
 	// WrittenPackets is where packets written to the endpoint are stored.
-	WrittenPackets []stack.PacketBufferPtr
+	WrittenPackets []*stack.PacketBuffer
 
 	mtu          uint32
 	err          tcpip.Error
@@ -56,6 +56,9 @@ func NewMockLinkEndpoint(mtu uint32, err tcpip.Error, allowPackets int) *MockLin
 // MTU implements LinkEndpoint.MTU.
 func (ep *MockLinkEndpoint) MTU() uint32 { return ep.mtu }
 
+// SetMTU implements LinkEndpoint.SetMTU.
+func (ep *MockLinkEndpoint) SetMTU(mtu uint32) { ep.mtu = mtu }
+
 // Capabilities implements LinkEndpoint.Capabilities.
 func (*MockLinkEndpoint) Capabilities() stack.LinkEndpointCapabilities { return 0 }
 
@@ -65,6 +68,9 @@ func (*MockLinkEndpoint) MaxHeaderLength() uint16 { return 0 }
 // LinkAddress implements LinkEndpoint.LinkAddress.
 func (*MockLinkEndpoint) LinkAddress() tcpip.LinkAddress { return "" }
 
+// SetLinkAddress implements LinkEndpoint.LinkAddress.
+func (*MockLinkEndpoint) SetLinkAddress(tcpip.LinkAddress) {}
+
 // WritePackets implements LinkEndpoint.WritePackets.
 func (ep *MockLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	var n int
@@ -73,7 +79,7 @@ func (ep *MockLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpi
 			return n, ep.err
 		}
 		ep.allowPackets--
-		ep.WrittenPackets = append(ep.WrittenPackets, pkt.IncRef())
+		ep.WrittenPackets = append(ep.WrittenPackets, pkt.Clone())
 		n++
 	}
 	return n, nil
@@ -92,10 +98,10 @@ func (*MockLinkEndpoint) Wait() {}
 func (*MockLinkEndpoint) ARPHardwareType() header.ARPHardwareType { return header.ARPHardwareNone }
 
 // AddHeader implements LinkEndpoint.AddHeader.
-func (*MockLinkEndpoint) AddHeader(stack.PacketBufferPtr) {}
+func (*MockLinkEndpoint) AddHeader(*stack.PacketBuffer) {}
 
 // ParseHeader implements LinkEndpoint.ParseHeader.
-func (*MockLinkEndpoint) ParseHeader(stack.PacketBufferPtr) bool { return true }
+func (*MockLinkEndpoint) ParseHeader(*stack.PacketBuffer) bool { return true }
 
 // Close releases all resources.
 func (ep *MockLinkEndpoint) Close() {
@@ -105,12 +111,15 @@ func (ep *MockLinkEndpoint) Close() {
 	ep.WrittenPackets = nil
 }
 
+// SetOnCloseAction implements stack.LinkEndpoint.SetOnCloseAction.
+func (*MockLinkEndpoint) SetOnCloseAction(func()) {}
+
 // MakeRandPkt generates a randomized packet. transportHeaderLength indicates
 // how many random bytes will be copied in the Transport Header.
 // extraHeaderReserveLength indicates how much extra space will be reserved for
 // the other headers. The payload is made from Views of the sizes listed in
 // viewSizes.
-func MakeRandPkt(transportHeaderLength int, extraHeaderReserveLength int, viewSizes []int, proto tcpip.NetworkProtocolNumber) stack.PacketBufferPtr {
+func MakeRandPkt(transportHeaderLength int, extraHeaderReserveLength int, viewSizes []int, proto tcpip.NetworkProtocolNumber) *stack.PacketBuffer {
 	var buf buffer.Buffer
 
 	for _, s := range viewSizes {
@@ -234,7 +243,7 @@ func ValidateIGMPv3RecordsAcrossReports(t *testing.T, e *channel.Endpoint, srcAd
 
 	for len(expectedRecords) != 0 {
 		p := e.Read()
-		if p.IsNil() {
+		if p == nil {
 			t.Fatalf("expected IGMP message with expectedRecords = %#v", expectedRecords)
 		}
 		v := stack.PayloadSince(p.NetworkHeader())
@@ -265,7 +274,7 @@ func ValidMultipleIGMPv2ReportLeaves(t *testing.T, e *channel.Endpoint, srcAddr 
 
 	for len(expectedGroups) != 0 {
 		p := e.Read()
-		if p.IsNil() {
+		if p == nil {
 			t.Fatalf("expected IGMP message with expectedGroups = %#v", expectedGroups)
 		}
 		v := stack.PayloadSince(p.NetworkHeader())
@@ -334,7 +343,7 @@ func ValidateMLDv2RecordsAcrossReports(t *testing.T, e *channel.Endpoint, srcAdd
 
 	for len(expectedRecords) != 0 {
 		p := e.Read()
-		if p.IsNil() {
+		if p == nil {
 			t.Fatalf("expected MLD Message with expectedRecords = %#v", expectedRecords)
 		}
 		v := stack.PayloadSince(p.NetworkHeader())
@@ -365,7 +374,7 @@ func ValidMultipleMLDv1ReportLeaves(t *testing.T, e *channel.Endpoint, srcAddr t
 
 	for len(expectedGroups) != 0 {
 		p := e.Read()
-		if p.IsNil() {
+		if p == nil {
 			t.Fatalf("expected MLD Message with expectedGroups = %#v", expectedGroups)
 		}
 		v := stack.PayloadSince(p.NetworkHeader())

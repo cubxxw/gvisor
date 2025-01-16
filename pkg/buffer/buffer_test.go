@@ -19,11 +19,11 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
-	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
+	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 )
@@ -625,7 +625,7 @@ func TestBufferPullUp(t *testing.T) {
 			for v := b.data.Front(); v != nil; v = v.Next() {
 				gotLengths = append(gotLengths, v.Size())
 			}
-			if !reflect.DeepEqual(gotLengths, tc.lengths) {
+			if !slices.Equal(gotLengths, tc.lengths) {
 				t.Errorf("lengths = %v; want %v", gotLengths, tc.lengths)
 			}
 		})

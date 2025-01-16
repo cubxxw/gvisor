@@ -8,6 +8,8 @@ package(
 go_library(
     name = "config",
     srcs = [
+        "cgo_disabled.go",
+        "cgo_enabled.go",
         "config.go",
         "config_bundles.go",
         "flags.go",
@@ -16,6 +18,7 @@ go_library(
     deps = [
         "//pkg/log",
         "//pkg/refs",
+        "//pkg/sentry/devices/nvproxy/nvconf",
         "//pkg/sentry/watchdog",
         "//runsc/flag",
         "//runsc/version",

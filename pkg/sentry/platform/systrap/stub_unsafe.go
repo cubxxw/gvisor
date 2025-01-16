@@ -15,13 +15,19 @@
 package systrap
 
 import (
+	"fmt"
+	"io/ioutil"
 	"math/rand"
 	"reflect"
+	"strconv"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safecopy"
 	"gvisor.dev/gvisor/pkg/sentry/platform/systrap/sysmsg"
@@ -40,31 +46,30 @@ func addrOfInitStubProcess() uintptr
 // stubCall calls the stub at the given address with the given pid.
 func stubCall(addr, pid uintptr)
 
-// unsafeSlice returns a slice for the given address and length.
-func unsafeSlice(addr uintptr, length int) (slice []byte) {
-	sh := (*reflect.SliceHeader)(unsafe.Pointer(&slice))
-	sh.Data = addr
-	sh.Len = length
-	sh.Cap = length
-	return
-}
-
 // prepareSeccompRules compiles stub process seccomp filters and fill
 // the sock_fprog structure. So the stub process will only need to call
 // seccomp system call to apply these filters.
 //
 //go:nosplit
-func prepareSeccompRules(stubSysmsgStart, stubSysmsgRules, stubSysmsgRulesLen uintptr) {
-
+func prepareSeccompRules(stubSysmsgStart,
+	stubSysmsgRules, stubSysmsgRulesLen,
+	stubSyscallRules, stubSyscallRulesLen uintptr) {
 	instrs := sysmsgThreadRules(stubSysmsgStart)
-	progLen := len(instrs) * int(unsafe.Sizeof(linux.BPFInstruction{}))
-	progPtr := stubSysmsgRules + unsafe.Sizeof(linux.SockFprog{})
+	copySeccompRulesToStub(instrs, stubSysmsgRules, stubSysmsgRulesLen)
 
-	if progLen+int(unsafe.Sizeof(linux.SockFprog{})) > int(stubSysmsgRulesLen) {
+	instrs = sysmsgSyscallNotifyRules()
+	copySeccompRulesToStub(instrs, stubSyscallRules, stubSyscallRulesLen)
+}
+
+func copySeccompRulesToStub(instrs []bpf.Instruction, stubAddr, size uintptr) {
+	progLen := len(instrs) * int(unsafe.Sizeof(bpf.Instruction{}))
+	progPtr := stubAddr + unsafe.Sizeof(linux.SockFprog{})
+
+	if progLen+int(unsafe.Sizeof(linux.SockFprog{})) > int(size) {
 		panic("not enough space for sysmsg seccomp rules")
 	}
 
-	var targetSlice []linux.BPFInstruction
+	var targetSlice []bpf.Instruction
 	sh := (*reflect.SliceHeader)(unsafe.Pointer(&targetSlice))
 	sh.Data = progPtr
 	sh.Cap = len(instrs)
@@ -75,18 +80,84 @@ func prepareSeccompRules(stubSysmsgStart, stubSysmsgRules, stubSysmsgRulesLen ui
 	// stubSysmsgRules and progPtr are addresses from a stub mapping which
 	// is mapped once and never moved, so it is safe to use unsafe.Pointer
 	// this way for them.
-	sockProg := (*linux.SockFprog)(unsafe.Pointer(stubSysmsgRules))
+	sockProg := (*linux.SockFprog)(unsafe.Pointer(stubAddr))
 	sockProg.Len = uint16(len(instrs))
 	sockProg.Filter = (*linux.BPFInstruction)(unsafe.Pointer(progPtr))
-
 	// Make the seccomp rules stub read-only.
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_MPROTECT,
-		stubSysmsgRules,
-		stubSysmsgRulesLen,
+		stubAddr,
+		size,
 		unix.PROT_READ); errno != 0 {
 		panic("mprotect failed: " + errno.Error())
 	}
+}
+
+type mapsRegion struct {
+	start, end uintptr
+}
+
+// parseMaps parses the /proc/self/maps file and returns regions where the stub
+// region can be mapped.
+func parseMaps(stubAreaStart, stubAreaEnd, minLen uintptr) ([]mapsRegion, error) {
+	data, err := ioutil.ReadFile(fmt.Sprintf("/proc/self/maps"))
+	if err != nil {
+		return nil, err
+	}
+
+	regions := []mapsRegion{}
+	rstart := stubAreaStart
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 1 {
+			continue
+		}
+
+		addrRange := strings.Split(fields[0], "-")
+		if len(addrRange) != 2 {
+			continue
+		}
+
+		start, err := strconv.ParseUint(addrRange[0], 16, 64)
+		if err != nil {
+			return nil, err
+		}
+
+		end, err := strconv.ParseUint(addrRange[1], 16, 64)
+		if err != nil {
+			return nil, err
+		}
+
+		if uintptr(end) < rstart {
+			continue
+		}
+		if uintptr(start) > stubAreaEnd {
+			break
+		}
+		if rstart+minLen < uintptr(start) {
+			regions = append(regions, mapsRegion{
+				start: uintptr(rstart),
+				end:   uintptr(start),
+			})
+		}
+		rstart = uintptr(end)
+	}
+	if rstart+minLen <= stubAreaEnd {
+		regions = append(regions, mapsRegion{
+			start: uintptr(rstart),
+			end:   uintptr(stubAreaEnd),
+		})
+	}
+	log.Debugf("Stub regions:")
+	for _, r := range regions {
+		log.Debugf("%16x-%016x", r.start, r.end)
+	}
+
+	return regions, nil
 }
 
 // stubInit allocates and  initializes the stub memory region which includes:
@@ -119,7 +190,7 @@ func stubInit() {
 	// Grab the existing stub.
 	procStubBegin := addrOfInitStubProcess()
 	procStubLen := int(safecopy.FindEndAddress(procStubBegin) - procStubBegin)
-	procStubSlice := unsafeSlice(procStubBegin, procStubLen)
+	procStubSlice := unsafe.Slice((*byte)(unsafe.Pointer(procStubBegin)), procStubLen)
 	mapLen, _ := hostarch.PageRoundUp(uintptr(procStubLen))
 
 	stubSysmsgStart = mapLen
@@ -127,8 +198,11 @@ func stubInit() {
 	mapLen, _ = hostarch.PageRoundUp(mapLen + uintptr(stubSysmsgLen))
 
 	stubSysmsgRules = mapLen
-	stubSysmsgRulesLen = hostarch.PageSize * 4
+	stubSysmsgRulesLen = hostarch.PageSize * 2
 	mapLen += stubSysmsgRulesLen
+	stubSyscallRules = mapLen
+	stubSyscallRulesLen = hostarch.PageSize
+	mapLen += stubSyscallRulesLen
 
 	stubROMapEnd = mapLen
 	// Add a guard page.
@@ -138,7 +212,7 @@ func stubInit() {
 	// Allocate maxGuestThreads plus ONE because each per-thread stack
 	// has to be aligned to sysmsg.PerThreadMemSize.
 	// Look at sysmsg/sighandler.c:sysmsg_addr() for more details.
-	mapLen, _ = hostarch.PageRoundUp(mapLen + sysmsg.PerThreadMemSize*(maxSystemThreads+1))
+	mapLen, _ = hostarch.PageRoundUp(mapLen + sysmsg.PerThreadMemSize*(uintptr(maxChildThreads+1)))
 
 	// Allocate context queue region
 	stubContextQueueRegion = mapLen
@@ -153,31 +227,35 @@ func stubInit() {
 	stubContextRegionLen = sysmsg.AllocatedSizeofThreadContextStruct * (maxGuestContexts + 1)
 	mapLen, _ = hostarch.PageRoundUp(mapLen + stubContextRegionLen)
 
-	// Randomize stubStart address.
-	randomOffset := uintptr(rand.Uint64() * hostarch.PageSize)
-	maxRandomOffset := maxRandomOffsetOfStubAddress - mapLen
-	stubStart = uintptr(0)
-	for offset := uintptr(0); offset < maxRandomOffset; offset += hostarch.PageSize {
-		stubStart = maxStubUserAddress + (randomOffset+offset)%maxRandomOffset
+	// Try a few times to avoid cases when new mappings are created.
+	for i := 0; i < 32; i++ {
+		if i == 0 { // fast path
+			// Randomize stubStart address.
+			randomOffset := uintptr(rand.Uint64() * hostarch.PageSize)
+			maxRandomOffset := maxRandomOffsetOfStubAddress - mapLen
+			stubStart = maxStubUserAddress + randomOffset%maxRandomOffset
+		} else {
+			regions, err := parseMaps(maxStubUserAddress, maximumUserAddress-mapLen+stubROMapEnd, stubROMapEnd)
+			if err != nil {
+				panic(fmt.Sprintf("failed to parse /proc/self/maps: %s", err))
+			}
+			n := len(regions)
+			if n == 0 {
+				panic("failed to map stub code")
+			}
+			r := regions[rand.Int()%n]
+			stubStart = r.start + uintptr(rand.Uint64())*hostarch.PageSize%(r.end-r.start-stubROMapEnd)
+		}
 		// Map the target address for the stub.
-		//
-		// We don't use FIXED here because we don't want to unmap
-		// something that may have been there already. We just walk
-		// down the address space until we find a place where the stub
-		// can be placed.
-		addr, _, _ := unix.RawSyscall6(
+		addr, _ := hostsyscall.RawSyscall6(
 			unix.SYS_MMAP,
 			stubStart,
 			stubROMapEnd,
 			unix.PROT_WRITE|unix.PROT_READ,
-			unix.MAP_PRIVATE|unix.MAP_ANONYMOUS,
+			unix.MAP_PRIVATE|unix.MAP_ANONYMOUS|unix.MAP_FIXED_NOREPLACE,
 			0 /* fd */, 0 /* offset */)
 		if addr == stubStart {
 			break
-		}
-		if addr != 0 {
-			// Unmap the region we've mapped accidentally.
-			unix.RawSyscall(unix.SYS_MUNMAP, addr, stubROMapEnd, 0)
 		}
 		stubStart = uintptr(0)
 	}
@@ -194,7 +272,7 @@ func stubInit() {
 	stubContextRegion += uintptr(gap)
 
 	// Copy the stub to the address.
-	targetSlice := unsafeSlice(stubStart, procStubLen)
+	targetSlice := unsafe.Slice((*byte)(unsafe.Pointer(stubStart)), procStubLen)
 	copy(targetSlice, procStubSlice)
 	stubInitProcess = stubStart
 
@@ -211,8 +289,8 @@ func stubInit() {
 		stubSysmsgStack += sysmsg.PerThreadMemSize - offset
 	}
 	stubSysmsgRules += stubStart
-
-	targetSlice = unsafeSlice(stubSysmsgStart, stubSysmsgLen)
+	stubSyscallRules += stubStart
+	targetSlice = unsafe.Slice((*byte)(unsafe.Pointer(stubSysmsgStart)), stubSysmsgLen)
 	copy(targetSlice, sysmsg.SighandlerBlob)
 
 	// Initialize stub globals
@@ -229,10 +307,12 @@ func stubInit() {
 	p = (*uint64)(unsafe.Pointer(stubSysmsgStart + uintptr(sysmsg.Sighandler_blob_offset____export_spinning_queue_addr)))
 	*p = uint64(stubSpinningThreadQueueAddr)
 
-	prepareSeccompRules(stubSysmsgStart, stubSysmsgRules, stubSysmsgRulesLen)
+	prepareSeccompRules(stubSysmsgStart,
+		stubSysmsgRules, stubSysmsgRulesLen,
+		stubSyscallRules, stubSyscallRulesLen)
 
 	// Make the stub executable.
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_MPROTECT,
 		stubStart,
 		stubROMapEnd-stubStart,

@@ -53,6 +53,7 @@
 #include "absl/container/btree_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/node_hash_set.h"
+#include "absl/flags/flag.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
@@ -101,6 +102,9 @@ using ::testing::UnorderedElementsAreArray;
 // Exported by glibc.
 extern char** environ;
 
+ABSL_FLAG(bool, proc_pid_reuse_child, false,
+          "If true, run the Proc_PidReuse child workload.");
+
 namespace gvisor {
 namespace testing {
 namespace {
@@ -116,34 +120,35 @@ namespace {
 #endif /* SUID_DUMP_ROOT */
 
 #if defined(__x86_64__) || defined(__i386__)
-// This list of "required" fields is taken from reading the file
-// arch/x86/kernel/cpu/proc.c and seeing which fields will be unconditionally
-// printed by the kernel.
+// This list of "required" fields consists of the set of fields that are printed
+// unconditionally by the kernel (see arch/x86/kernel/cpu/proc.c) and a set of
+// fields that are printed conditionally, but are present on common
+// configurations (e.g. when CONFIG_SMP is set).
 static const char* required_fields[] = {
-    "processor",
-    "vendor_id",
-    "cpu family",
-    "model\t\t:",
-    "model name",
-    "stepping",
-    "cpu MHz",
-    "fpu\t\t:",
-    "fpu_exception",
-    "cpuid level",
-    "wp",
-    "bogomips",
-    "clflush size",
-    "cache_alignment",
-    "address sizes",
-    "power management",
+    "processor",     "vendor_id",        "cpu family",
+    "model\t\t:",    "model name",       "stepping",
+    "cpu MHz",       "cache size",       "physical id",
+    "siblings",      "core id",          "cpu cores",
+    "apicid\t\t:",   "initial apicid",   "fpu\t\t:",
+    "fpu_exception", "cpuid level",      "wp",
+    "bogomips",      "clflush size",     "cache_alignment",
+    "address sizes", "power management",
 };
-#elif __aarch64__
+#elif defined(__aarch64__)
 // This list of "required" fields is taken from reading the file
 // arch/arm64/kernel/cpuinfo.c and seeing which fields will be unconditionally
 // printed by the kernel.
 static const char* required_fields[] = {
     "processor",        "BogoMIPS",    "Features", "CPU implementer",
     "CPU architecture", "CPU variant", "CPU part", "CPU revision",
+};
+#elif defined(__riscv)
+// This list of "required" fields is taken from reading the file
+// arch/riscv/kernel/cpu.c and seeing which fields will be unconditionally
+// printed by the kernel.
+static const char* required_fields[] = {
+    "processor",
+    "hart",
 };
 #else
 #error "Unknown architecture"
@@ -1122,22 +1127,122 @@ TEST(ProcSelfMaps, Mprotect) {
                                                    3 * kPageSize, PROT_READ)));
 }
 
+// Expected pathname for MAP_SHARED | MAP_ANONYMOUS mappings. See proc(5),
+// "/proc/[pid]/map_files/".
+constexpr char kSharedAnonPath[] = "/dev/zero (deleted)";
+
 TEST(ProcSelfMaps, SharedAnon) {
   const Mapping m = ASSERT_NO_ERRNO_AND_VALUE(
       MmapAnon(kPageSize, PROT_READ, MAP_SHARED | MAP_ANONYMOUS));
 
   const auto proc_self_maps =
       ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
-  for (const auto& line : absl::StrSplit(proc_self_maps, '\n')) {
-    const auto entry = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMapsLine(line));
-    if (entry.start <= m.addr() && m.addr() < entry.end) {
-      // cf. proc(5), "/proc/[pid]/map_files/"
-      EXPECT_EQ(entry.filename, "/dev/zero (deleted)");
-      return;
-    }
-  }
-  FAIL() << "no maps entry containing mapping at " << m.ptr();
+  const auto entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  const auto entry =
+      ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, kSharedAnonPath);
 }
+
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#endif
+#ifndef PR_SET_VMA_ANON_NAME
+#define PR_SET_VMA_ANON_NAME 0
+#endif
+
+TEST(ProcSelfMaps, AnonNamePrivateAnon) {
+  const Mapping m = ASSERT_NO_ERRNO_AND_VALUE(
+      MmapAnon(kPageSize, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS));
+
+  int rv = prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), "test");
+  SKIP_IF(rv < 0 && errno == EINVAL);
+  ASSERT_THAT(rv, SyscallSucceeds());
+  auto proc_self_maps =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  auto entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  auto entry =
+      ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, "[anon:test]");
+
+  ASSERT_THAT(prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), ""),
+              SyscallSucceeds());
+  proc_self_maps = ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  entry = ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, "[anon:]");
+
+  ASSERT_THAT(
+      prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), nullptr),
+      SyscallSucceeds());
+  proc_self_maps = ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  entry = ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, "");
+}
+
+TEST(ProcSelfMaps, AnonNameSharedAnon) {
+  const Mapping m = ASSERT_NO_ERRNO_AND_VALUE(
+      MmapAnon(kPageSize, PROT_READ, MAP_SHARED | MAP_ANONYMOUS));
+
+  int rv = prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), "test");
+  SKIP_IF(rv < 0 && errno == EINVAL);
+  // Using PR_SET_VMA_ANON_NAME on shared anonymous mappings isn't permitted
+  // until d09e8ca6cb93 ("mm: anonymous shared memory naming"), Linux 6.2+.
+  SKIP_IF(rv < 0 && errno == EBADF);
+  ASSERT_THAT(rv, SyscallSucceeds());
+  auto proc_self_maps =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  auto entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  auto entry =
+      ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, "[anon_shmem:test]");
+
+  ASSERT_THAT(prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), ""),
+              SyscallSucceeds());
+  proc_self_maps = ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  entry = ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, "[anon_shmem:]");
+
+  ASSERT_THAT(
+      prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), nullptr),
+      SyscallSucceeds());
+  proc_self_maps = ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  entry = ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, kSharedAnonPath);
+}
+
+// Test parameterized by mmap flags.
+class ProcSelfMapsMmapFileTest : public ::testing::TestWithParam<int> {};
+
+TEST_P(ProcSelfMapsMmapFileTest, AnonNameFile) {
+  const auto f = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  const auto fd = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_RDONLY));
+  const Mapping m = ASSERT_NO_ERRNO_AND_VALUE(
+      Mmap(nullptr, kPageSize, PROT_READ, GetParam(), fd.get(), 0));
+
+  int rv = prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), "test");
+  SKIP_IF(rv < 0 && errno == EINVAL);
+  ASSERT_THAT(rv, SyscallFailsWithErrno(EBADF));
+  auto proc_self_maps =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  auto entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  auto entry =
+      ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, f.path());
+
+  ASSERT_THAT(
+      prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), nullptr),
+      SyscallFailsWithErrno(EBADF));
+  proc_self_maps = ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  entry = ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, f.path());
+}
+
+INSTANTIATE_TEST_SUITE_P(SelfAndNumericPid, ProcSelfMapsMmapFileTest,
+                         ::testing::Values(MAP_SHARED, MAP_PRIVATE));
 
 TEST(ProcSelfFd, OpenFd) {
   int pipe_fds[2];
@@ -2546,6 +2651,17 @@ TEST(ProcTask, CommCannotSetAnotherProcessThreadName) {
   EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
 }
 
+TEST(ProcTask, CommLenLimited) {
+  auto path = JoinPath("/proc", absl::StrCat(getpid()), "task",
+                       absl::StrCat(syscall(SYS_gettid)), "comm");
+  // comm is limited by 15 symbols (TASK_COMM_LEN).
+  constexpr char kThreadName[] = "0123456789abcde";
+  ASSERT_NO_ERRNO(SetContents(path, absl::StrCat(kThreadName, "XYZ")));
+
+  auto got_thread_name = ASSERT_NO_ERRNO_AND_VALUE(GetContents(path));
+  EXPECT_EQ(absl::StrCat(kThreadName, "\n"), got_thread_name);
+}
+
 TEST(ProcTaskNs, NsDirExistsAndHasCorrectMetadata) {
   EXPECT_NO_ERRNO(DirContains("/proc/self/ns", {"net", "pid", "user"}, {}));
 
@@ -2893,6 +3009,32 @@ TEST(Proc, RegressionTestB236035339) {
               SyscallFailsWithErrno(ENOTDIR));
 }
 
+// NOTE(b/338393279): Tests that after execve() from a non-leader thread
+// changes which thread owns the thread group ID, the new thread group leader
+// can access its /proc/self.
+TEST(Proc, PidReuse) {
+  const ExecveArray owned_child_argv = {"/proc/self/exe",
+                                        "--proc_pid_reuse_child"};
+  char* const* const child_argv = owned_child_argv.get();
+
+  const auto rest = [child_argv] {
+    struct stat statbuf;
+    TEST_PCHECK(stat("/proc/self/cwd", &statbuf) == 0);
+
+    ScopedThread([child_argv] {
+      execve(child_argv[0], child_argv, /* envp = */ nullptr);
+      TEST_PCHECK_MSG(false, "Survived execve to test child");
+    });
+  };
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
+}
+
+[[noreturn]] void RunProcPidReuseChild() {
+  struct stat statbuf;
+  TEST_PCHECK(stat("/proc/self/cwd", &statbuf) == 0);
+  _exit(0);
+}
+
 TEST(ProcFilesystems, ReadCapLastCap) {
   std::string lastCapStr =
       ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/cap_last_cap"));
@@ -2900,6 +3042,20 @@ TEST(ProcFilesystems, ReadCapLastCap) {
   uint64_t lastCap;
   ASSERT_TRUE(absl::SimpleAtoi(lastCapStr, &lastCap));
   EXPECT_TRUE(lastCap > 32 && lastCap < 64);
+}
+
+TEST(ProcFilesystems, OverflowID) {
+  std::string overflowGidStr =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/overflowgid"));
+  std::string overflowUidStr =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/overflowuid"));
+  uint64_t overflowGid, overflowUid;
+  ASSERT_TRUE(absl::SimpleAtoi(overflowGidStr, &overflowGid));
+  ASSERT_TRUE(absl::SimpleAtoi(overflowUidStr, &overflowUid));
+
+  const uint64_t defaultOverflowID = 65534;
+  EXPECT_EQ(overflowGid, defaultOverflowID);
+  EXPECT_EQ(overflowUid, defaultOverflowID);
 }
 
 }  // namespace
@@ -2912,5 +3068,10 @@ int main(int argc, char** argv) {
   }
 
   gvisor::testing::TestInit(&argc, &argv);
+
+  if (absl::GetFlag(FLAGS_proc_pid_reuse_child)) {
+    gvisor::testing::RunProcPidReuseChild();
+  }
+
   return gvisor::testing::RunAllTests();
 }

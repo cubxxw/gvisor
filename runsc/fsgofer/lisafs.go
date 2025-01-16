@@ -23,7 +23,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"sync"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -63,14 +65,26 @@ type Config struct {
 	// DonateMountPointFD indicates whether a host FD to the mount point should
 	// be donated to the client on Mount RPC.
 	DonateMountPointFD bool
+
+	// Gofer process's RUID.
+	RUID int
+
+	// Gofer process's EUID.
+	EUID int
+
+	// Gofer process's RGID.
+	RGID int
+
+	// Gofer process's EGID.
+	EGID int
 }
 
 var procSelfFD *rwfd.FD
 
 // OpenProcSelfFD opens the /proc/self/fd directory, which will be used to
 // reopen file descriptors.
-func OpenProcSelfFD() error {
-	d, err := unix.Open("/proc/self/fd", unix.O_RDONLY|unix.O_DIRECTORY, 0)
+func OpenProcSelfFD(path string) error {
+	d, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY, 0)
 	if err != nil {
 		return fmt.Errorf("error opening /proc/self/fd: %v", err)
 	}
@@ -177,6 +191,7 @@ func (s *LisafsServer) SupportedMessages() []lisafs.MID {
 		lisafs.BindAt,
 		lisafs.Listen,
 		lisafs.Accept,
+		lisafs.ConnectWithCreds,
 	}
 }
 
@@ -287,12 +302,17 @@ func (fd *controlFDLisa) Stat() (linux.Statx, error) {
 // SetStat implements lisafs.ControlFDImpl.SetStat.
 func (fd *controlFDLisa) SetStat(stat lisafs.SetStatReq) (failureMask uint32, failureErr error) {
 	if stat.Mask&unix.STATX_MODE != 0 {
-		if fd.IsSocket() {
-			// fchmod(2) on socket files created via bind(2) fails. We need to
-			// fchmodat(2) it from its parent.
+		switch fd.FileType() {
+		case unix.S_IFLNK:
+			// Linux does not support changing the mode of symlinks. See
+			// fs/attr.c:notify_change().
+			failureMask |= unix.STATX_MODE
+			failureErr = unix.EOPNOTSUPP
+		case unix.S_IFSOCK:
+			// Sockets use O_PATH host FDs. However, fchmod(2) fails with EBADF for
+			// O_PATH FDs. Try to fchmodat(2) it from its parent.
 			parent, sockName, err := fd.getParentFD()
 			if err == nil {
-				// Note that AT_SYMLINK_NOFOLLOW flag is not currently supported.
 				err = unix.Fchmodat(parent, sockName, stat.Mode&^unix.S_IFMT, 0 /* flags */)
 				unix.Close(parent)
 			}
@@ -301,7 +321,7 @@ func (fd *controlFDLisa) SetStat(stat lisafs.SetStatReq) (failureMask uint32, fa
 				failureMask |= unix.STATX_MODE
 				failureErr = err
 			}
-		} else {
+		default:
 			if err := unix.Fchmod(fd.hostFD, stat.Mode&^unix.S_IFMT); err != nil {
 				log.Warningf("SetStat fchmod failed %q, err: %v", fd.Node().FilePath(), err)
 				failureMask |= unix.STATX_MODE
@@ -478,6 +498,14 @@ func (fd *controlFDLisa) WalkStat(path lisafs.StringArray, recordStat func(linux
 	return nil
 }
 
+// Used to log rejected fifo/uds operations, one time each.
+var (
+	logRejectedFifoOpenOnce   sync.Once
+	logRejectedUdsOpenOnce    sync.Once
+	logRejectedUdsCreateOnce  sync.Once
+	logRejectedUdsConnectOnce sync.Once
+)
+
 // Open implements lisafs.ControlFDImpl.Open.
 func (fd *controlFDLisa) Open(flags uint32) (*lisafs.OpenFD, int, error) {
 	ftype := fd.FileType()
@@ -485,10 +513,16 @@ func (fd *controlFDLisa) Open(flags uint32) (*lisafs.OpenFD, int, error) {
 	switch ftype {
 	case unix.S_IFIFO:
 		if !server.config.HostFifo.AllowOpen() {
+			logRejectedFifoOpenOnce.Do(func() {
+				log.Warningf("Rejecting attempt to open fifo/pipe from host filesystem: %q. If you want to allow this, set flag --host-fifo=open", fd.ControlFD.Node().FilePath())
+			})
 			return nil, -1, unix.EPERM
 		}
 	case unix.S_IFSOCK:
 		if !server.config.HostUDS.AllowOpen() {
+			logRejectedUdsOpenOnce.Do(func() {
+				log.Warningf("Rejecting attempt to open unix domain socket from host filesystem. If you want to allow this, set flag --host-uds=open", fd.ControlFD.Node().FilePath())
+			})
 			return nil, -1, unix.EPERM
 		}
 	}
@@ -771,6 +805,9 @@ func isSockTypeSupported(sockType uint32) bool {
 // Connect implements lisafs.ControlFDImpl.Connect.
 func (fd *controlFDLisa) Connect(sockType uint32) (int, error) {
 	if !fd.Conn().ServerImpl().(*LisafsServer).config.HostUDS.AllowOpen() {
+		logRejectedUdsConnectOnce.Do(func() {
+			log.Warningf("Rejecting attempt to connect to unix domain socket from host filesystem: %q. If you want to allow this, set flag --host-uds=open", fd.ControlFD.Node().FilePath())
+		})
 		return -1, unix.EPERM
 	}
 
@@ -800,9 +837,73 @@ func (fd *controlFDLisa) Connect(sockType uint32) (int, error) {
 	return sock, nil
 }
 
+// ConnectWithCreds implements lisafs.ControlFDImpl.ConnectWithCreds.
+func (fd *controlFDLisa) ConnectWithCreds(sockType uint32, uid lisafs.UID, gid lisafs.GID) (int, error) {
+	serverConfig := fd.Conn().ServerImpl().(*LisafsServer).config
+	if !serverConfig.HostUDS.AllowOpen() {
+		logRejectedUdsConnectOnce.Do(func() {
+			log.Warningf("Rejecting attempt to connect to unix domain socket from host filesystem: %q. If you want to allow this, set flag --host-uds=open", fd.ControlFD.Node().FilePath())
+		})
+		return -1, unix.EPERM
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// As per capabilities(7), "If the effective user ID is changed from 0 to
+	// nonzero, then all capabilities are cleared from the effective set. If the
+	// effective user ID is changed from nonzero to 0, then the permitted set is
+	// copied to the effective set." Below, we temporarily change the effective
+	// UID and GID. So the effective capability set is cleared and restored; the
+	// permitted set stays the same. We change GID first, and then UID. Because
+	// once the UID is changed, capabilities needed to change GID are dropped.
+	uidChanged, gidChanged := false, false
+	if int(gid) != serverConfig.EGID {
+		_, _, err := unix.Syscall(unix.SYS_SETREGID, uintptr(serverConfig.RGID), uintptr(gid), 0)
+		if err != 0 {
+			log.Warningf("Failed to set egid; err: %v", err)
+		} else {
+			log.Debugf("Successfully set egid to %d", gid)
+			gidChanged = true
+		}
+	}
+
+	if int(uid) != serverConfig.EUID {
+		_, _, err := unix.Syscall(unix.SYS_SETREUID, uintptr(serverConfig.RUID), uintptr(uid), 0)
+		if err != 0 {
+			log.Warningf("Failed to set euid; err: %v", err)
+		} else {
+			log.Debugf("Successfully set euid to %d", uid)
+			uidChanged = true
+		}
+	}
+
+	defer func() {
+		if uidChanged {
+			_, _, err := unix.Syscall(unix.SYS_SETREUID, uintptr(serverConfig.RUID), uintptr(serverConfig.EUID), 0)
+			if err != 0 {
+				panic(fmt.Sprintf("Failed to restore euid; err: %v", err))
+			}
+			log.Debugf("Successfully restored euid to %d", serverConfig.EUID)
+		}
+
+		if gidChanged {
+			_, _, err := unix.Syscall(unix.SYS_SETREGID, uintptr(serverConfig.RGID), uintptr(serverConfig.EGID), 0)
+			if err != 0 {
+				panic(fmt.Sprintf("Failed to restore egid; err: %v", err))
+			}
+			log.Debugf("Successfully restored egid to %d", serverConfig.EGID)
+		}
+	}()
+
+	return fd.Connect(sockType)
+}
+
 // BindAt implements lisafs.ControlFDImpl.BindAt.
 func (fd *controlFDLisa) BindAt(name string, sockType uint32, mode linux.FileMode, uid lisafs.UID, gid lisafs.GID) (*lisafs.ControlFD, linux.Statx, *lisafs.BoundSocketFD, int, error) {
 	if !fd.Conn().ServerImpl().(*LisafsServer).config.HostUDS.AllowCreate() {
+		logRejectedUdsCreateOnce.Do(func() {
+			log.Warningf("Rejecting attempt to create unix domain socket from host filesystem: %q. If you want to allow this, set flag --host-uds=create", name)
+		})
 		return nil, linux.Statx{}, nil, -1, unix.EPERM
 	}
 
@@ -901,7 +1002,15 @@ func (fd *controlFDLisa) Renamed() {
 
 // GetXattr implements lisafs.ControlFDImpl.GetXattr.
 func (fd *controlFDLisa) GetXattr(name string, size uint32, getValueBuf func(uint32) []byte) (uint16, error) {
-	return 0, unix.EOPNOTSUPP
+	data := getValueBuf(size)
+	if fd.IsSocket() || fd.IsSymlink() {
+		// Sockets and symlinks use O_PATH host FDs. However, fgetxattr(2) fails
+		// with EBADF for O_PATH FDs. Use lgetxattr(2) instead.
+		xattrSize, err := unix.Lgetxattr(fd.Node().FilePath(), name, data)
+		return uint16(xattrSize), err
+	}
+	xattrSize, err := unix.Fgetxattr(fd.hostFD, name, data)
+	return uint16(xattrSize), err
 }
 
 // SetXattr implements lisafs.ControlFDImpl.SetXattr.
@@ -1020,7 +1129,7 @@ func (fd *openFDLisa) Getdent64(count uint32, seek0 bool, recordDirent func(lisa
 			break
 		}
 
-		fsutil.ParseDirents(direntsBuf[:n], func(ino uint64, off int64, ftype uint8, name string, reclen uint16) bool {
+		fsutil.ParseDirents(direntsBuf[:n], func(ino uint64, off int64, ftype uint8, name string, reclen uint16) {
 			dirent := lisafs.Dirent64{
 				Ino:  primitive.Uint64(ino),
 				Off:  primitive.Uint64(off),
@@ -1034,13 +1143,12 @@ func (fd *openFDLisa) Getdent64(count uint32, seek0 bool, recordDirent func(lisa
 			stat, err := fsutil.StatAt(fd.hostFD, name)
 			if err != nil {
 				log.Warningf("Getdent64: skipping file %q with failed stat, err: %v", path.Join(fd.ControlFD().FD().Node().FilePath(), name), err)
-				return true
+				return
 			}
 			dirent.DevMinor = primitive.Uint32(unix.Minor(stat.Dev))
 			dirent.DevMajor = primitive.Uint32(unix.Major(stat.Dev))
 			recordDirent(dirent)
 			bytesRead += int(reclen)
-			return true
 		})
 	}
 	return nil

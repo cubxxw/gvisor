@@ -16,7 +16,6 @@
 package test
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
@@ -53,7 +52,7 @@ type Message struct {
 // NewServer creates a new server that listens to a UDS that it creates under
 // os.TempDir.
 func NewServer() (*Server, error) {
-	dir, err := ioutil.TempDir(os.TempDir(), "remote")
+	dir, err := os.MkdirTemp(os.TempDir(), "remote")
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +135,7 @@ func (m *msgHandler) Message(_ []byte, hdr wire.Header, payload []byte) error {
 	return nil
 }
 
-// Version returns the wire version supported or overriden by SetVersion.
+// Version returns the wire version supported or overridden by SetVersion.
 func (m *msgHandler) Version() uint32 {
 	m.owner.mu.Lock()
 	defer m.owner.mu.Unlock()

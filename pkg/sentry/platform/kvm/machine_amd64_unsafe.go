@@ -23,7 +23,11 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 )
+
+func rdfsbase() uint64
+func rdgsbase() uint64
 
 // loadSegments copies the current segments.
 //
@@ -31,29 +35,37 @@ import (
 //
 //go:nosplit
 func (c *vCPU) loadSegments(tid uint64) {
-	if _, _, errno := unix.RawSyscall(
-		unix.SYS_ARCH_PRCTL,
-		linux.ARCH_GET_FS,
-		uintptr(unsafe.Pointer(&c.CPU.Registers().Fs_base)),
-		0); errno != 0 {
-		throw("getting FS segment")
+	if errno := hostsyscall.RawSyscallErrno(unix.SYS_SIGALTSTACK, 0, uintptr(unsafe.Pointer(&c.signalStack)), 0); errno != 0 {
+		throw("sigaltstack")
 	}
-	if _, _, errno := unix.RawSyscall(
-		unix.SYS_ARCH_PRCTL,
-		linux.ARCH_GET_GS,
-		uintptr(unsafe.Pointer(&c.CPU.Registers().Gs_base)),
-		0); errno != 0 {
-		throw("getting GS segment")
+	if hasFSGSBASE {
+		c.CPU.Registers().Fs_base = rdfsbase()
+		c.CPU.Registers().Gs_base = rdgsbase()
+	} else {
+		if errno := hostsyscall.RawSyscallErrno(
+			unix.SYS_ARCH_PRCTL,
+			linux.ARCH_GET_FS,
+			uintptr(unsafe.Pointer(&c.CPU.Registers().Fs_base)),
+			0); errno != 0 {
+			throw("getting FS segment")
+		}
+		if errno := hostsyscall.RawSyscallErrno(
+			unix.SYS_ARCH_PRCTL,
+			linux.ARCH_GET_GS,
+			uintptr(unsafe.Pointer(&c.CPU.Registers().Gs_base)),
+			0); errno != 0 {
+			throw("getting GS segment")
+		}
 	}
 	c.tid.Store(tid)
 }
 
 // setCPUID sets the CPUID to be used by the guest.
 func (c *vCPU) setCPUID() error {
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_SET_CPUID2,
+		KVM_SET_CPUID2,
 		uintptr(unsafe.Pointer(&cpuidSupported))); errno != 0 {
 		return fmt.Errorf("error setting CPUID: %v", errno)
 	}
@@ -64,10 +76,10 @@ func (c *vCPU) setCPUID() error {
 //
 // If mustSucceed is true, then this function panics on error.
 func (c *vCPU) getTSCFreq() (uintptr, error) {
-	rawFreq, _, errno := unix.RawSyscall(
+	rawFreq, errno := hostsyscall.RawSyscall(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_GET_TSC_KHZ,
+		KVM_GET_TSC_KHZ,
 		0 /* ignored */)
 	if errno != 0 {
 		return 0, errno
@@ -77,10 +89,10 @@ func (c *vCPU) getTSCFreq() (uintptr, error) {
 
 // setTSCFreq sets the TSC frequency.
 func (c *vCPU) setTSCFreq(freq uintptr) error {
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_SET_TSC_KHZ,
+		KVM_SET_TSC_KHZ,
 		freq /* khz */); errno != 0 {
 		return fmt.Errorf("error setting TSC frequency: %v", errno)
 	}
@@ -100,10 +112,10 @@ func (c *vCPU) setTSCOffset() error {
 		attr:  _KVM_VCPU_TSC_OFFSET,
 		addr:  unsafe.Pointer(&offset),
 	}
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_SET_DEVICE_ATTR,
+		KVM_SET_DEVICE_ATTR,
 		uintptr(unsafe.Pointer(&da))); errno != 0 {
 		return fmt.Errorf("error setting tsc offset: %v", errno)
 	}
@@ -118,10 +130,10 @@ func (c *vCPU) setTSC(value uint64) error {
 	}
 	registers.entries[0].index = _MSR_IA32_TSC
 	registers.entries[0].data = value
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_SET_MSRS,
+		KVM_SET_MSRS,
 		uintptr(unsafe.Pointer(&registers))); errno != 0 {
 		return fmt.Errorf("error setting tsc: %v", errno)
 	}
@@ -132,10 +144,10 @@ func (c *vCPU) setTSC(value uint64) error {
 //
 //go:nosplit
 func (c *vCPU) setUserRegisters(uregs *userRegs) unix.Errno {
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_SET_REGS,
+		KVM_SET_REGS,
 		uintptr(unsafe.Pointer(uregs))); errno != 0 {
 		return errno
 	}
@@ -148,10 +160,10 @@ func (c *vCPU) setUserRegisters(uregs *userRegs) unix.Errno {
 //
 //go:nosplit
 func (c *vCPU) getUserRegisters(uregs *userRegs) unix.Errno {
-	if _, _, errno := unix.RawSyscall( // escapes: no.
+	if errno := hostsyscall.RawSyscallErrno( // escapes: no.
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_GET_REGS,
+		KVM_GET_REGS,
 		uintptr(unsafe.Pointer(uregs))); errno != 0 {
 		return errno
 	}
@@ -160,10 +172,10 @@ func (c *vCPU) getUserRegisters(uregs *userRegs) unix.Errno {
 
 // setSystemRegisters sets system registers.
 func (c *vCPU) setSystemRegisters(sregs *systemRegs) error {
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_SET_SREGS,
+		KVM_SET_SREGS,
 		uintptr(unsafe.Pointer(sregs))); errno != 0 {
 		return fmt.Errorf("error setting system registers: %v", errno)
 	}
@@ -174,10 +186,10 @@ func (c *vCPU) setSystemRegisters(sregs *systemRegs) error {
 //
 //go:nosplit
 func (c *vCPU) getSystemRegisters(sregs *systemRegs) unix.Errno {
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_GET_SREGS,
+		KVM_GET_SREGS,
 		uintptr(unsafe.Pointer(sregs))); errno != 0 {
 		return errno
 	}
@@ -189,9 +201,13 @@ func seccompMmapSyscall(context unsafe.Pointer) (uintptr, uintptr, unix.Errno) {
 	ctx := bluepillArchContext(context)
 
 	// MAP_DENYWRITE is deprecated and ignored by kernel. We use it only for seccomp filters.
-	addr, _, e := unix.RawSyscall6(uintptr(ctx.Rax), uintptr(ctx.Rdi), uintptr(ctx.Rsi),
+	addr, e := hostsyscall.RawSyscall6(uintptr(ctx.Rax), uintptr(ctx.Rdi), uintptr(ctx.Rsi),
 		uintptr(ctx.Rdx), uintptr(ctx.R10)|unix.MAP_DENYWRITE, uintptr(ctx.R8), uintptr(ctx.R9))
-	ctx.Rax = uint64(addr)
+	if e != 0 {
+		ctx.Rax = uint64(-e)
+	} else {
+		ctx.Rax = uint64(addr)
+	}
 
-	return addr, uintptr(ctx.Rsi), e
+	return addr, uintptr(ctx.Rsi), unix.Errno(e)
 }

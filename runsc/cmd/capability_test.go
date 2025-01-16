@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"slices"
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -57,7 +58,7 @@ func checkProcessCaps(pid int, wantCaps *specs.LinuxCapabilities) error {
 func checkCaps(which capability.CapType, curCaps capability.Capabilities, wantCaps *specs.LinuxCapabilities) error {
 	wantNames := getCaps(which, wantCaps)
 	for name, c := range capFromName {
-		want := specutils.ContainsStr(wantNames, name)
+		want := slices.Contains(wantNames, name)
 		got := curCaps.Get(which, c)
 		if want != got {
 			if want {
@@ -81,13 +82,13 @@ func testCapabilities(t *testing.T, directfs bool) {
 	spec := testutil.NewSpecWithArgs("/bin/sleep", "10000")
 	caps := []string{
 		"CAP_CHOWN",
-		"CAP_SYS_PTRACE", // ptrace is added due to the platform choice.
+		"CAP_SYS_ADMIN",
+		"CAP_NET_ADMIN",
 	}
 	spec.Process.Capabilities = &specs.LinuxCapabilities{
-		Permitted:   caps,
-		Bounding:    caps,
-		Effective:   caps,
-		Inheritable: caps,
+		Permitted: caps,
+		Bounding:  caps,
+		Effective: caps,
 	}
 
 	conf := testutil.TestConfig(t)
@@ -117,7 +118,16 @@ func testCapabilities(t *testing.T, directfs bool) {
 		t.Fatalf("error starting container: %v", err)
 	}
 
-	wantSandboxCaps := spec.Process.Capabilities
+	caps = []string{
+		"CAP_SYS_PTRACE", // ptrace is added due to the platform choice.
+		"CAP_NET_ADMIN",
+		"CAP_NET_BIND_SERVICE",
+	}
+	wantSandboxCaps := &specs.LinuxCapabilities{
+		Permitted: caps,
+		Bounding:  caps,
+		Effective: caps,
+	}
 	if directfs {
 		// With directfs, the sandbox has additional capabilities.
 		wantSandboxCaps = specutils.MergeCapabilities(wantSandboxCaps, directfsSandboxLinuxCaps)

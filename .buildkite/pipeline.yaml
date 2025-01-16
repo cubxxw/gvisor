@@ -1,20 +1,14 @@
 _templates:
+  retry_settings: &retry_settings
+    automatic:
+      - exit_status: -1
+        limit: 10
+      - exit_status: "*"
+        limit: 2
   common: &common
     timeout_in_minutes: 30
     retry:
-      automatic:
-        - exit_status: -1
-          limit: 10
-        - exit_status: "*"
-          limit: 2
-  common_60_tl: &common_60_tl
-    timeout_in_minutes: 60
-    retry:
-      automatic:
-        - exit_status: -1
-          limit: 10
-        - exit_status: "*"
-          limit: 2
+      <<: *retry_settings
   source_test: &source_test
     if: build.env("STAGED_BINARIES") == null
   source_test_presubmit: &source_test_presubmit
@@ -88,6 +82,12 @@ steps:
       GLIBC_TUNABLES: glibc.pthread.rseq=0
     label: ":fire: Smoke race tests"
     command: make smoke-race-tests
+  - <<: *common
+    <<: *source_test
+    label: ":speedboat: Compile runsc-plugin-stack (AMD64)"
+    command: make runsc-plugin-stack
+    agents:
+      arch: "amd64"
 
   # Build runsc and pkg (presubmits only).
   - <<: *common
@@ -95,7 +95,7 @@ steps:
     label: ":world_map: Build runsc and pkg (AMD64)"
     commands:
       - "make build TARGETS=//pkg/..."
-      - "make build TARGETS=//runsc/..."
+      - "make build OPTIONS='--build_tag_filters=-network_plugins' TARGETS='//runsc/...'"
     agents:
       arch: "amd64"
 
@@ -104,16 +104,16 @@ steps:
     label: ":world_map: Build runsc and pkg (ARM64)"
     commands:
       - "make build TARGETS=//pkg/..."
-      - "make build TARGETS=//runsc/..."
+      - "make build OPTIONS='--build_tag_filters=-network_plugins' TARGETS='//runsc/...'"
     agents:
       arch: "arm64"
 
   # Build everything (continuous only).
-  - <<: *common_60_tl
+  - <<: *common
     <<: *source_test_continuous
     label: ":world_map: Build everything"
     commands:
-      - "make build TARGETS=//..."
+      - "make build OPTIONS='--build_tag_filters=-network_plugins' TARGETS='//...'"
 
   # Check that the Go branch builds. This is not technically required, as this build is maintained
   # as a GitHub action in order to preserve this maintaince across forks. However, providing the
@@ -168,6 +168,56 @@ steps:
       - git checkout go && git clean -xf .
       - GOOS=linux GOARCH=mips go build $$PACKAGES
 
+  # GPU workflow.
+  - <<: *common
+    <<: *source_test_presubmit
+    label: ":firefighter: GPU Smoke Tests"
+    commands:
+      - make sudo TARGETS=//tools/gpu:main ARGS="install --latest" || cat /var/log/nvidia-installer.log
+      - make gpu-smoke-tests
+    agents:
+      queue: gpu
+  - <<: *common
+    <<: *source_test_continuous
+    label: ":bun: COS Latest Driver Compatibility Test"
+    commands:
+      - tools/gpu/cos_drivers_test.sh
+  - <<: *common
+    <<: *source_test_continuous
+    label: ":screwdriver: GPU Tests"
+    commands:
+      - make sudo TARGETS=//tools/gpu:main ARGS="install --latest" || cat /var/log/nvidia-installer.log
+      - make gpu-all-tests
+    agents:
+      queue: gpu
+  - <<: *common
+    <<: *source_test_continuous
+    label: ":female_supervillain: COS GPU Tests"
+    commands:
+      - make cos-gpu-all-tests
+    agents:
+      queue: cos-canary-gpu
+  - <<: *source_test_continuous
+    label: ":fish: CUDA tests"
+    # This is its own test rather than being part of the GPU tests,
+    # because it takes around 30 minutes to run.
+    parallelism: 8
+    timeout_in_minutes: 60
+    retry:
+      <<: *retry_settings
+    commands:
+      - make sudo TARGETS=//tools/gpu:main ARGS="install --latest" || cat /var/log/nvidia-installer.log
+      - make cuda-tests
+    agents:
+      queue: gpu
+  - <<: *common
+    <<: *source_test_continuous
+    label: ":screwdriver: All GPU Drivers Test"
+    parallelism: 8
+    commands:
+      - tools/gpu/all_drivers_test.sh
+    agents:
+      queue: gpu
   # Release workflow.
   - <<: *common
     <<: *source_test
@@ -181,17 +231,17 @@ steps:
 
   # Images tests.
   - <<: *common
-    <<: *source_test
     label: ":docker: Images (x86_64)"
-    command: make ARCH=x86_64 load-all-images
+    if: build.env("SKIP_LOADING_IMAGES") == null && build.env("STAGED_BINARIES") == null
+    command: make ARCH=x86_64 test-all-test-images
     agents:
       arch: "amd64"
   - <<: *common
-    <<: *source_test
     label: ":docker: Images (aarch64)"
-    command: make ARCH=aarch64 load-all-images
+    if: build.env("SKIP_LOADING_IMAGES") == null && build.env("STAGED_BINARIES") == null
+    command: make ARCH=aarch64 test-all-test-images
     agents:
-      arch: "amd64"
+      arch: "arm64"
 
   # Basic unit tests.
   - <<: *common
@@ -239,10 +289,11 @@ steps:
       <<: *kvm_agents
       cgroup: "v2"
       arch: "amd64"
+
   # All system call tests.
   - <<: *common
     label: ":toolbox: System call tests (AMD64)"
-    command: "make BAZEL_OPTIONS=--test_tag_filters=$SYSCALL_TEST_FILTERS syscall-tests"
+    command: make BAZEL_OPTIONS=--test_tag_filters=-allsave syscall-tests
     parallelism: 20
     agents:
       <<: *platform_specific_agents
@@ -251,7 +302,23 @@ steps:
   - <<: *common
     <<: *source_test
     label: ":muscle: System call tests (ARM64)"
-    command: make BAZEL_OPTIONS=--test_tag_filters=runsc_ptrace,runsc_systrap syscall-tests
+    command: make BAZEL_OPTIONS=--test_tag_filters=-allsave,runsc_ptrace,runsc_systrap syscall-tests
+    parallelism: 10
+    agents:
+      arch: "arm64"
+  # With Save Restore on AMD64.
+  - <<: *common
+    <<: *source_test_continuous
+    label: ":muscle: System call save restore tests (AMD64)"
+    command: make BAZEL_OPTIONS=--test_tag_filters=save_restore syscall-tests
+    parallelism: 20
+    agents:
+      arch: "amd64"
+  # With Save Resume on ARM64.
+  - <<: *common
+    <<: *source_test_continuous
+    label: ":muscle: System call save resume tests (ARM64)"
+    command: make BAZEL_OPTIONS=--test_tag_filters=save_resume syscall-tests
     parallelism: 10
     agents:
       arch: "arm64"
@@ -307,6 +374,14 @@ steps:
     agents:
       <<: *platform_specific_agents
       <<: *ubuntu_agents
+      arch: "amd64"
+  - <<: *common
+    <<: *docker
+    <<: *source_test
+    label: ":satellite: gVisor network plugin tests"
+    command: make plugin-network-tests
+    agents:
+      <<: *kvm_agents
       arch: "amd64"
   - <<: *common
     <<: *source_test
@@ -440,99 +515,96 @@ steps:
   - <<: *common
     <<: *docker
     label: ":php: PHP runtime tests"
-    command: make php8.1.1-runtime-tests RUNTIME_ARGS=--directfs
-    parallelism: 10
+    command: make php8.3.7-runtime-tests RUNTIME_ARGS=--directfs
+    parallelism: 2
     agents:
       <<: *platform_specific_agents
-      <<: *ubuntu_agents
       arch: "amd64"
   - <<: *common
     <<: *docker
     label: ":java: Java runtime tests"
-    command: make java17-runtime-tests RUNTIME_ARGS=--directfs
+    command: make java21-runtime-tests RUNTIME_ARGS=--directfs
     parallelism: 40
     agents:
       <<: *platform_specific_agents
-      <<: *ubuntu_agents
       arch: "amd64"
   - <<: *common
     <<: *docker
     label: ":golang: Go runtime tests"
-    command: make go1.20-runtime-tests RUNTIME_ARGS=--directfs
+    command: make go1.22-runtime-tests RUNTIME_ARGS=--directfs
     parallelism: 10
     agents:
       <<: *platform_specific_agents
-      <<: *ubuntu_agents
       arch: "amd64"
   - <<: *common
     <<: *docker
     label: ":node: NodeJS runtime tests"
-    command: make nodejs16.13.2-runtime-tests RUNTIME_ARGS=--directfs
+    command: make nodejs22.2.0-runtime-tests RUNTIME_ARGS=--directfs
     parallelism: 10
     agents:
       <<: *platform_specific_agents
-      <<: *ubuntu_agents
       arch: "amd64"
   - <<: *common
     <<: *docker
     label: ":python: Python runtime tests"
-    command: make python3.10.2-runtime-tests RUNTIME_ARGS=--directfs
-    parallelism: 10
+    command: make python3.12.3-runtime-tests RUNTIME_ARGS=--directfs
+    parallelism: 2
     agents:
       <<: *platform_specific_agents
-      <<: *ubuntu_agents
       arch: "amd64"
 
   # Runtime tests (goferfs). Continuous only.
   - <<: *common
     <<: *docker
     label: ":php: PHP runtime tests (goferfs)"
-    command: make php8.1.1-runtime-tests RUNTIME_ARGS=--directfs=false
-    parallelism: 10
+    command: make php8.3.7-runtime-tests RUNTIME_ARGS=--directfs=false
+    parallelism: 2
     if: build.branch == "master"
     agents:
       <<: *platform_specific_agents
-      <<: *ubuntu_agents
       arch: "amd64"
   - <<: *common
     <<: *docker
     label: ":java: Java runtime tests (goferfs)"
-    command: make java17-runtime-tests RUNTIME_ARGS=--directfs=false
+    command: make java21-runtime-tests RUNTIME_ARGS=--directfs=false
     parallelism: 40
     if: build.branch == "master"
     agents:
       <<: *platform_specific_agents
-      <<: *ubuntu_agents
       arch: "amd64"
   - <<: *common
     <<: *docker
     label: ":golang: Go runtime tests (goferfs)"
-    command: make go1.20-runtime-tests RUNTIME_ARGS=--directfs=false
+    command: make go1.22-runtime-tests RUNTIME_ARGS=--directfs=false
     parallelism: 10
     if: build.branch == "master"
     agents:
       <<: *platform_specific_agents
-      <<: *ubuntu_agents
       arch: "amd64"
   - <<: *common
     <<: *docker
     label: ":node: NodeJS runtime tests (goferfs)"
-    command: make nodejs16.13.2-runtime-tests RUNTIME_ARGS=--directfs=false
+    command: make nodejs22.2.0-runtime-tests RUNTIME_ARGS=--directfs=false
     parallelism: 10
     if: build.branch == "master"
     agents:
       <<: *platform_specific_agents
-      <<: *ubuntu_agents
       arch: "amd64"
   - <<: *common
     <<: *docker
     label: ":python: Python runtime tests (goferfs)"
-    command: make python3.10.2-runtime-tests RUNTIME_ARGS=--directfs=false
-    parallelism: 10
+    command: make python3.12.3-runtime-tests RUNTIME_ARGS=--directfs=false
+    parallelism: 2
     if: build.branch == "master"
     agents:
       <<: *platform_specific_agents
-      <<: *ubuntu_agents
+      arch: "amd64"
+  - <<: *common
+    <<: *source_test_continuous
+    label: ":slot_machine: Syzkaller smoke test"
+    commands:
+      - make syzkaller-smoke-test
+    agents:
       arch: "amd64"
 
   # Run basic benchmarks smoke tests (no upload).
@@ -582,7 +654,7 @@ steps:
     command: make -i benchmark-platforms BENCHMARKS_FILTER="Continuous" BENCHMARKS_SUITE=httpd BENCHMARKS_TARGETS=test/benchmarks/network:httpd_test
   - <<: *benchmarks
     label: ":piedpiper: iperf benchmarks"
-    command: make -i benchmark-platforms BENCHMARKS_SUITE=iperf BENCHMARKS_TARGETS=test/benchmarks/network:iperf_test BENCHMARKS_FILTER=BenchmarkIperf$
+    command: make -i benchmark-platforms BENCHMARKS_SUITE=iperf BENCHMARKS_TARGETS=test/benchmarks/network:iperf_test BENCHMARKS_FILTER=BenchmarkIperfOneConnection
   - <<: *benchmarks
     label: ":nginx: nginx benchmarks"
     command: make -i benchmark-platforms BENCHMARKS_FILTER="Continuous" BENCHMARKS_SUITE=nginx BENCHMARKS_TARGETS=test/benchmarks/network:nginx_test

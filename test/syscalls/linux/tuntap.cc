@@ -26,12 +26,14 @@
 #include <sys/types.h>
 
 #include <cstddef>
+#include <cstring>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/str_split.h"
 #include "test/syscalls/linux/socket_netlink_route_util.h"
+#include "test/syscalls/linux/socket_netlink_util.h"
 #include "test/util/capability_util.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
@@ -220,13 +222,15 @@ TEST_F(TuntapTest, CreateFixedNameInterface) {
 
   FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(kDevNetTun, O_RDWR));
 
-  struct ifreq ifr_set = {};
+  struct ifreq ifr_set;
+  memset(&ifr_set, 0, sizeof(ifr_set));
   ifr_set.ifr_flags = IFF_TAP;
   strncpy(ifr_set.ifr_name, kTapName, IFNAMSIZ);
   EXPECT_THAT(ioctl(fd.get(), TUNSETIFF, &ifr_set),
               SyscallSucceedsWithValue(0));
 
-  struct ifreq ifr_get = {};
+  struct ifreq ifr_get;
+  memset(&ifr_get, 0, sizeof(ifr_get));
   EXPECT_THAT(ioctl(fd.get(), TUNGETIFF, &ifr_get),
               SyscallSucceedsWithValue(0));
 
@@ -325,9 +329,10 @@ PosixErrorOr<TunTapInterface> OpenAndAttachTunTap(const std::string& dev_name,
 
   ASSIGN_OR_RETURN_ERRNO(auto link, GetLinkByName(dev_name));
 
+  ASSIGN_OR_RETURN_ERRNO(auto nlsk, NetlinkBoundSocket(NETLINK_ROUTE));
   const struct in_addr dev_ipv4_addr = {.s_addr = dev_addr};
   // Interface setup.
-  EXPECT_NO_ERRNO(LinkAddLocalAddr(link.index, AF_INET, /*prefixlen=*/24,
+  EXPECT_NO_ERRNO(LinkAddLocalAddr(nlsk, link.index, AF_INET, /*prefixlen=*/24,
                                    &dev_ipv4_addr, sizeof(dev_ipv4_addr)));
 
   if (!IsRunningOnGvisor()) {
@@ -498,8 +503,10 @@ TEST_F(TuntapTest, TUNNoPacketInfo) {
   // Interface setup.
   auto link = ASSERT_NO_ERRNO_AND_VALUE(GetLinkByName(kTunName));
   const struct in_addr dev_ipv4_addr = {.s_addr = kTapIPAddr};
-  EXPECT_NO_ERRNO(LinkAddLocalAddr(link.index, AF_INET, 24, &dev_ipv4_addr,
-                                   sizeof(dev_ipv4_addr)));
+  FileDescriptor nlsk =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  EXPECT_NO_ERRNO(LinkAddLocalAddr(nlsk, link.index, AF_INET, 24,
+                                   &dev_ipv4_addr, sizeof(dev_ipv4_addr)));
 
   ping_ip_pkt ping_req = CreatePingIPPacket(kTapPeerIPAddr, kTapIPAddr);
 

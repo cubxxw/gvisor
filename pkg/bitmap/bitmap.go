@@ -250,6 +250,12 @@ func (b *Bitmap) FlipRange(begin, end uint32) {
 	}
 }
 
+// Reset zeroes the entire bitmap.
+func (b *Bitmap) Reset() {
+	b.numOnes = 0
+	clear(b.bitBlock)
+}
+
 // ForEach calls `f` for each set bit in the range [start, end).
 //
 // If f returns false, ForEach stops the iteration.
@@ -303,7 +309,7 @@ func (b *Bitmap) ToSlice() []uint32 {
 	return bitmapSlice
 }
 
-// GetNumOnes return the the number of ones in the Bitmap.
+// GetNumOnes return the number of ones in the Bitmap.
 func (b *Bitmap) GetNumOnes() uint32 {
 	return b.numOnes
 }

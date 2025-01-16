@@ -30,6 +30,7 @@ const (
 	_CR4_PGE        = 1 << 7
 	_CR4_OSFXSR     = 1 << 9
 	_CR4_OSXMMEXCPT = 1 << 10
+	_CR4_UMIP       = 1 << 11
 	_CR4_FSGSBASE   = 1 << 16
 	_CR4_PCIDE      = 1 << 17
 	_CR4_OSXSAVE    = 1 << 18
@@ -76,7 +77,7 @@ const (
 	//
 	// Here, _RFLAGS_IOPL0 is used only to determine whether the task is
 	// running in the kernel or userspace mode. In the user mode, the CPL is
-	// always 3 and it doesn't matter what IOPL is set if it is bellow CPL.
+	// always 3 and it doesn't matter what IOPL is set if it is below CPL.
 	//
 	// We need to have one bit which will be always different in user and
 	// kernel modes. And we have to remember that even though we have
@@ -100,7 +101,7 @@ const (
 	UserFlagsClear = _RFLAGS_NT | _RFLAGS_IOPL1
 )
 
-// IsKernelFlags returns true if rflags coresponds to the kernel mode.
+// IsKernelFlags returns true if rflags corresponds to the kernel mode.
 //
 //go:nosplit
 func IsKernelFlags(rflags uint64) bool {

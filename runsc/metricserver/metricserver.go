@@ -19,8 +19,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
@@ -261,6 +259,10 @@ type metricServer struct {
 	// Size of the map of written metrics during the last /metrics export. Initially zero.
 	// Used to efficiently reallocate a map of the right size during the next export.
 	lastMetricsWrittenSize atomicbitops.Uint32
+
+	// Pool of `prometheus.ReusableWriter`s. Used to avoid large buffer allocations for
+	// successive snapshots.
+	promWriterPool sync.Pool
 
 	// mu protects the fields below.
 	mu sync.Mutex
@@ -613,7 +615,7 @@ func queryMultiSandboxMetrics(ctx context.Context, loadedSandboxes []sandboxLoad
 }
 
 // serveMetrics serves metrics requests.
-func (m *metricServer) serveMetrics(w http.ResponseWriter, req *http.Request) httpResult {
+func (m *metricServer) serveMetrics(w *httpResponseWriter, req *http.Request) httpResult {
 	ctx, ctxCancel := context.WithTimeout(req.Context(), metricsExportTimeout)
 	defer ctxCancel()
 
@@ -738,10 +740,12 @@ func (m *metricServer) serveMetrics(w http.ResponseWriter, req *http.Request) ht
 	if metricsFilter != "" {
 		commentHeader = fmt.Sprintf("%s (filtered using regular expression: %q)", commentHeader, metricsFilter)
 	}
-	written, err := prometheus.Write(w, prometheus.ExportOptions{
+	promWriter := m.promWriterPool.Get().(*prometheus.ReusableWriter[*httpResponseWriter])
+	written, err := promWriter.Write(w, prometheus.ExportOptions{
 		CommentHeader:  commentHeader,
 		MetricsWritten: metricsWritten,
 	}, snapshotsToOptions)
+	m.promWriterPool.Put(promWriter)
 	if err != nil {
 		if written == 0 {
 			return httpResult{http.StatusServiceUnavailable, err}
@@ -761,7 +765,7 @@ func (m *metricServer) serveMetrics(w http.ResponseWriter, req *http.Request) ht
 // Returns a response prefixed by "runsc-metrics:OK" on success.
 // Clients can use this to assert that they are talking to the metrics server, as opposed to some
 // other random HTTP server.
-func (m *metricServer) serveHealthCheck(w http.ResponseWriter, req *http.Request) httpResult {
+func (m *metricServer) serveHealthCheck(w *httpResponseWriter, req *http.Request) httpResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.shuttingDown {
@@ -775,18 +779,18 @@ func (m *metricServer) serveHealthCheck(w http.ResponseWriter, req *http.Request
 		return httpResult{http.StatusBadRequest, fmt.Errorf("this metric server is configured to serve root directory: %s", m.rootDir)}
 	}
 	w.WriteHeader(http.StatusOK)
-	io.WriteString(w, "runsc-metrics:OK")
+	w.WriteString("runsc-metrics:OK")
 	return httpOK
 }
 
 // servePID serves the PID of the metric server process.
-func (m *metricServer) servePID(w http.ResponseWriter, req *http.Request) httpResult {
+func (m *metricServer) servePID(w *httpResponseWriter, req *http.Request) httpResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.shuttingDown {
 		return httpResult{http.StatusServiceUnavailable, errors.New("server is shutting down")}
 	}
-	io.WriteString(w, strconv.Itoa(m.pid))
+	w.WriteString(strconv.Itoa(m.pid))
 	return httpOK
 }
 
@@ -823,6 +827,11 @@ func (s *Server) Run(ctx context.Context) error {
 		pidFile:                s.PIDFile,
 		exposeProfileEndpoints: s.ExposeProfileEndpoints,
 		allowUnknownRoot:       s.AllowUnknownRoot,
+		promWriterPool: sync.Pool{
+			New: func() any {
+				return &prometheus.ReusableWriter[*httpResponseWriter]{}
+			},
+		},
 	}
 	conf := s.Config
 	if conf.MetricServer == "" {
@@ -835,15 +844,15 @@ func (s *Server) Run(ctx context.Context) error {
 		if !m.allowUnknownRoot {
 			return fmt.Errorf("invalid root directory %q: tried to list sandboxes within it and got: %w", conf.RootDir, err)
 		}
-		log.Warningf("Invalid root directory %q: tried to list sandboxes within it and got: %v. Continuing anyway, as the server is configured to tolerate this.", conf.RootDir, err)
+		log.Infof("Root directory %q: tried to list sandboxes within it and got: %v. Continuing anyway, as this is expected with --allow-unknown-root.", conf.RootDir, err)
 	}
 	// container.ListSandboxes uses a glob pattern, which doesn't error out on
 	// permission errors. Double-check by actually listing the directory.
-	if _, err := ioutil.ReadDir(conf.RootDir); err != nil {
+	if _, err := os.ReadDir(conf.RootDir); err != nil {
 		if !m.allowUnknownRoot {
 			return fmt.Errorf("invalid root directory %q: tried to list all entries within it and got: %w", conf.RootDir, err)
 		}
-		log.Warningf("Invalid root directory %q: tried to list all entries within it and got: %v. Continuing anyway, as the server is configured to tolerate this.", conf.RootDir, err)
+		log.Infof("Root directory %q: tried to list all entries within it and got: %v. Continuing anyway, as this is expected with --allow-unknown-root.", conf.RootDir, err)
 	}
 	m.startTime = time.Now()
 	m.rootDir = conf.RootDir
@@ -920,7 +929,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("cannot start background loop: %w", err)
 	}
 	if m.pidFile != "" {
-		if err := ioutil.WriteFile(m.pidFile, []byte(fmt.Sprintf("%d", m.pid)), 0644); err != nil {
+		if err := os.WriteFile(m.pidFile, []byte(fmt.Sprintf("%d", m.pid)), 0644); err != nil {
 			return fmt.Errorf("cannot write PID to file %q: %w", m.pidFile, err)
 		}
 		defer os.Remove(m.pidFile)

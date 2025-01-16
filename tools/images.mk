@@ -40,11 +40,17 @@ endif
 # Note that the image prefixes used here must match the image mangling in
 # runsc/testutil.MangleImage. Names are mangled in this way to ensure that all
 # tests are using locally-defined images (that are consistent and idempotent).
-REMOTE_IMAGE_PREFIX ?= gcr.io/gvisor-presubmit
-LOCAL_IMAGE_PREFIX ?= gvisor.dev/images
-ALL_IMAGES   := $(subst /,_,$(subst images/,,$(shell find images/ -name Dockerfile -o -name Dockerfile.$(ARCH) | xargs -n 1 dirname | uniq)))
-SUB_IMAGES   := $(foreach image,$(ALL_IMAGES),$(if $(findstring _,$(image)),$(image),))
-IMAGE_GROUPS := $(sort $(foreach image,$(SUB_IMAGES),$(firstword $(subst _, ,$(image)))))
+REMOTE_IMAGE_PREFIX ?= us-central1-docker.pkg.dev/gvisor-presubmit/gvisor-presubmit-images
+LOCAL_IMAGE_PREFIX  ?= gvisor.dev/images
+ALL_IMAGES          := $(subst /,_,$(subst images/,,$(shell find images/ -name Dockerfile -o -name Dockerfile.$(ARCH) | xargs -n 1 dirname | uniq)))
+NON_TEST_IMAGES     := gpu/ollama/bench\|gpu/vllm
+TEST_IMAGES         := $(subst /,_,$(subst images/,,$(shell find images/ -name Dockerfile -o -name Dockerfile.$(ARCH) | xargs -n 1 dirname | uniq | grep -v "$(NON_TEST_IMAGES)")))
+SUB_IMAGES          := $(foreach image,$(ALL_IMAGES),$(if $(findstring _,$(image)),$(image),))
+IMAGE_GROUPS        := $(sort $(foreach image,$(SUB_IMAGES),$(firstword $(subst _, ,$(image)))))
+
+# If set to 'true', will skip loading any image from remote.
+# This will only work if local images already exist in Docker.
+SKIP_IMAGE_LOAD     ?=
 
 define expand_group =
 load-$(1): $$(patsubst $(1)_%, load-$(1)_%, $$(filter $(1)_%,$$(ALL_IMAGES)))
@@ -60,13 +66,29 @@ list-all-images: ## List all images.
 	@for image in $(ALL_IMAGES); do echo $${image}; done
 .PHONY: list-all-images
 
+list-all-test-images: ## List all test images.
+	@for image in $(TEST_IMAGES); do echo $${image}; done
+.PHONY: list-all-test-images
+
 load-all-images: ## Load all images.
 load-all-images: $(patsubst %,load-%,$(ALL_IMAGES))
 .PHONY: load-all-images
 
+load-all-test-images: ## Load all test images.
+load-all-test-images: $(patsubst %,load-%,$(TEST_IMAGES))
+.PHONY: load-all-test-images
+
+test-all-test-images: ## Test all test images.
+test-all-test-images: $(patsubst %,test-%,$(TEST_IMAGES))
+.PHONY: test-all-test-images
+
 push-all-images: ## Push all images.
 push-all-images: $(patsubst %,push-%,$(ALL_IMAGES))
 .PHONY: push-all-images
+
+push-all-test-images: ## Push all images.
+push-all-test-images: $(patsubst %,push-%,$(TEST_IMAGES))
+.PHONY: push-all-test-images
 
 # path and dockerfile are used to extract the relevant path and dockerfile
 # (depending on what's available for the given architecture).
@@ -110,10 +132,15 @@ $(foreach image, $(ALL_IMAGES), $(eval $(call tag_expand_rule,$(image))))
 local_tag = \
   docker tag $(call remote_image,$(1)):$(call tag,$(1)) $(call local_image,$(1)):$(call tag,$(1)) >&2
 latest_tag = \
-  docker tag $(call local_image,$(1)):$(call tag,$(1)) $(call local_image,$(1)) >&2
+  docker tag $(call local_image,$(1)):$(call tag,$(1)) $(call local_image,$(1)):latest >&2
+tag_exists = \
+  docker image inspect $(call local_image,$(1)):$(call tag,$(1)) &>/dev/null
 tag-%: ## Tag a local image.
 	@$(call header,TAG $*)
 	@$(call local_tag,$*) && $(call latest_tag,$*)
+
+image_manifest = \
+	docker run --rm gcr.io/go-containerregistry/crane manifest $(call remote_image,$(1)):$(call tag,$(1))
 
 # pull forces the image to be pulled.
 pull = \
@@ -146,14 +173,41 @@ rebuild-%: register-cross ## Force rebuild an image locally.
 # load will either pull the "remote" or build it locally. This is the preferred
 # entrypoint, as it should never fail. The local tag should always be set after
 # this returns (either by the pull or the build).
+# If the image is not available for the current architecture, it is not loaded.
 load-%: register-cross ## Pull or build an image locally.
-	@($(call pull,$*)) || ($(call rebuild,$*))
+	@if [ -f "$(call path,$*)/$(call dockerfile,$*)" ]; then \
+	  if [ "$(SKIP_IMAGE_LOAD)" == true ]; then \
+	    if ! $(call tag_exists,$*); then \
+	      echo "Image $* does not exist locally and SKIP_IMAGE_LOAD is set so cannot pull it. Failing." >&2; \
+	      exit 1; \
+	    fi; \
+	  else \
+	    ($(call pull,$*)) || ($(call rebuild,$*)); \
+	  fi; \
+	else \
+	  echo "Image $* is not available on $$(uname -m), ignoring it." >&2; \
+	fi
 
-# push pushes the remote image, after either pulling (to validate that the tag
-# already exists) or building manually. Note that this generic rule will match
-# the fully-expanded remote image tag.
-push-%: load-% ## Push a given image.
-	@docker image push $(call remote_image,$*):$(call tag,$*) >&2
+test-%: register-cross ## Build an image locally if the remote doesn't exist.
+	@($(call image_manifest,$*)) >&2 || ($(call rebuild,$*))
+
+local-image-%: register-cross ## Print current 'image:tag' for a local image.
+	echo "$(call local_image,$*):$(call tag,$*)"
+
+# push pushes the remote image, after validating that the tag doesn't exist
+# yet. Note that this generic rule will match the fully-expanded remote image
+# tag.
+# If DOCKER_PUSH_AS_LATEST is set to true, this also marks this image as being
+# the latest one on the remote repository.
+DOCKER_PUSH_AS_LATEST ?= false
+push-%:
+	$(call image_manifest,$*) >&2 || \
+	( $(call rebuild,$*) && \
+	  docker image push $(call remote_image,$*):$(call tag,$*) >&2 && \
+	  ( test $(DOCKER_PUSH_AS_LATEST) '!=' true || \
+	    docker image push $(call remote_image,$*):latest >&2 \
+	  ) \
+	)
 
 # register-cross registers the necessary qemu binaries for cross-compilation.
 # This may be used by any target that may execute containers that are not the

@@ -21,6 +21,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 )
@@ -32,7 +33,7 @@ func fpsimdPtr(addr *byte) *arch.FpsimdContext {
 	return (*arch.FpsimdContext)(unsafe.Pointer(addr))
 }
 
-// dieArchSetup initialies the state for dieTrampoline.
+// dieArchSetup initializes the state for dieTrampoline.
 //
 // The arm64 dieTrampoline requires the vCPU to be set in R1, and the last PC
 // to be in R0. The trampoline then simulates a call to dieHandler from the
@@ -77,7 +78,7 @@ func getHypercallID(addr uintptr) int {
 	}
 }
 
-// bluepillStopGuest is reponsible for injecting sError.
+// bluepillStopGuest is responsible for injecting sError.
 //
 //go:nosplit
 func bluepillStopGuest(c *vCPU) {
@@ -88,16 +89,16 @@ func bluepillStopGuest(c *vCPU) {
 		},
 	}
 
-	if _, _, errno := unix.RawSyscall( // escapes: no.
+	if errno := hostsyscall.RawSyscallErrno( // escapes: no.
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_SET_VCPU_EVENTS,
+		KVM_SET_VCPU_EVENTS,
 		uintptr(unsafe.Pointer(vcpuSErrBounce))); errno != 0 {
 		throw("bounce sErr injection failed")
 	}
 }
 
-// bluepillSigBus is reponsible for injecting sError to trigger sigbus.
+// bluepillSigBus is responsible for injecting sError to trigger sigbus.
 //
 //go:nosplit
 func bluepillSigBus(c *vCPU) {
@@ -111,10 +112,10 @@ func bluepillSigBus(c *vCPU) {
 	}
 
 	// Host must support ARM64_HAS_RAS_EXTN.
-	if _, _, errno := unix.RawSyscall( // escapes: no.
+	if errno := hostsyscall.RawSyscallErrno( // escapes: no.
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_SET_VCPU_EVENTS,
+		KVM_SET_VCPU_EVENTS,
 		uintptr(unsafe.Pointer(vcpuSErrNMI))); errno != 0 {
 		if errno == unix.EINVAL {
 			throw("No ARM64_HAS_RAS_EXTN feature in host.")
@@ -123,7 +124,7 @@ func bluepillSigBus(c *vCPU) {
 	}
 }
 
-// bluepillExtDabt is reponsible for injecting external data abort.
+// bluepillExtDabt is responsible for injecting external data abort.
 //
 //go:nosplit
 func bluepillExtDabt(c *vCPU) {
@@ -134,16 +135,16 @@ func bluepillExtDabt(c *vCPU) {
 		},
 	}
 
-	if _, _, errno := unix.RawSyscall( // escapes: no.
+	if errno := hostsyscall.RawSyscallErrno( // escapes: no.
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_SET_VCPU_EVENTS,
+		KVM_SET_VCPU_EVENTS,
 		uintptr(unsafe.Pointer(vcpuExtDabt))); errno != 0 {
 		throw("ext_dabt injection failed")
 	}
 }
 
-// bluepillHandleEnosys is reponsible for handling enosys error.
+// bluepillHandleEnosys is responsible for handling enosys error.
 //
 //go:nosplit
 func bluepillHandleEnosys(c *vCPU) {

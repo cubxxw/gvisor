@@ -24,7 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 )
 
 // The most significant 29 bits hold either a pid or a file descriptor.
@@ -241,20 +241,7 @@ func ClockNanosleep(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (
 // If blocking is interrupted, the syscall is restarted with the original
 // arguments.
 func clockNanosleepUntil(t *kernel.Task, c ktime.Clock, end ktime.Time, rem hostarch.Addr, needRestartBlock bool) error {
-	var err error
-	if c == t.Kernel().MonotonicClock() {
-		err = t.BlockWithDeadline(nil, true, end)
-	} else {
-		notifier, tchan := ktime.NewChannelNotifier()
-		timer := ktime.NewTimer(c, notifier)
-		timer.Swap(ktime.Setting{
-			Period:  0,
-			Enabled: true,
-			Next:    end,
-		})
-		err = t.BlockWithTimer(nil, tchan)
-		timer.Destroy()
-	}
+	err := t.BlockWithDeadlineFrom(nil, c, true, end)
 
 	switch {
 	case linuxerr.Equals(linuxerr.ETIMEDOUT, err):

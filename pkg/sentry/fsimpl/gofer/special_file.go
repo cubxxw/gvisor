@@ -43,6 +43,7 @@ import (
 type specialFileFD struct {
 	fileDescription
 	specialFDEntry
+	memmap.NoBufferedIOFallback
 
 	// releaseMu synchronizes the closing of fd.handle with fd.sync(). It's safe
 	// to access fd.handle without locking for operations that require a ref to
@@ -481,6 +482,10 @@ func (fd *specialFileFD) Translate(ctx context.Context, required, optional memma
 
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
 func (fd *specialFileFD) InvalidateUnsavable(ctx context.Context) error {
+	d := fd.dentry()
+	d.mapsMu.Lock()
+	defer d.mapsMu.Unlock()
+	d.mappings.InvalidateAll(memmap.InvalidateOpts{})
 	return nil
 }
 
@@ -502,6 +507,11 @@ func (fd *specialFileFD) DecRef(fr memmap.FileRange) {
 func (fd *specialFileFD) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
 	fd.requireHostFD()
 	return fd.hostFileMapper.MapInternal(fr, int(fd.handle.fd), at.Write)
+}
+
+// DataFD implements memmap.File.DataFD.
+func (fd *specialFileFD) DataFD(fr memmap.FileRange) (int, error) {
+	return fd.FD(), nil
 }
 
 // FD implements memmap.File.FD.

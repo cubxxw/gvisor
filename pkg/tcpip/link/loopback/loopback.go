@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package loopback provides the implemention of loopback data-link layer
+// Package loopback provides the implementation of loopback data-link layer
 // endpoints. Such endpoints just turn outbound packets into inbound ones.
 //
 // Loopback endpoints can be used in the networking stack by calling New() to
@@ -21,23 +21,32 @@
 package loopback
 
 import (
-	"sync"
-
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
+const (
+	loopbackMTU = 65536
+)
+
+// +stateify savable
 type endpoint struct {
-	mu sync.RWMutex
+	mu endpointRWMutex `state:"nosave"`
 	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
+	// +checklocks:mu
+	addr tcpip.LinkAddress
+	// +checklocks:mu
+	mtu uint32
 }
 
 // New creates a new loopback endpoint. This link-layer endpoint just turns
 // outbound packets into inbound packets.
 func New() stack.LinkEndpoint {
-	return &endpoint{}
+	return &endpoint{
+		mtu: loopbackMTU,
+	}
 }
 
 // Attach implements stack.LinkEndpoint.Attach. It just saves the stack network-
@@ -55,10 +64,18 @@ func (e *endpoint) IsAttached() bool {
 	return e.dispatcher != nil
 }
 
-// MTU implements stack.LinkEndpoint.MTU. It returns a constant that matches the
-// linux loopback interface.
-func (*endpoint) MTU() uint32 {
-	return 65536
+// MTU implements stack.LinkEndpoint.MTU.
+func (e *endpoint) MTU() uint32 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.mtu
+}
+
+// SetMTU implements stack.LinkEndpoint.SetMTU. It has no impact.
+func (e *endpoint) SetMTU(mtu uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mtu = mtu
 }
 
 // Capabilities implements stack.LinkEndpoint.Capabilities. Loopback advertises
@@ -74,8 +91,17 @@ func (*endpoint) MaxHeaderLength() uint16 {
 }
 
 // LinkAddress returns the link address of this endpoint.
-func (*endpoint) LinkAddress() tcpip.LinkAddress {
-	return ""
+func (e *endpoint) LinkAddress() tcpip.LinkAddress {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.addr
+}
+
+// SetLinkAddress implements stack.LinkEndpoint.SetLinkAddress.
+func (e *endpoint) SetLinkAddress(addr tcpip.LinkAddress) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.addr = addr
 }
 
 // Wait implements stack.LinkEndpoint.Wait.
@@ -108,7 +134,13 @@ func (*endpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.
-func (*endpoint) AddHeader(stack.PacketBufferPtr) {}
+func (*endpoint) AddHeader(*stack.PacketBuffer) {}
 
 // ParseHeader implements stack.LinkEndpoint.
-func (*endpoint) ParseHeader(stack.PacketBufferPtr) bool { return true }
+func (*endpoint) ParseHeader(*stack.PacketBuffer) bool { return true }
+
+// Close implements stack.LinkEndpoint.
+func (*endpoint) Close() {}
+
+// SetOnCloseAction implements stack.LinkEndpoint.
+func (*endpoint) SetOnCloseAction(func()) {}

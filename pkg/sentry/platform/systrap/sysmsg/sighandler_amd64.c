@@ -32,6 +32,10 @@
 #include "sysmsg_offsets.h"
 #include "sysmsg_offsets_amd64.h"
 
+#ifndef X86_TRAP_PF
+#define X86_TRAP_PF 14
+#endif
+
 // TODO(b/271631387): These globals are shared between AMD64 and ARM64; move to
 // sysmsg_lib.c.
 struct arch_state __export_arch_state;
@@ -138,7 +142,7 @@ static uint64_t get_fsbase(void) {
     int ret =
         __syscall(__NR_arch_prctl, ARCH_GET_FS, (long)&fsbase, 0, 0, 0, 0);
     if (ret) {
-      panic(ret);
+      panic(STUB_ERROR_ARCH_PRCTL, ret);
     }
   }
   return fsbase;
@@ -151,7 +155,7 @@ static void set_fsbase(uint64_t fsbase) {
   } else {
     int ret = __syscall(__NR_arch_prctl, ARCH_SET_FS, fsbase, 0, 0, 0, 0);
     if (ret) {
-      panic(ret);
+      panic(STUB_ERROR_ARCH_PRCTL, ret);
     }
   }
 }
@@ -161,6 +165,7 @@ static void set_fsbase(uint64_t fsbase) {
 struct thread_context *switch_context_amd64(
     struct sysmsg *sysmsg, struct thread_context *ctx,
     enum context_state new_context_state) {
+  // NOTE: Both ctx and old_ctx may not be valid and should not be dereferenced.
   struct thread_context *old_ctx = sysmsg->context;
 
   for (;;) {
@@ -198,7 +203,7 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   void *sp = sysmsg_sp();
   struct sysmsg *sysmsg = sysmsg_addr(sp);
 
-  if (sysmsg != sysmsg->self) panic(0xdeaddead);
+  if (sysmsg != sysmsg->self) panic(STUB_ERROR_BAD_SYSMSG, 0);
   int32_t thread_state = atomic_load(&sysmsg->state);
   if (thread_state == THREAD_STATE_INITIALIZING) {
     // This thread was interrupted before it even had a context.
@@ -230,11 +235,10 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   if (signo != SIGCHLD ||
       ucontext->uc_mcontext.gregs[REG_RIP] < __export_stub_start) {
     ctx->ptregs.fs_base = fs_base;
+    ctx->err = 0;
     gregs_to_ptregs(ucontext, &ctx->ptregs);
     memcpy(ctx->fpstate, (uint8_t *)ucontext->uc_mcontext.fpregs,
            __export_arch_state.fp_len);
-
-    atomic_store(&ctx->fpstate_changed, 0);
   }
 
   enum context_state ctx_state = CONTEXT_STATE_INVALID;
@@ -286,7 +290,7 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
         uint8_t syscall_opcode = *(syscall_code + 6);
 
         // A binary patch is built so that the first byte of the syscall
-        // instruction is changed on the invalid instuction. If we meet this
+        // instruction is changed on the invalid instruction. If we meet this
         // case, this means that another thread has been patched this syscall
         // and we need to restart it.
         if (syscall_opcode == FAULT_OPCODE) {
@@ -307,8 +311,12 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
         ctx->ptregs.orig_rax += 0x86000000;
       break;
     }
-    case SIGCHLD:
     case SIGSEGV:
+      if (ucontext->uc_mcontext.gregs[REG_TRAPNO] == X86_TRAP_PF) {
+        ctx->err = ucontext->uc_mcontext.gregs[REG_ERR];
+      }
+    // fallthrough
+    case SIGCHLD:
     case SIGBUS:
     case SIGFPE:
     case SIGTRAP:
@@ -320,6 +328,7 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
       return;
   }
 
+  atomic_store(&ctx->fpstate_changed, 0);
   ctx = switch_context_amd64(sysmsg, ctx, ctx_state);
   if (fs_base != ctx->ptregs.fs_base) {
     set_fsbase(ctx->ptregs.fs_base);
@@ -340,7 +349,7 @@ void __syshandler() {
   // SYSMSG_STATE_PREP is set to postpone interrupts. Look at
   // __export_sighandler for more details.
   int state = atomic_load(&sysmsg->state);
-  if (state != THREAD_STATE_PREP) panic(state);
+  if (state != THREAD_STATE_PREP) panic(STUB_ERROR_BAD_THREAD_STATE, 0);
 
   struct thread_context *ctx = sysmsg->context;
 
@@ -353,6 +362,7 @@ void __syshandler() {
   long fs_base = get_fsbase();
   ctx->ptregs.fs_base = fs_base;
 
+  atomic_store(&ctx->fpstate_changed, 0);
   ctx = switch_context_amd64(sysmsg, ctx, ctx_state);
   // switch_context_amd64 changed sysmsg->state to THREAD_STATE_NONE, so we can
   // only resume the current process, all other actions are
@@ -368,7 +378,7 @@ void __export_start(struct sysmsg *sysmsg, void *_ucontext) {
 
   asm volatile("movq %%gs:0, %0\n" : "=r"(sysmsg) : :);
   if (sysmsg->self != sysmsg) {
-    panic(0xdeaddead);
+    panic(STUB_ERROR_BAD_SYSMSG, 0);
   }
 
   struct thread_context *ctx =
@@ -480,7 +490,7 @@ static void prep_fpstate_for_sigframe(void *buf, uint32_t user_size,
 
   sw_bytes->magic1 = FP_XSTATE_MAGIC1;
   sw_bytes->extended_size = user_size + FP_XSTATE_MAGIC2_SIZE;
-  sw_bytes->xfeatures = ~(0ULL);
+  sw_bytes->xfeatures = ~(0ULL) ^ (XCR0_DISABLED_MASK);
   sw_bytes->xstate_size = user_size;
   *(uint32_t *)(buf + user_size) = use_xsave ? FP_XSTATE_MAGIC2 : 0;
 }

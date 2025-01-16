@@ -14,10 +14,13 @@
 
 #include <fcntl.h>
 
+#include <memory>
+
 #ifdef __linux__
 #include <linux/filter.h>
 #include <sys/epoll.h>
 #endif  // __linux__
+#include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -28,6 +31,7 @@
 #include <limits>
 #include <vector>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/status/statusor.h"
 #include "absl/time/clock.h"
@@ -37,6 +41,8 @@
 #include "test/util/socket_util.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
+
+using ::testing::AnyOf;
 
 namespace gvisor {
 namespace testing {
@@ -133,7 +139,7 @@ static void FillSocketBuffers(int sender, int receiver) {
   while (RetryEINTR(send)(sender, buf.data(), buf.size(), 0) != -1) {
     // Sleep to give linux a chance to move data from the send buffer to the
     // receive buffer.
-    absl::SleepFor(absl::Milliseconds(100));  // 100ms.
+    absl::SleepFor(absl::Milliseconds(200));  // 200ms.
   }
   // The last error should have been EWOULDBLOCK.
   ASSERT_EQ(errno, EWOULDBLOCK);
@@ -521,7 +527,7 @@ TEST_P(TcpSocketTest, PollWithFullBufferBlocks) {
 
 TEST_P(TcpSocketTest, ClosedWriteBlockingSocket) {
   FillSocketBuffers(connected_.get(), accepted_.get());
-  constexpr int timeout = 10;
+  constexpr int timeout = 3;
   struct timeval tv = {.tv_sec = timeout, .tv_usec = 0};
   EXPECT_THAT(
       setsockopt(connected_.get(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)),
@@ -554,7 +560,7 @@ TEST_P(TcpSocketTest, ClosedWriteBlockingSocket) {
 }
 
 TEST_P(TcpSocketTest, ClosedReadBlockingSocket) {
-  constexpr int timeout = 10;
+  constexpr int timeout = 3;
   struct timeval tv = {.tv_sec = timeout, .tv_usec = 0};
   EXPECT_THAT(
       setsockopt(connected_.get(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)),
@@ -1016,6 +1022,39 @@ TEST_P(SimpleTcpSocketTest, GetPeerNameUnconnected) {
               SyscallFailsWithErrno(ENOTCONN));
 }
 
+TEST_P(SimpleTcpSocketTest, GetSockNameUnbound) {
+  int fd;
+  ASSERT_THAT(fd = socket(GetParam(), SOCK_STREAM, IPPROTO_TCP),
+              SyscallSucceeds());
+  FileDescriptor sock_fd(fd);
+
+  sockaddr_storage addr;
+  // Ensure that any 0s we read later have been explicitly set by getsockname.
+  memset(&addr, -1, sizeof(addr));
+  socklen_t addrlen = sizeof(addr);
+  EXPECT_THAT(getsockname(fd, AsSockAddr(&addr), &addrlen), SyscallSucceeds());
+  switch (GetParam()) {
+    case AF_INET: {
+      ASSERT_EQ(addrlen, sizeof(sockaddr_in));
+      auto sock_addr_in = reinterpret_cast<const sockaddr_in*>(&addr);
+      ASSERT_EQ(sock_addr_in->sin_addr.s_addr, 0);
+      ASSERT_EQ(sock_addr_in->sin_port, 0);
+      break;
+    }
+    case AF_INET6: {
+      ASSERT_EQ(addrlen, sizeof(sockaddr_in6));
+      auto sock_addr_in6 = reinterpret_cast<const sockaddr_in6*>(&addr);
+      ASSERT_TRUE(IN6_IS_ADDR_UNSPECIFIED(&sock_addr_in6->sin6_addr));
+      ASSERT_EQ(sock_addr_in6->sin6_port, 0);
+      break;
+    }
+    default: {
+      ADD_FAILURE() << "unreachable";
+      break;
+    }
+  }
+}
+
 TEST_P(TcpSocketTest, FullBuffer) {
   // Set both FDs to be blocking.
   int flags = 0;
@@ -1221,7 +1260,8 @@ PosixErrorOr<FileDescriptor> nonBlockingConnectNoListener(
 
   // Wait for the connect to fail.
   struct pollfd poll_fd = {s.get(), POLLERR, 0};
-  EXPECT_THAT(RetryEINTR(poll)(&poll_fd, 1, 1000), SyscallSucceedsWithValue(1));
+  EXPECT_THAT(RetryEINTR(poll)(&poll_fd, 1, kTimeoutMillis),
+              SyscallSucceedsWithValue(1));
   return std::move(s);
 }
 
@@ -1279,21 +1319,22 @@ TEST_P(SimpleTcpSocketTest, ListenConnectParallel) {
   std::vector<std::unique_ptr<ScopedThread>> threads;
   threads.reserve(num_threads);
   for (int i = 0; i < num_threads; i++) {
-    threads.push_back(
-        std::make_unique<ScopedThread>([&addr, &addrlen, family]() {
-          const FileDescriptor c = ASSERT_NO_ERRNO_AND_VALUE(
-              Socket(family, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP));
+    threads.push_back(std::make_unique<ScopedThread>([&addr, &addrlen,
+                                                      family]() {
+      const FileDescriptor c = ASSERT_NO_ERRNO_AND_VALUE(
+          Socket(family, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP));
 
-          // Now connect to the bound address and this should fail as nothing
-          // is listening on the bound address.
-          EXPECT_THAT(RetryEINTR(connect)(c.get(), AsSockAddr(&addr), addrlen),
-                      SyscallFailsWithErrno(EINPROGRESS));
-          // Wait for the connect to fail or succeed as it can race with the
-          // socket listening.
-          struct pollfd poll_fd = {c.get(), POLLERR | POLLOUT, 0};
-          EXPECT_THAT(RetryEINTR(poll)(&poll_fd, 1, 1000),
-                      SyscallSucceedsWithValue(1));
-        }));
+      // Now connect to the bound address and this should fail as nothing
+      // is listening on the bound address.
+      EXPECT_THAT(RetryEINTR(connect)(c.get(), AsSockAddr(&addr), addrlen),
+                  SyscallFailsWithErrno(EINPROGRESS));
+      // Wait for the connect to fail or succeed as it can race with the
+      // socket listening.
+      struct pollfd poll_fd = {c.get(), POLLERR | POLLOUT, 0};
+      const int timeout = GvisorPlatform() == Platform::kFuchsia ? -1 : 1000;
+      EXPECT_THAT(RetryEINTR(poll)(&poll_fd, 1, timeout),
+                  SyscallSucceedsWithValue(1));
+    }));
   }
 }
 
@@ -1696,7 +1737,8 @@ TEST_P(SimpleTcpSocketTest, NonBlockingConnectRefused) {
   // We don't need to specify any events to get POLLHUP or POLLERR as these
   // are added before the poll.
   struct pollfd poll_fd = {s.get(), /*events=*/0, 0};
-  EXPECT_THAT(RetryEINTR(poll)(&poll_fd, 1, 1000), SyscallSucceedsWithValue(1));
+  EXPECT_THAT(RetryEINTR(poll)(&poll_fd, 1, kTimeoutMillis),
+              SyscallSucceedsWithValue(1));
 
   // The ECONNREFUSED should cause us to be woken up with POLLHUP.
   EXPECT_NE(poll_fd.revents & (POLLHUP | POLLERR), 0);
@@ -1857,17 +1899,19 @@ TEST_P(SimpleTcpSocketTest, SetMaxSeg) {
                          sizeof(kTCPMaxSeg)),
               SyscallSucceedsWithValue(0));
 
-  // Linux actually never returns the user_mss value. It will always return the
-  // default MSS value defined above for an unconnected socket and always return
-  // the actual current MSS for a connected one.
   int optval;
   socklen_t optlen = sizeof(optval);
   ASSERT_THAT(getsockopt(s.get(), IPPROTO_TCP, TCP_MAXSEG, &optval, &optlen),
               SyscallSucceedsWithValue(0));
   ASSERT_EQ(optlen, sizeof(optval));
 
-  EXPECT_EQ(kDefaultMSS, optval);
-  EXPECT_EQ(sizeof(optval), optlen);
+  // In older Linux versions, user_mss value was never actually returned. Linux
+  // would always return the default MSS value for an unconnected socket and
+  // always return the actual current MSS for a connected one. However, the
+  // behavior changed since 34dfde4ad87b ("tcp: Return user_mss for TCP_MAXSEG
+  // in CLOSE/LISTEN state if user_mss set"). With this change, user_mss is
+  // returned if set for unconnected sockets. So allow both.
+  EXPECT_THAT(optval, AnyOf(kDefaultMSS, kTCPMaxSeg));
 }
 
 TEST_P(SimpleTcpSocketTest, SetMaxSegFailsForInvalidMSSValues) {
@@ -2287,6 +2331,49 @@ TEST_P(TcpSocketTest, GetSocketAcceptConnNonListener) {
   EXPECT_EQ(got, 0);
 }
 
+TEST_P(TcpSocketTest, SetPMTUD) {
+  // IP_PMTUDISC_WANT should be default.
+  int got = -1;
+  socklen_t length = sizeof(got);
+  ASSERT_THAT(
+      getsockopt(accepted_.get(), SOL_IP, IP_MTU_DISCOVER, &got, &length),
+      SyscallSucceeds());
+  EXPECT_EQ(got, IP_PMTUDISC_WANT);
+
+  int set = IP_PMTUDISC_DO;
+  ASSERT_THAT(
+      setsockopt(accepted_.get(), SOL_IP, IP_MTU_DISCOVER, &set, length),
+      SyscallSucceeds());
+  ASSERT_THAT(
+      getsockopt(accepted_.get(), SOL_IP, IP_MTU_DISCOVER, &got, &length),
+      SyscallSucceeds());
+  EXPECT_EQ(got, IP_PMTUDISC_DO);
+  set = IP_PMTUDISC_DONT;
+  ASSERT_THAT(
+      setsockopt(accepted_.get(), SOL_IP, IP_MTU_DISCOVER, &set, length),
+      SyscallSucceeds());
+  ASSERT_THAT(
+      getsockopt(accepted_.get(), SOL_IP, IP_MTU_DISCOVER, &got, &length),
+      SyscallSucceeds());
+  EXPECT_EQ(got, IP_PMTUDISC_DONT);
+
+  // IP_PMTUDISC_PROBE is not supported by gVisor.
+  set = IP_PMTUDISC_PROBE;
+  if (IsRunningOnGvisor() && !IsRunningWithHostinet()) {
+    ASSERT_THAT(
+        setsockopt(accepted_.get(), SOL_IP, IP_MTU_DISCOVER, &set, length),
+        SyscallFailsWithErrno(ENOTSUP));
+  } else {
+    ASSERT_THAT(
+        setsockopt(accepted_.get(), SOL_IP, IP_MTU_DISCOVER, &set, length),
+        SyscallSucceeds());
+    ASSERT_THAT(
+        getsockopt(accepted_.get(), SOL_IP, IP_MTU_DISCOVER, &got, &length),
+        SyscallSucceeds());
+    EXPECT_EQ(got, IP_PMTUDISC_PROBE);
+  }
+}
+
 TEST_P(SimpleTcpSocketTest, GetSocketAcceptConnWithShutdown) {
   // TODO(b/171345701): Fix the TCP state for listening socket on shutdown.
   SKIP_IF(IsRunningOnGvisor());
@@ -2372,24 +2459,18 @@ void ShutdownConnectingSocket(int domain, int shutdown_mode) {
 }
 
 TEST_P(SimpleTcpSocketTest, ShutdownReadConnectingSocket) {
-  // TODO(b/171436815): Re-enable when S/R is fixed.
-  const DisableSave disable_save;
   // TODO(b/175409607): Fix this test for hostinet.
   SKIP_IF(IsRunningWithHostinet());
   ShutdownConnectingSocket(GetParam(), SHUT_RD);
 }
 
 TEST_P(SimpleTcpSocketTest, ShutdownWriteConnectingSocket) {
-  // TODO(b/171436815): Re-enable when S/R is fixed.
-  const DisableSave disable_save;
   // TODO(b/175409607): Fix this test for hostinet.
   SKIP_IF(IsRunningWithHostinet());
   ShutdownConnectingSocket(GetParam(), SHUT_WR);
 }
 
 TEST_P(SimpleTcpSocketTest, ShutdownReadWriteConnectingSocket) {
-  // TODO(b/171436815): Re-enable when S/R is fixed.
-  const DisableSave disable_save;
   // TODO(b/175409607): Fix this test for hostinet.
   SKIP_IF(IsRunningWithHostinet());
   ShutdownConnectingSocket(GetParam(), SHUT_RDWR);
@@ -2537,7 +2618,7 @@ TEST_P(SimpleTcpSocketTest, SynRcvdOnListenerShutdown) {
 
       if (err == 0) {
         EXPECT_EQ(poll_fd.revents, POLLOUT
-        // TODO(https://fxbug.dev/73258): Remove when POLLWRNORM is correctly
+        // TODO(https://fxbug.dev/42152810): Remove when POLLWRNORM is correctly
         // asserted in Fuchsia.
 #if !defined(__Fuchsia__)
                                        | POLLWRNORM
@@ -2556,8 +2637,8 @@ TEST_P(SimpleTcpSocketTest, SynRcvdOnListenerShutdown) {
                     SyscallSucceedsWithValue(1));
 
         EXPECT_EQ(poll_fd.revents,
-        // TODO(https://fxbug.dev/76353): Remove when other signals are asserted
-        // together with POLLERR in Fuchsia.
+        // TODO(https://fxbug.dev/42156248): Remove when other signals are
+        // asserted together with POLLERR in Fuchsia.
 #if defined(__Fuchsia__)
                   POLLOUT
 #else
@@ -2658,7 +2739,30 @@ TEST_P(SimpleTcpSocketTest, EpollListeningSocket) {
   save_and_connect_thread.Join();
 }
 
+TEST_P(SimpleTcpSocketTest, SetTCPCorkOff) {
+  int fd;
+  ASSERT_THAT(fd = socket(GetParam(), SOCK_STREAM, IPPROTO_TCP),
+              SyscallSucceeds());
+
+  ASSERT_THAT(
+      setsockopt(fd, IPPROTO_TCP, TCP_CORK, &kSockOptOff, sizeof(kSockOptOff)),
+      SyscallSucceeds());
+}
 #endif  // __linux__
+
+TEST_P(SimpleTcpSocketTest, SetUnsupportedPMTUDISC) {
+  int fd;
+  ASSERT_THAT(fd = socket(GetParam(), SOCK_STREAM, IPPROTO_TCP),
+              SyscallSucceeds());
+
+  int set = IP_PMTUDISC_INTERFACE;
+  socklen_t length = sizeof(set);
+  EXPECT_THAT(setsockopt(fd, IPPROTO_IP, IP_MTU_DISCOVER, &set, length),
+              SyscallSucceeds());
+  set = IP_PMTUDISC_OMIT;
+  EXPECT_THAT(setsockopt(fd, IPPROTO_IP, IP_MTU_DISCOVER, &set, length),
+              SyscallSucceeds());
+}
 
 INSTANTIATE_TEST_SUITE_P(AllInetTests, SimpleTcpSocketTest,
                          ::testing::Values(AF_INET, AF_INET6));

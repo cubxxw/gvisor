@@ -39,11 +39,11 @@ type countedEndpoint struct {
 	dispatcher stack.NetworkDispatcher
 }
 
-func (e *countedEndpoint) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+func (e *countedEndpoint) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	e.dispatchCount++
 }
 
-func (*countedEndpoint) DeliverLinkPacket(tcpip.NetworkProtocolNumber, stack.PacketBufferPtr) {
+func (*countedEndpoint) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {
 	panic("not implemented")
 }
 
@@ -61,6 +61,10 @@ func (e *countedEndpoint) MTU() uint32 {
 	return e.mtu
 }
 
+func (e *countedEndpoint) SetMTU(mtu uint32) {
+	e.mtu = mtu
+}
+
 func (e *countedEndpoint) Capabilities() stack.LinkEndpointCapabilities {
 	return e.capabilities
 }
@@ -71,6 +75,10 @@ func (e *countedEndpoint) MaxHeaderLength() uint16 {
 
 func (e *countedEndpoint) LinkAddress() tcpip.LinkAddress {
 	return e.linkAddr
+}
+
+func (e *countedEndpoint) SetLinkAddress(addr tcpip.LinkAddress) {
+	e.linkAddr = addr
 }
 
 // WritePackets implements stack.LinkEndpoint.WritePackets.
@@ -88,14 +96,20 @@ func (*countedEndpoint) ARPHardwareType() header.ARPHardwareType {
 func (*countedEndpoint) Wait() {}
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (*countedEndpoint) AddHeader(stack.PacketBufferPtr) {
+func (*countedEndpoint) AddHeader(*stack.PacketBuffer) {
 	panic("unimplemented")
 }
 
 // ParseHeader implements stack.LinkEndpoint.ParseHeader.
-func (*countedEndpoint) ParseHeader(stack.PacketBufferPtr) bool {
+func (*countedEndpoint) ParseHeader(*stack.PacketBuffer) bool {
 	panic("unimplemented")
 }
+
+// Close implements stack.LinkEndpoint.
+func (*countedEndpoint) Close() {}
+
+// SetOnCloseAction implements stack.LinkEndpoint.SetOnCloseAction.
+func (*countedEndpoint) SetOnCloseAction(func()) {}
 
 func TestWaitWrite(t *testing.T) {
 	ep := &countedEndpoint{}

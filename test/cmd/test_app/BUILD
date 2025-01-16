@@ -13,12 +13,13 @@ go_binary(
         "main.go",
         "zombies.go",
     ],
-    static = True,
+    features = ["fully_static_link"],
     visibility = [
         "//runsc/container:__pkg__",
         "//test/syscalls/linux:__pkg__",
     ],
     deps = [
+        "//pkg/rand",
         "//pkg/test/testutil",
         "//pkg/unet",
         "//runsc/flag",

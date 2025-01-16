@@ -72,8 +72,9 @@ void unpackSyscall(absl::string_view buf) {
   if (!evt.ParseFromArray(buf.data(), buf.size())) {
     err(1, "ParseFromString(): %.*s", static_cast<int>(buf.size()), buf.data());
   }
-  log("%s %s %s\n", evt.has_exit() ? "X" : "E",
-      evt.GetMetadata().descriptor->name().c_str(), shortfmt(evt).c_str());
+  absl::string_view name = evt.GetDescriptor()->name();
+  log("%s %.*s %s\n", evt.has_exit() ? "X" : "E", static_cast<int>(name.size()),
+      name.data(), shortfmt(evt).c_str());
 }
 
 template <class T>
@@ -82,7 +83,8 @@ void unpack(absl::string_view buf) {
   if (!evt.ParseFromArray(buf.data(), buf.size())) {
     err(1, "ParseFromString(): %.*s", static_cast<int>(buf.size()), buf.data());
   }
-  log("%s => %s\n", evt.GetMetadata().descriptor->name().c_str(),
+  absl::string_view name = evt.GetDescriptor()->name();
+  log("%.*s => %s\n", static_cast<int>(name.size()), name.data(),
       shortfmt(evt).c_str());
 }
 
@@ -240,7 +242,7 @@ bool handshake(int client_fd) {
   return true;
 }
 
-extern "C" int main(int argc, char** argv) {
+int main(int argc, char** argv) {
   for (int c = 0; (c = getopt(argc, argv, "q")) != -1;) {
     switch (c) {
       case 'q':

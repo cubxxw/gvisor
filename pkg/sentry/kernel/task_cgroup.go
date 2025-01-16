@@ -156,7 +156,7 @@ func (t *Task) CgroupPrepareMigrate(dst Cgroup) (*CgroupMigrationContext, error)
 	defer t.mu.Unlock()
 	src, found := t.findCgroupWithMatchingHierarchyLocked(dst)
 	if !found {
-		log.Warningf("Cannot migrate to cgroup %v since task %v not currently in target hierarchy %v", dst, t, dst.HierarchyID())
+		log.Warningf("Cannot migrate to cgroup %v since task not currently in target hierarchy %v", dst, dst.HierarchyID())
 		return nil, linuxerr.EINVAL
 	}
 	if err := dst.PrepareMigrate(t, &src); err != nil {
@@ -236,7 +236,7 @@ func (t *Task) GetCgroupEntries() []TaskCgroupEntry {
 		// We're guaranteed to have a valid name, a non-empty controller list,
 		// or both.
 
-		// Explicit hierachy name, if any.
+		// Explicit hierarchy name, if any.
 		if name := c.Name(); name != "" {
 			ctlNames = append(ctlNames, fmt.Sprintf("name=%s", name))
 		}

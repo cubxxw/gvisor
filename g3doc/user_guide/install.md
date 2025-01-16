@@ -2,7 +2,7 @@
 
 [TOC]
 
-> Note: gVisor supports only x86\_64 and requires Linux 4.14.77+
+> Note: gVisor supports x86\_64 and ARM64, and requires Linux 4.14.77+
 > ([older Linux](./networking.md#gso)).
 
 ## Install latest release {#install-latest}
@@ -38,9 +38,9 @@ For more details about using gVisor with Docker, see
 production purposes.
 
 > **Note**: It is important to copy `runsc` to a location that is readable and
-> executable to all users, since `runsc` executes itself as user `nobody` to
-> avoid unnecessary privileges. The `/usr/local/bin` directory is a good place
-> to put the `runsc` binary.
+> executable to all users, since `runsc` may need to re-execute itself as an
+> unprivileged user to increase security. The `/usr/local/bin` directory is a
+> good place to put the `runsc` binary.
 
 ## Install from an `apt` repository
 

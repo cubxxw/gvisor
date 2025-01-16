@@ -15,13 +15,18 @@ def _go_proto_or_grpc_library(go_library_func, name, **kwargs):
         go_library_func(name = name, **kwargs)
         return
     deps = []
+    com_google_protobuf = "@com_google_protobuf//"
+    org_golang_google_protobuf = "@org_golang_google_protobuf//"
     for d in (kwargs.pop("deps", []) or []):
-        if d == "@com_google_protobuf//:timestamp_proto":
-            # Special case: this proto has its Go definitions in a different
-            # repository.
-            deps.append("@org_golang_google_protobuf//" +
-                        "types/known/timestamppb")
+        # Special cases: these protos have their Go definitions in a different
+        # repository.
+        if d == com_google_protobuf + ":timestamp_proto":
+            deps.append(org_golang_google_protobuf + "types/known/timestamppb")
             continue
+        if d == com_google_protobuf + ":any_proto":
+            deps.append(org_golang_google_protobuf + "types/known/anypb")
+            continue
+
         if "//" in d:
             repo, path = d.split("//", 1)
             deps.append(repo + "//" + path.replace("_proto", "_go_proto"))
@@ -57,7 +62,11 @@ def go_binary(name, static = False, pure = False, x_defs = None, **kwargs):
         kwargs["pure"] = "on"
     gc_goopts = select({
         "//conditions:default": kwargs.pop("gc_goopts", []),
-        "//tools:debug": kwargs.pop("gc_goopts", []) + ["-all=-N -l"],
+        "//tools:debug": kwargs.pop("gc_goopts", []) + ["-N", "-l"],
+    })
+    kwargs["gotags"] = select({
+        "//conditions:default": kwargs.pop("gotags", []),
+        "//tools:debug": kwargs.pop("gotags", []) + ["debug"],
     })
     _go_binary(
         name = name,
@@ -70,9 +79,23 @@ def go_importpath(target):
     """Returns the importpath for the target."""
     return target[GoLibrary].importpath
 
-def go_library(name, arch_deps = [], **kwargs):
+def go_library(name, bazel_cgo = False, bazel_cdeps = [], bazel_clinkopts = [], bazel_copts = [], **kwargs):
+    """Wrapper for `go_library` rule.
+
+    Args:
+        name: name of the target.
+        bazel_cgo: if True, build with cgo.
+        cgo_cdeps: cgo deps to pass to `go_library`.
+        cgo_clinkopts: cgo linkopts to pass to `go_library`.
+        cgo_copts: cgo opts to pass to `go_library`.
+        **kwargs: rest of the arguments are passed to `go_library`.
+    """
     _go_library(
         name = name,
+        cgo = bazel_cgo,
+        cdeps = bazel_cdeps,
+        copts = bazel_copts,
+        clinkopts = bazel_clinkopts,
         importpath = "gvisor.dev/gvisor/" + native.package_name(),
         **kwargs
     )

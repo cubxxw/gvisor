@@ -33,6 +33,18 @@ const (
 	NF_INET_NUMHOOKS     = 5
 )
 
+// Protocol families (address families). These correspond to values in
+// include/uapi/linux/netfilter.h.
+const (
+	NFPROTO_UNSPEC = 0
+	NFPROTO_INET   = 1
+	NFPROTO_IPV4   = 2
+	NFPROTO_ARP    = 3
+	NFPROTO_NETDEV = 5
+	NFPROTO_BRIDGE = 7
+	NFPROTO_IPV6   = 10
+)
+
 // Verdicts that can be returned by targets. These correspond to values in
 // include/uapi/linux/netfilter.h
 const (
@@ -389,18 +401,40 @@ type XTRedirectTarget struct {
 // SizeOfXTRedirectTarget is the size of an XTRedirectTarget.
 const SizeOfXTRedirectTarget = 56
 
-// XTSNATTarget triggers Source NAT when reached.
+// XTNATTargetV0 triggers NAT when reached.
 // Adding 4 bytes of padding to make the struct 8 byte aligned.
 //
 // +marshal
-type XTSNATTarget struct {
+type XTNATTargetV0 struct {
 	Target  XTEntryTarget
 	NfRange NfNATIPV4MultiRangeCompat
 	_       [4]byte
 }
 
-// SizeOfXTSNATTarget is the size of an XTSNATTarget.
-const SizeOfXTSNATTarget = 56
+// SizeOfXTNATTargetV0 is the size of an XTNATTargetV0.
+const SizeOfXTNATTargetV0 = 56
+
+// XTNATTargetV1 triggers NAT when reached.
+//
+// +marshal
+type XTNATTargetV1 struct {
+	Target XTEntryTarget
+	Range  NFNATRange
+}
+
+// SizeOfXTNATTargetV1 is the size of an XTNATTargetV1.
+const SizeOfXTNATTargetV1 = SizeOfXTEntryTarget + SizeOfNFNATRange
+
+// XTNATTargetV2 triggers NAT when reached.
+//
+// +marshal
+type XTNATTargetV2 struct {
+	Target XTEntryTarget
+	Range  NFNATRange2
+}
+
+// SizeOfXTNATTargetV2 is the size of an XTNATTargetV2.
+const SizeOfXTNATTargetV2 = SizeOfXTEntryTarget + SizeOfNFNATRange2
 
 // IPTGetinfo is the argument for the IPT_SO_GET_INFO sockopt. It corresponds
 // to struct ipt_getinfo in include/uapi/linux/netfilter_ipv4/ip_tables.h.
@@ -633,8 +667,8 @@ const (
 	XT_UDP_INV_MASK = 0x03
 )
 
-// IPTOwnerInfo holds data for matching packets with owner. It corresponds
-// to struct ipt_owner_info in libxt_owner.c of iptables binary.
+// IPTOwnerInfo holds data for matching packets with the owner v0 matcher. It
+// corresponds to struct ipt_owner_info in libxt_owner.c of iptables binary.
 //
 // +marshal
 type IPTOwnerInfo struct {
@@ -661,11 +695,29 @@ type IPTOwnerInfo struct {
 	Invert uint8 `marshal:"unaligned"`
 }
 
-// SizeOfIPTOwnerInfo is the size of an XTOwnerMatchInfo.
+// SizeOfIPTOwnerInfo is the size of an IPTOwnerInfo.
 const SizeOfIPTOwnerInfo = 34
 
-// Flags in IPTOwnerInfo.Match. Corresponding constants are in
-// include/uapi/linux/netfilter/xt_owner.h.
+// XTOwnerMatchInfo holds data for matching packets with the owner v1 matcher.
+// It corresponds to struct xt_owner_match_info in
+// include/uapi/linux/netfilter/xt_owner.h
+//
+// +marshal
+type XTOwnerMatchInfo struct {
+	UIDMin uint32
+	UIDMax uint32
+	GIDMin uint32
+	GIDMax uint32
+	Match  uint8
+	Invert uint8
+	_      [2]byte
+}
+
+// SizeOfXTOwnerMatchInfo is the size of an XTOwnerMatchInfo.
+const SizeOfXTOwnerMatchInfo = 20
+
+// Flags in IPTOwnerInfo.Match and XTOwnerMatchInfo.Match. Corresponding
+// constants are in include/uapi/linux/netfilter/xt_owner.h.
 const (
 	// Match the UID of the packet.
 	XT_OWNER_UID = 1 << 0

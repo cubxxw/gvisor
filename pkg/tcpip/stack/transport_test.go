@@ -45,7 +45,6 @@ type fakeTransportEndpoint struct {
 	proto    *fakeTransportProtocol
 	peerAddr tcpip.Address
 	route    *stack.Route
-	uniqueID uint64
 
 	// acceptQueue is non-nil iff bound.
 	acceptQueue []*fakeTransportEndpoint
@@ -69,7 +68,7 @@ func (f *fakeTransportEndpoint) SocketOptions() *tcpip.SocketOptions {
 }
 
 func newFakeTransportEndpoint(proto *fakeTransportProtocol, netProto tcpip.NetworkProtocolNumber, s *stack.Stack) tcpip.Endpoint {
-	ep := &fakeTransportEndpoint{TransportEndpointInfo: stack.TransportEndpointInfo{NetProto: netProto}, proto: proto, uniqueID: s.UniqueID()}
+	ep := &fakeTransportEndpoint{TransportEndpointInfo: stack.TransportEndpointInfo{NetProto: netProto}, proto: proto}
 	ep.ops.InitHandler(ep, s, tcpip.GetStackSendBufferLimits, tcpip.GetStackReceiveBufferLimits)
 	return ep
 }
@@ -162,10 +161,6 @@ func (f *fakeTransportEndpoint) Connect(addr tcpip.FullAddress) tcpip.Error {
 	return nil
 }
 
-func (f *fakeTransportEndpoint) UniqueID() uint64 {
-	return f.uniqueID
-}
-
 func (*fakeTransportEndpoint) ConnectEndpoint(e tcpip.Endpoint) tcpip.Error {
 	return nil
 }
@@ -213,7 +208,7 @@ func (*fakeTransportEndpoint) GetRemoteAddress() (tcpip.FullAddress, tcpip.Error
 	return tcpip.FullAddress{}, nil
 }
 
-func (f *fakeTransportEndpoint) HandlePacket(id stack.TransportEndpointID, pkt stack.PacketBufferPtr) {
+func (f *fakeTransportEndpoint) HandlePacket(id stack.TransportEndpointID, pkt *stack.PacketBuffer) {
 	// Increment the number of received packets.
 	f.proto.packetCount++
 	if f.acceptQueue == nil {
@@ -244,7 +239,7 @@ func (f *fakeTransportEndpoint) HandlePacket(id stack.TransportEndpointID, pkt s
 	f.acceptQueue = append(f.acceptQueue, ep)
 }
 
-func (f *fakeTransportEndpoint) HandleError(stack.TransportError, stack.PacketBufferPtr) {
+func (f *fakeTransportEndpoint) HandleError(stack.TransportError, *stack.PacketBuffer) {
 	// Increment the number of received control packets.
 	f.proto.controlCount++
 }
@@ -255,7 +250,7 @@ func (*fakeTransportEndpoint) State() uint32 {
 
 func (*fakeTransportEndpoint) ModerateRecvBuf(copied int) {}
 
-func (*fakeTransportEndpoint) Resume(*stack.Stack) {}
+func (*fakeTransportEndpoint) Restore(*stack.Stack) {}
 
 func (*fakeTransportEndpoint) Wait() {}
 
@@ -303,7 +298,7 @@ func (*fakeTransportProtocol) ParsePorts([]byte) (src, dst uint16, err tcpip.Err
 	return 0, 0, nil
 }
 
-func (*fakeTransportProtocol) HandleUnknownDestinationPacket(stack.TransportEndpointID, stack.PacketBufferPtr) stack.UnknownDestinationPacketDisposition {
+func (*fakeTransportProtocol) HandleUnknownDestinationPacket(stack.TransportEndpointID, *stack.PacketBuffer) stack.UnknownDestinationPacketDisposition {
 	return stack.UnknownDestinationPacketHandled
 }
 
@@ -342,8 +337,11 @@ func (*fakeTransportProtocol) Pause() {}
 // Resume implements TransportProtocol.Resume.
 func (*fakeTransportProtocol) Resume() {}
 
+// Restore implements TransportProtocol.Restore.
+func (*fakeTransportProtocol) Restore() {}
+
 // Parse implements TransportProtocol.Parse.
-func (*fakeTransportProtocol) Parse(pkt stack.PacketBufferPtr) bool {
+func (*fakeTransportProtocol) Parse(pkt *stack.PacketBuffer) bool {
 	if _, ok := pkt.TransportHeader().Consume(fakeTransHeaderLen); ok {
 		pkt.TransportProtocolNumber = fakeTransNumber
 		return true

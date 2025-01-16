@@ -67,7 +67,10 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 		},
 		MaxPerms:  hostarch.AnyAccess,
 		GrowsDown: linux.MAP_GROWSDOWN&flags != 0,
-		Precommit: linux.MAP_POPULATE&flags != 0,
+		Stack:     linux.MAP_STACK&flags != 0,
+	}
+	if linux.MAP_POPULATE&flags != 0 {
+		opts.PlatformEffect = memmap.PlatformEffectCommit
 	}
 	if linux.MAP_LOCKED&flags != 0 {
 		opts.MLockMode = memmap.MLockEager
@@ -109,6 +112,8 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 		if err := file.ConfigureMMap(t, &opts); err != nil {
 			return 0, nil, err
 		}
+	} else {
+		opts.NameMut = memmap.NameMutAnon
 	}
 
 	rv, err := t.MemoryManager().MMap(t, opts)
@@ -172,21 +177,6 @@ func Madvise(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 	length := uint64(args[1].SizeT())
 	adv := args[2].Int()
 
-	// "The Linux implementation requires that the address addr be
-	// page-aligned, and allows length to be zero." - madvise(2)
-	if addr.RoundDown() != addr {
-		return 0, nil, linuxerr.EINVAL
-	}
-	if length == 0 {
-		return 0, nil, nil
-	}
-	// Not explicitly stated: length need not be page-aligned.
-	lenAddr, ok := hostarch.Addr(length).RoundUp()
-	if !ok {
-		return 0, nil, linuxerr.EINVAL
-	}
-	length = uint64(lenAddr)
-
 	switch adv {
 	case linux.MADV_DONTNEED:
 		return 0, nil, t.MemoryManager().Decommit(addr, length)
@@ -224,6 +214,7 @@ func Mincore(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 	length := args[1].SizeT()
 	vec := args[2].Pointer()
 
+	addr = hostarch.UntaggedUserAddr(addr)
 	if addr != addr.RoundDown() {
 		return 0, nil, linuxerr.EINVAL
 	}

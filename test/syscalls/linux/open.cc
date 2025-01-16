@@ -19,11 +19,13 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <memory>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/memory/memory.h"
+#include "absl/strings/string_view.h"
 #include "test/syscalls/linux/file_base.h"
 #include "test/util/capability_util.h"
 #include "test/util/cleanup.h"
@@ -102,10 +104,10 @@ TEST_F(OpenTest, OCreateDirectory) {
   ASSERT_THAT(open(dir.path().c_str(), O_RDONLY | O_CREAT, 0666),
               SyscallFailsWithErrno(EISDIR));
   // Trailing separator on existing directory.
-  ASSERT_THAT(open(dir.path().append("/").c_str(), O_RDONLY | O_CREAT, 0666),
+  ASSERT_THAT(open((dir.path() + "/").c_str(), O_RDONLY | O_CREAT, 0666),
               SyscallFailsWithErrno(EISDIR));
   // Trailing separator on non-existing directory.
-  ASSERT_THAT(open(JoinPath(dir.path(), "non-existent").append("/").c_str(),
+  ASSERT_THAT(open((JoinPath(dir.path(), "non-existent") + "/").c_str(),
                    O_RDONLY | O_CREAT, 0666),
               SyscallFailsWithErrno(EISDIR));
   // "." special case.
@@ -319,6 +321,7 @@ TEST_F(OpenTest, AppendConcurrentWrite) {
   // externally, so we create a new inode each time when we open a file and we
   // can't guarantee that writes to files with O_APPEND will work correctly.
   SKIP_IF(getenv("GVISOR_GOFER_UNCACHED"));
+  SKIP_IF(absl::NullSafeStringView(getenv("GVISOR_FUSE_TEST")) == "TRUE");
 
   EXPECT_THAT(truncate(test_file_name_.c_str(), 0), SyscallSucceeds());
 

@@ -19,10 +19,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"reflect"
+	"slices"
 	"sync"
 	"testing"
 
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 )
@@ -50,7 +51,8 @@ func singleTest(t *testing.T, test TestCase) {
 
 func iptablesTest(t *testing.T, test TestCase, ipv6 bool) {
 	if _, ok := Tests[test.Name()]; !ok {
-		t.Fatalf("no test found with name %q. Has it been registered?", test.Name())
+		log.Infof("no test found with name %q. Has it been registered?", test.Name())
+		t.FailNow()
 	}
 
 	// Wait for the local and container goroutines to finish.
@@ -63,9 +65,9 @@ func iptablesTest(t *testing.T, test TestCase, ipv6 bool) {
 	d := dockerutil.MakeContainer(ctx, t)
 	defer func() {
 		if logs, err := d.Logs(context.Background()); err != nil {
-			t.Logf("Failed to retrieve container logs.")
+			log.Infof("Failed to retrieve container logs.")
 		} else {
-			t.Logf("=== Container logs: ===\n%s", logs)
+			log.Infof("=== Container logs: ===\n%s", logs)
 		}
 		// Use a new context, as cleanup should run even when we
 		// timeout.
@@ -83,7 +85,8 @@ func iptablesTest(t *testing.T, test TestCase, ipv6 bool) {
 		args = append(args, "-ipv6")
 	}
 	if err := d.Spawn(ctx, opts, args...); err != nil {
-		t.Fatalf("docker run failed: %v", err)
+		log.Infof("docker run failed: %v", err)
+		t.FailNow()
 	}
 
 	// Get the container IP.
@@ -91,14 +94,17 @@ func iptablesTest(t *testing.T, test TestCase, ipv6 bool) {
 	if err != nil {
 		// If ipv6 is not configured, don't fail.
 		if ipv6 && err == dockerutil.ErrNoIP {
-			t.Skipf("No ipv6 address is available.")
+			log.Infof("No ipv6 address is available.")
+			t.Skip()
 		}
-		t.Fatalf("failed to get container IP: %v", err)
+		log.Infof("failed to get container IP: %v", err)
+		t.FailNow()
 	}
 
 	// Give the container our IP.
 	if err := sendIP(ip); err != nil {
-		t.Fatalf("failed to send IP to container: %v", err)
+		log.Infof("failed to send IP to container: %v", err)
+		t.FailNow()
 	}
 
 	// Run our side of the test.
@@ -281,6 +287,14 @@ func TestFilterOutputInterfaceInvertAccept(t *testing.T) {
 	singleTest(t, &FilterOutputInterfaceInvertAccept{})
 }
 
+func TestFilterOutputInvertSportAccept(t *testing.T) {
+	singleTest(t, &FilterOutputInvertSportAccept{})
+}
+
+func TestFilterOutputInvertSportDrop(t *testing.T) {
+	singleTest(t, &FilterOutputInvertSportDrop{})
+}
+
 func TestJumpSerialize(t *testing.T) {
 	singleTest(t, &FilterInputSerializeJump{})
 }
@@ -364,6 +378,18 @@ func TestNATOutRedirectInvert(t *testing.T) {
 	singleTest(t, &NATOutRedirectInvert{})
 }
 
+func TestNATOutDNAT(t *testing.T) {
+	singleTest(t, &NATOutDNAT{})
+}
+
+func TestNATOutDNATAddrOnly(t *testing.T) {
+	singleTest(t, &NATOutDNATAddrOnly{})
+}
+
+func TestNATOutDNATPortOnly(t *testing.T) {
+	singleTest(t, &NATOutDNATPortOnly{})
+}
+
 func TestNATPreRedirectIP(t *testing.T) {
 	singleTest(t, &NATPreRedirectIP{})
 }
@@ -416,6 +442,14 @@ func TestInputInterfaceInvertAccept(t *testing.T) {
 	singleTest(t, &FilterInputInterfaceInvertAccept{})
 }
 
+func TestFilterInputInvertDportAccept(t *testing.T) {
+	singleTest(t, &FilterInputInvertDportAccept{})
+}
+
+func TestFilterInputInvertDportDrop(t *testing.T) {
+	singleTest(t, &FilterInputInvertDportDrop{})
+}
+
 func TestFilterAddrs(t *testing.T) {
 	tcs := []struct {
 		ipv6  bool
@@ -435,7 +469,7 @@ func TestFilterAddrs(t *testing.T) {
 	}
 
 	for _, tc := range tcs {
-		if got := filterAddrs(tc.addrs, tc.ipv6); !reflect.DeepEqual(got, tc.want) {
+		if got := filterAddrs(tc.addrs, tc.ipv6); !slices.Equal(got, tc.want) {
 			t.Errorf("%v with IPv6 %t: got %v, but wanted %v", tc.addrs, tc.ipv6, got, tc.want)
 		}
 	}

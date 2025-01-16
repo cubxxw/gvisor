@@ -15,7 +15,6 @@
 package stack_test
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -547,16 +546,6 @@ func TestDADResolve(t *testing.T) {
 		},
 	}
 
-	nonces := [][]byte{
-		{1, 2, 3, 4, 5, 6},
-		{7, 8, 9, 10, 11, 12},
-	}
-
-	var secureRNGBytes []byte
-	for _, n := range nonces {
-		secureRNGBytes = append(secureRNGBytes, n...)
-	}
-
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			ndpDisp := ndpDispatcher{
@@ -568,14 +557,10 @@ func TestDADResolve(t *testing.T) {
 			}
 			e.Endpoint.LinkEPCapabilities |= stack.CapabilityResolutionRequired
 
-			var secureRNG bytes.Reader
-			secureRNG.Reset(secureRNGBytes)
-
 			clock := faketime.NewManualClock()
 			s := stack.New(stack.Options{
 				Clock:      clock,
 				RandSource: rand.NewSource(time.Now().UnixNano()),
-				SecureRNG:  &secureRNG,
 				NetworkProtocols: []stack.NetworkProtocolFactory{ipv6.NewProtocolWithOptions(ipv6.Options{
 					NDPDisp: &ndpDisp,
 					DADConfigs: stack.DADConfigurations{
@@ -698,7 +683,7 @@ func TestDADResolve(t *testing.T) {
 			// Validate the sent Neighbor Solicitation messages.
 			for i := uint8(0); i < test.dupAddrDetectTransmits; i++ {
 				p := e.Read()
-				if p.IsNil() {
+				if p == nil {
 					t.Fatal("packet didn't arrive")
 				}
 
@@ -726,7 +711,6 @@ func TestDADResolve(t *testing.T) {
 					checker.TTL(header.NDPHopLimit),
 					checker.NDPNS(
 						checker.NDPNSTargetAddress(addr1),
-						checker.NDPNSOptions([]header.NDPOption{header.NDPNonceOption(nonces[i])}),
 					))
 
 				if l, want := p.AvailableHeaderBytes(), int(test.linkHeaderLen); l != want {
@@ -1231,7 +1215,7 @@ func TestSetNDPConfigurations(t *testing.T) {
 
 // raBuf returns a valid NDP Router Advertisement with options, router
 // preference and DHCPv6 configurations specified.
-func raBuf(ip tcpip.Address, rl uint16, managedAddress, otherConfigurations bool, prf header.NDPRoutePreference, optSer header.NDPOptionsSerializer) stack.PacketBufferPtr {
+func raBuf(ip tcpip.Address, rl uint16, managedAddress, otherConfigurations bool, prf header.NDPRoutePreference, optSer header.NDPOptionsSerializer) *stack.PacketBuffer {
 	const flagsByte = 1
 	const routerLifetimeOffset = 2
 
@@ -1282,7 +1266,7 @@ func raBuf(ip tcpip.Address, rl uint16, managedAddress, otherConfigurations bool
 //
 // Note, raBufWithOpts does not populate any of the RA fields other than the
 // Router Lifetime.
-func raBufWithOpts(ip tcpip.Address, rl uint16, optSer header.NDPOptionsSerializer) stack.PacketBufferPtr {
+func raBufWithOpts(ip tcpip.Address, rl uint16, optSer header.NDPOptionsSerializer) *stack.PacketBuffer {
 	return raBuf(ip, rl, false /* managedAddress */, false /* otherConfigurations */, 0 /* prf */, optSer)
 }
 
@@ -1291,7 +1275,7 @@ func raBufWithOpts(ip tcpip.Address, rl uint16, optSer header.NDPOptionsSerializ
 //
 // Note, raBufWithDHCPv6 does not populate any of the RA fields other than the
 // DHCPv6 related ones.
-func raBufWithDHCPv6(ip tcpip.Address, managedAddresses, otherConfigurations bool) stack.PacketBufferPtr {
+func raBufWithDHCPv6(ip tcpip.Address, managedAddresses, otherConfigurations bool) *stack.PacketBuffer {
 	return raBuf(ip, 0, managedAddresses, otherConfigurations, 0 /* prf */, header.NDPOptionsSerializer{})
 }
 
@@ -1299,7 +1283,7 @@ func raBufWithDHCPv6(ip tcpip.Address, managedAddresses, otherConfigurations boo
 //
 // Note, raBuf does not populate any of the RA fields other than the
 // Router Lifetime.
-func raBufSimple(ip tcpip.Address, rl uint16) stack.PacketBufferPtr {
+func raBufSimple(ip tcpip.Address, rl uint16) *stack.PacketBuffer {
 	return raBufWithOpts(ip, rl, header.NDPOptionsSerializer{})
 }
 
@@ -1307,7 +1291,7 @@ func raBufSimple(ip tcpip.Address, rl uint16) stack.PacketBufferPtr {
 //
 // Note, raBufWithPrf does not populate any of the RA fields other than the
 // Router Lifetime and Default Router Preference fields.
-func raBufWithPrf(ip tcpip.Address, rl uint16, prf header.NDPRoutePreference) stack.PacketBufferPtr {
+func raBufWithPrf(ip tcpip.Address, rl uint16, prf header.NDPRoutePreference) *stack.PacketBuffer {
 	return raBuf(ip, rl, false /* managedAddress */, false /* otherConfigurations */, prf, header.NDPOptionsSerializer{})
 }
 
@@ -1316,7 +1300,7 @@ func raBufWithPrf(ip tcpip.Address, rl uint16, prf header.NDPRoutePreference) st
 //
 // Note, raBufWithPI does not populate any of the RA fields other than the
 // Router Lifetime.
-func raBufWithPI(ip tcpip.Address, rl uint16, prefix tcpip.AddressWithPrefix, onLink, auto bool, vl, pl uint32) stack.PacketBufferPtr {
+func raBufWithPI(ip tcpip.Address, rl uint16, prefix tcpip.AddressWithPrefix, onLink, auto bool, vl, pl uint32) *stack.PacketBuffer {
 	flags := uint8(0)
 	if onLink {
 		// The OnLink flag is the 7th bit in the flags byte.
@@ -1353,7 +1337,7 @@ func raBufWithPI(ip tcpip.Address, rl uint16, prefix tcpip.AddressWithPrefix, on
 // Information option.
 //
 // All fields in the RA will be zero except the RIO option.
-func raBufWithRIO(t *testing.T, ip tcpip.Address, prefix tcpip.AddressWithPrefix, lifetimeSeconds uint32, prf header.NDPRoutePreference) stack.PacketBufferPtr {
+func raBufWithRIO(t *testing.T, ip tcpip.Address, prefix tcpip.AddressWithPrefix, lifetimeSeconds uint32, prf header.NDPRoutePreference) *stack.PacketBuffer {
 	// buf will hold the route information option after the Type and Length
 	// fields.
 	//
@@ -1396,7 +1380,7 @@ func TestDynamicConfigurationsDisabled(t *testing.T) {
 	tests := []struct {
 		name   string
 		config func(bool) ipv6.NDPConfigurations
-		ra     stack.PacketBufferPtr
+		ra     *stack.PacketBuffer
 	}{
 		{
 			name: "No Router Discovery",
@@ -1482,10 +1466,10 @@ func TestDynamicConfigurationsDisabled(t *testing.T) {
 						t.Errorf("got v6Stats.ICMP.PacketsSent.RouterSolicit.Value() = %d, want = %d", got, want)
 					}
 					if handleRAsDisabled {
-						if p := e.Read(); !p.IsNil() {
+						if p := e.Read(); p != nil {
 							t.Errorf("unexpectedly got a packet = %#v", p)
 						}
-					} else if p := e.Read(); p.IsNil() {
+					} else if p := e.Read(); p == nil {
 						t.Error("expected router solicitation packet")
 					} else if p.NetworkProtocolNumber != header.IPv6ProtocolNumber {
 						t.Errorf("got Proto = %d, want = %d", p.NetworkProtocolNumber, header.IPv6ProtocolNumber)
@@ -1585,14 +1569,14 @@ func TestOffLinkRouteDiscovery(t *testing.T) {
 		discoverMoreSpecificRoutes bool
 
 		dest tcpip.Subnet
-		ra   func(*testing.T, tcpip.Address, uint16, header.NDPRoutePreference) stack.PacketBufferPtr
+		ra   func(*testing.T, tcpip.Address, uint16, header.NDPRoutePreference) *stack.PacketBuffer
 	}{
 		{
 			name:                       "Default router discovery",
 			discoverDefaultRouters:     true,
 			discoverMoreSpecificRoutes: false,
 			dest:                       header.IPv6EmptySubnet,
-			ra: func(_ *testing.T, router tcpip.Address, lifetimeSeconds uint16, prf header.NDPRoutePreference) stack.PacketBufferPtr {
+			ra: func(_ *testing.T, router tcpip.Address, lifetimeSeconds uint16, prf header.NDPRoutePreference) *stack.PacketBuffer {
 				return raBufWithPrf(router, lifetimeSeconds, prf)
 			},
 		},
@@ -1601,7 +1585,7 @@ func TestOffLinkRouteDiscovery(t *testing.T) {
 			discoverDefaultRouters:     false,
 			discoverMoreSpecificRoutes: true,
 			dest:                       moreSpecificPrefix.Subnet(),
-			ra: func(t *testing.T, router tcpip.Address, lifetimeSeconds uint16, prf header.NDPRoutePreference) stack.PacketBufferPtr {
+			ra: func(t *testing.T, router tcpip.Address, lifetimeSeconds uint16, prf header.NDPRoutePreference) *stack.PacketBuffer {
 				return raBufWithRIO(t, router, moreSpecificPrefix, uint32(lifetimeSeconds), prf)
 			},
 		},
@@ -2137,12 +2121,12 @@ func TestMaxSlaacPrefixes(t *testing.T) {
 			PrefixLen: 64,
 		}
 		prefixes[i] = prefix.Subnet()
-		// Serialize a perfix information option.
+		// Serialize a prefix information option.
 		buf := [30]byte{}
 		buf[0] = uint8(prefix.PrefixLen)
 		// Set the autonomous configuration flag.
 		buf[1] = 64
-		// Set the preferred and valid lifetimes to the maxiumum possible value.
+		// Set the preferred and valid lifetimes to the maximum possible value.
 		binary.BigEndian.PutUint32(buf[2:], math.MaxUint32)
 		binary.BigEndian.PutUint32(buf[6:], math.MaxUint32)
 		if n := copy(buf[14:], prefix.Address.AsSlice()); n != prefix.Address.Len() {
@@ -2674,7 +2658,7 @@ func TestNoAutoGenTempAddrForLinkLocal(t *testing.T) {
 			// No new addresses should be generated.
 			select {
 			case e := <-ndpDisp.autoGenAddrC:
-				t.Errorf("got unxpected auto gen addr event = %+v", e)
+				t.Errorf("got unexpected auto gen addr event = %+v", e)
 			default:
 			}
 		})
@@ -3197,7 +3181,7 @@ func TestMixedSLAACAddrConflictRegen(t *testing.T) {
 		lifetimeSeconds = 9999
 		// From stack.maxSLAACAddrLocalRegenAttempts
 		maxSLAACAddrLocalRegenAttempts = 10
-		// We use 2 more addreses than the maximum local regeneration attempts
+		// We use 2 more addresses than the maximum local regeneration attempts
 		// because we want to also trigger regeneration in response to a DAD
 		// conflicts for this test.
 		maxAddrs         = maxSLAACAddrLocalRegenAttempts + 2
@@ -3548,7 +3532,7 @@ func TestAutoGenAddrDeprecateFromPI(t *testing.T) {
 	}
 	expectPrimaryAddr(addr1)
 
-	// Deprecate addr for prefix1 immedaitely.
+	// Deprecate addr for prefix1 immediately.
 	e.InjectInbound(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix1, true, true, 100, 0))
 	expectAutoGenAddrEvent(t, ndpDisp, addr1, deprecatedAddr)
 	if !containsV6Addr(s.NICInfo()[nicID].ProtocolAddresses, addr1) {
@@ -3576,7 +3560,7 @@ func TestAutoGenAddrDeprecateFromPI(t *testing.T) {
 	}
 	expectPrimaryAddr(addr2)
 
-	// Deprecate addr for prefix2 immedaitely.
+	// Deprecate addr for prefix2 immediately.
 	e.InjectInbound(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix2, true, true, 100, 0))
 	expectAutoGenAddrEvent(t, ndpDisp, addr2, deprecatedAddr)
 	if !containsV6Addr(s.NICInfo()[nicID].ProtocolAddresses, addr2) {
@@ -5821,7 +5805,7 @@ func TestRouterSolicitation(t *testing.T) {
 
 						clock.Advance(timeout)
 						p := e.Read()
-						if p.IsNil() {
+						if p == nil {
 							t.Fatal("expected router solicitation packet")
 						}
 						defer p.DecRef()
@@ -5850,7 +5834,7 @@ func TestRouterSolicitation(t *testing.T) {
 						t.Helper()
 
 						clock.Advance(timeout)
-						if p := e.Read(); !p.IsNil() {
+						if p := e.Read(); p != nil {
 							t.Fatalf("unexpectedly got a packet = %#v", p)
 						}
 					}
@@ -5985,7 +5969,7 @@ func TestStopStartSolicitingRouters(t *testing.T) {
 		},
 
 		// Tests that when a NIC is removed, router solicitations are stopped. We
-		// cannot start router solications on a removed NIC.
+		// cannot start router solicitations on a removed NIC.
 		{
 			name: "Remove NIC",
 			stopFn: func(t *testing.T, s *stack.Stack, first bool) {
@@ -6012,7 +5996,7 @@ func TestStopStartSolicitingRouters(t *testing.T) {
 
 				clock.Advance(timeout)
 				p := e.Read()
-				if p.IsNil() {
+				if p == nil {
 					t.Fatal("timed out waiting for packet")
 				}
 
@@ -6045,11 +6029,11 @@ func TestStopStartSolicitingRouters(t *testing.T) {
 			// Stop soliciting routers.
 			test.stopFn(t, s, true /* first */)
 			clock.Advance(delay)
-			if p := e.Read(); !p.IsNil() {
+			if p := e.Read(); p != nil {
 				p.DecRef()
 				// A single RS may have been sent before solicitations were stopped.
 				clock.Advance(interval)
-				if pb := e.Read(); !pb.IsNil() {
+				if pb := e.Read(); pb != nil {
 					t.Fatal("should not have sent more than one RS message")
 				}
 			}
@@ -6058,11 +6042,11 @@ func TestStopStartSolicitingRouters(t *testing.T) {
 			// do nothing.
 			test.stopFn(t, s, false /* first */)
 			clock.Advance(delay)
-			if pb := e.Read(); !pb.IsNil() {
+			if pb := e.Read(); pb != nil {
 				t.Fatal("unexpectedly got a packet after router solicitation has been stopepd")
 			}
 
-			// If test.startFn is nil, there is no way to restart router solications.
+			// If test.startFn is nil, there is no way to restart router solicitations.
 			if test.startFn == nil {
 				return
 			}
@@ -6073,7 +6057,7 @@ func TestStopStartSolicitingRouters(t *testing.T) {
 			waitForPkt(clock, interval)
 			waitForPkt(clock, interval)
 			clock.Advance(interval)
-			if pb := e.Read(); !pb.IsNil() {
+			if pb := e.Read(); pb != nil {
 				t.Fatal("unexpectedly got an extra packet after sending out the expected RSs")
 			}
 
@@ -6081,7 +6065,7 @@ func TestStopStartSolicitingRouters(t *testing.T) {
 			// nothing.
 			test.startFn(t, s)
 			clock.Advance(interval)
-			if pb := e.Read(); !pb.IsNil() {
+			if pb := e.Read(); pb != nil {
 				t.Fatal("unexpectedly got a packet after finishing router solicitations")
 			}
 		})

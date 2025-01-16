@@ -16,9 +16,7 @@ package nvproxy
 
 import (
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
-	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -26,7 +24,10 @@ import (
 
 // ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
 func (fd *uvmFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
-	return vfs.GenericConfigureMMap(&fd.vfsfd, fd, opts)
+	// UVM_VALIDATE_VA_RANGE, and probably other ioctls, expect that
+	// application mmaps of /dev/nvidia-uvm are immediately visible to the
+	// driver.
+	return vfs.GenericProxyDeviceConfigureMMap(&fd.vfsfd, fd, opts)
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
@@ -50,9 +51,7 @@ func (fd *uvmFD) Translate(ctx context.Context, required, optional memmap.Mappab
 			Source: optional,
 			File:   &fd.memmapFile,
 			Offset: optional.Start,
-			// kernel-open/nvidia-uvm/uvm.c:uvm_mmap() requires mappings to be
-			// PROT_READ|PROT_WRITE.
-			Perms: hostarch.ReadWrite,
+			Perms:  hostarch.AnyAccess,
 		},
 	}, nil
 }
@@ -62,6 +61,7 @@ func (fd *uvmFD) InvalidateUnsavable(ctx context.Context) error {
 	return nil
 }
 
+// +stateify savable
 type uvmFDMemmapFile struct {
 	fd *uvmFD
 }
@@ -77,8 +77,12 @@ func (mf *uvmFDMemmapFile) DecRef(fr memmap.FileRange) {
 // MapInternal implements memmap.File.MapInternal.
 func (mf *uvmFDMemmapFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
 	// TODO(jamieliu): make an attempt with MAP_FIXED_NOREPLACE?
-	log.Traceback("nvproxy: rejecting uvmFDMemmapFile.MapInternal")
-	return safemem.BlockSeq{}, linuxerr.EINVAL
+	return safemem.BlockSeq{}, memmap.BufferedIOFallbackErr{}
+}
+
+// DataFD implements memmap.File.DataFD.
+func (mf *uvmFDMemmapFile) DataFD(fr memmap.FileRange) (int, error) {
+	return mf.FD(), nil
 }
 
 // FD implements memmap.File.FD.

@@ -19,8 +19,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -253,6 +253,10 @@ func (c *Do) setupNet(cid string, spec *specs.Spec) (func(), error) {
 	if err != nil {
 		return nil, errNoDefaultInterface
 	}
+	mtu, err := deviceMTU(dev)
+	if err != nil {
+		return nil, err
+	}
 	peerIP, err := calculatePeerIP(c.ip)
 	if err != nil {
 		return nil, err
@@ -260,7 +264,7 @@ func (c *Do) setupNet(cid string, spec *specs.Spec) (func(), error) {
 	veth, peer := deviceNames(cid)
 
 	cmds := []string{
-		fmt.Sprintf("ip link add %s type veth peer name %s", veth, peer),
+		fmt.Sprintf("ip link add %s mtu %v type veth peer name %s", veth, mtu, peer),
 
 		// Setup device outside the namespace.
 		fmt.Sprintf("ip addr add %s/24 dev %s", peerIP, peer),
@@ -367,8 +371,16 @@ func defaultDevice() (string, error) {
 	return parts[4], nil
 }
 
+func deviceMTU(dev string) (int, error) {
+	intf, err := net.InterfaceByName(dev)
+	if err != nil {
+		return 0, err
+	}
+	return intf.MTU, nil
+}
+
 func makeFile(dest, content string, spec *specs.Spec) (string, error) {
-	tmpFile, err := ioutil.TempFile("", filepath.Base(dest))
+	tmpFile, err := os.CreateTemp("", filepath.Base(dest))
 	if err != nil {
 		return "", err
 	}
@@ -420,7 +432,7 @@ func startContainerAndWait(spec *specs.Spec, conf *config.Config, cid string, wa
 	if err != nil {
 		return util.Errorf("Error to marshal spec: %v", err)
 	}
-	tmpDir, err := ioutil.TempDir("", "runsc-do")
+	tmpDir, err := os.MkdirTemp("", "runsc-do")
 	if err != nil {
 		return util.Errorf("Error to create tmp dir: %v", err)
 	}
@@ -430,7 +442,7 @@ func startContainerAndWait(spec *specs.Spec, conf *config.Config, cid string, wa
 	conf.RootDir = tmpDir
 
 	cfgPath := filepath.Join(tmpDir, "config.json")
-	if err := ioutil.WriteFile(cfgPath, out, 0755); err != nil {
+	if err := os.WriteFile(cfgPath, out, 0755); err != nil {
 		return util.Errorf("Error write spec: %v", err)
 	}
 

@@ -83,6 +83,7 @@ func rdmsr(reg uintptr) uintptr
 var (
 	hasSMEP       bool
 	hasSMAP       bool
+	hasUMIP       bool
 	hasPCID       bool
 	hasXSAVEOPT   bool
 	hasXSAVE      bool
@@ -113,13 +114,15 @@ func Init(fs cpuid.FeatureSet) {
 	// Initialize all functions.
 	hasSMEP = fs.HasFeature(cpuid.X86FeatureSMEP)
 	hasSMAP = fs.HasFeature(cpuid.X86FeatureSMAP)
+	hasUMIP = fs.HasFeature(cpuid.X86FeatureUMIP)
 	hasPCID = fs.HasFeature(cpuid.X86FeaturePCID)
 	hasXSAVEOPT = fs.UseXsaveopt()
 	hasXSAVE = fs.UseXsave()
 	hasFSGSBASE = fs.HasFeature(cpuid.X86FeatureFSGSBase)
 	validXCR0Mask = uintptr(fs.ValidXCR0Mask())
 	if hasXSAVE {
-		localXCR0 = xgetbv(0)
+		XCR0DisabledMask := uintptr((1 << 9) | (1 << 17) | (1 << 18))
+		localXCR0 = xgetbv(0) &^ XCR0DisabledMask
 	}
 }
 

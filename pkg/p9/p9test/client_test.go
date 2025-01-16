@@ -20,7 +20,7 @@ import (
 	"io"
 	"math/rand"
 	"os"
-	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +29,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/p9"
+	gvisorrand "gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -408,7 +409,7 @@ type deleter func(parent p9.File, name string) error
 // unlinkAt is a deleter.
 func unlinkAt(parent p9.File, name string) error {
 	// Call unlink. Note that a filesystem may normally impose additional
-	// constaints on unlinkat success, such as ensuring that a directory is
+	// constraints on unlinkat success, such as ensuring that a directory is
 	// empty, requiring AT_REMOVEDIR in flags to remove a directory, etc.
 	// None of that is required internally (entire trees can be marked
 	// deleted when this operation succeeds), so the mock will succeed.
@@ -633,7 +634,7 @@ func renameHelper(h *Harness, root p9.File, srcNames []string, dstNames []string
 			// renameSrcPath here? If yes, then this is a mismatch.
 			// We can't rename the src to some subpath of itself.
 			if len(renameDestPath) > len(renameSrcPath) &&
-				reflect.DeepEqual(renameDestPath[:len(renameSrcPath)], renameSrcPath) {
+				slices.Equal(renameDestPath[:len(renameSrcPath)], renameSrcPath) {
 				renameDestPath = nil
 				renameSrcPath = nil
 				continue
@@ -2192,7 +2193,7 @@ func TestReadWriteConcurrent(t *testing.T) {
 
 	// Initialize random data for each instance.
 	for i := 0; i < instances; i++ {
-		if _, err := rand.Read(dataSets[i][:]); err != nil {
+		if _, err := gvisorrand.Read(dataSets[i][:]); err != nil {
 			t.Fatalf("error initializing dataSet#%d, got %v", i, err)
 		}
 	}

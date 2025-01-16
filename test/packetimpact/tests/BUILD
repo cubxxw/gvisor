@@ -281,6 +281,7 @@ packetimpact_testbench(
     name = "ipv4_fragment_reassembly",
     srcs = ["ipv4_fragment_reassembly_test.go"],
     deps = [
+        "//pkg/rand",
         "//pkg/tcpip/checksum",
         "//pkg/tcpip/header",
         "//test/packetimpact/testbench",
@@ -293,6 +294,7 @@ packetimpact_testbench(
     name = "ipv6_fragment_reassembly",
     srcs = ["ipv6_fragment_reassembly_test.go"],
     deps = [
+        "//pkg/rand",
         "//pkg/tcpip",
         "//pkg/tcpip/checksum",
         "//pkg/tcpip/header",
@@ -412,8 +414,41 @@ packetimpact_testbench(
 )
 
 packetimpact_testbench(
-    name = "generic_dgram_socket_send_recv",
-    srcs = ["generic_dgram_socket_send_recv_test.go"],
+    name = "icmpv4_socket_send_recv",
+    srcs = [
+        "generic_dgram_socket_send_recv.go",
+        "icmpv4_socket_send_recv_test.go",
+    ],
+    deps = [
+        "//pkg/tcpip",
+        "//pkg/tcpip/header",
+        "//test/packetimpact/testbench",
+        "@com_github_google_go_cmp//cmp:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+packetimpact_testbench(
+    name = "icmpv6_socket_send_recv",
+    srcs = [
+        "generic_dgram_socket_send_recv.go",
+        "icmpv6_socket_send_recv_test.go",
+    ],
+    deps = [
+        "//pkg/tcpip",
+        "//pkg/tcpip/header",
+        "//test/packetimpact/testbench",
+        "@com_github_google_go_cmp//cmp:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+packetimpact_testbench(
+    name = "udp_socket_send_recv",
+    srcs = [
+        "generic_dgram_socket_send_recv.go",
+        "udp_socket_send_recv_test.go",
+    ],
     deps = [
         "//pkg/tcpip",
         "//pkg/tcpip/header",
@@ -435,8 +470,8 @@ validate_all_tests()
 test_suite(
     name = "all_tests",
     tags = [
-        "local",
         "manual",
+        "notap",
         "packetimpact",
     ],
     tests = existing_rules(),

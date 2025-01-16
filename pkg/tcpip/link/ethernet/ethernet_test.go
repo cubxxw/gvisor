@@ -33,18 +33,18 @@ var _ stack.NetworkDispatcher = (*testNetworkDispatcher)(nil)
 
 type deliveredPacket struct {
 	protocol tcpip.NetworkProtocolNumber
-	packet   stack.PacketBufferPtr
+	packet   *stack.PacketBuffer
 }
 
 type testNetworkDispatcher struct {
 	networkPackets []deliveredPacket
 }
 
-func (t *testNetworkDispatcher) DeliverNetworkPacket(proto tcpip.NetworkProtocolNumber, pb stack.PacketBufferPtr) {
+func (t *testNetworkDispatcher) DeliverNetworkPacket(proto tcpip.NetworkProtocolNumber, pb *stack.PacketBuffer) {
 	t.networkPackets = append(t.networkPackets, deliveredPacket{protocol: proto, packet: pb})
 }
 
-func (*testNetworkDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, stack.PacketBufferPtr) {
+func (*testNetworkDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {
 	panic("not implemented")
 }
 
@@ -144,20 +144,12 @@ func TestMTU(t *testing.T) {
 			expectedMTU:  0,
 		},
 		{
-			maxFrameSize: header.EthernetMinimumSize - 1,
-			expectedMTU:  0,
-		},
-		{
 			maxFrameSize: header.EthernetMinimumSize,
-			expectedMTU:  0,
-		},
-		{
-			maxFrameSize: header.EthernetMinimumSize + 1,
-			expectedMTU:  1,
+			expectedMTU:  header.EthernetMinimumSize,
 		},
 		{
 			maxFrameSize: maxFrameSize,
-			expectedMTU:  maxFrameSize - header.EthernetMinimumSize,
+			expectedMTU:  maxFrameSize,
 		},
 	}
 
@@ -193,7 +185,7 @@ func TestWritePacketToRemoteAddHeader(t *testing.T) {
 
 	{
 		pkt := c.Read()
-		if pkt.IsNil() {
+		if pkt == nil {
 			t.Fatal("expected to read a packet")
 		}
 

@@ -7,11 +7,17 @@ package(
 )
 
 go_binary(
-    name = "metricserver_bin",
+    name = "runsc-metric-server",
     srcs = [
         "metricserver_main.go",
     ],
+    pure = True,
+    visibility = [
+        "//:sandbox",
+    ],
     deps = [
+        "//pkg/log",
+        "//runsc/cmd/metricserver/metricservercmd",
         "//runsc/cmd/util",
         "//runsc/config",
         "//runsc/flag",
@@ -22,7 +28,7 @@ go_binary(
 
 embedded_binary_go_library(
     name = "metricserver",
-    binary = ":metricserver_bin",
+    binary = ":runsc-metric-server",
     visibility = [
         "//runsc:__subpackages__",
     ],

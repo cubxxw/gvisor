@@ -28,6 +28,7 @@
 #include "absl/memory/memory.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "test/util/save_util.h"
 #include "test/util/socket_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
@@ -143,9 +144,10 @@ TEST_P(TCPSocketPairTest, RSTCausesPollHUP) {
 
   // Confirm we at least have one unread byte.
   int bytes_available = 0;
-  ASSERT_THAT(
-      RetryEINTR(ioctl)(sockets->second_fd(), FIONREAD, &bytes_available),
-      SyscallSucceeds());
+  ASSERT_THAT(RetryEINTR([&]() {
+                return ioctl(sockets->second_fd(), FIONREAD, &bytes_available);
+              })(),
+              SyscallSucceeds());
   EXPECT_GT(bytes_available, 0);
 
   // Now close the connected socket without reading the data from the second,
@@ -416,6 +418,11 @@ TEST_P(TCPSocketPairTest, SetTCPCork) {
 }
 
 TEST_P(TCPSocketPairTest, TCPCork) {
+  // Disable save on this test, this test checks if the data is not recv'd by
+  // the receiver after enabling TCP_CORK when the size of the packet < MSS.
+  // But the save/resume may take more than the cork timeout of 200ms causing
+  // all the corked packets to be sent and makes the test flaky.
+  const DisableSave ds;
   auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
 
   EXPECT_THAT(setsockopt(sockets->first_fd(), IPPROTO_TCP, TCP_CORK,
@@ -1118,6 +1125,52 @@ TEST_P(TCPSocketPairTest, SpliceToPipe) {
   EXPECT_EQ(memcmp(rbuf.data(), buf.data(), buf.size()), 0);
 }
 
+// Regression test for #9932.
+TEST_P(TCPSocketPairTest, LargeSpliceFromPipe) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  // Create a pipe, increase its size from the default 64K, and fill it with
+  // data.
+  int pipe_fds[2];
+  ASSERT_THAT(pipe(pipe_fds), SyscallSucceeds());
+  const FileDescriptor pipe_rfd(pipe_fds[0]);
+  const FileDescriptor pipe_wfd(pipe_fds[1]);
+  constexpr size_t kPipeSize = 1 << 20;
+  ASSERT_THAT(fcntl(pipe_wfd.get(), F_SETPIPE_SZ, kPipeSize),
+              SyscallSucceeds());
+  std::vector<char> orig_data(kPipeSize);
+  RandomizeBuffer(orig_data.data(), orig_data.size());
+  ASSERT_THAT(WriteFd(pipe_wfd.get(), orig_data.data(), orig_data.size()),
+              SyscallSucceedsWithValue(orig_data.size()));
+
+  // Splice all data from the pipe to one end of the TCP socket pair in a
+  // separate thread, while draining the other end from this thread.
+  std::vector<char> read_data(orig_data.size());
+  ScopedThread reader_thread([&] {
+    size_t spliced_bytes = 0;
+    ssize_t n;
+    while (spliced_bytes < orig_data.size()) {
+      ASSERT_THAT(
+          n = RetryEINTR(splice)(pipe_rfd.get(), nullptr, sockets->first_fd(),
+                                 nullptr, orig_data.size() - spliced_bytes, 0),
+          SyscallSucceeds());
+      spliced_bytes += n;
+    }
+  });
+  size_t read_bytes = 0;
+  while (read_bytes < read_data.size()) {
+    ssize_t n;
+    ASSERT_THAT(n = RetryEINTR(read)(sockets->second_fd(),
+                                     read_data.data() + read_bytes,
+                                     read_data.size() - read_bytes),
+                SyscallSucceeds());
+    read_bytes += n;
+  }
+
+  // Check that correct data was spliced and read.
+  EXPECT_EQ(0, memcmp(orig_data.data(), read_data.data(), orig_data.size()));
+}
+
 #include <sys/sendfile.h>
 
 #include <memory>
@@ -1414,6 +1467,48 @@ TEST_P(TCPSocketPairTest, ResetWithSoLingerZeroTimeoutOption) {
               SyscallFailsWithErrno(ECONNRESET));
 
   ASSERT_THAT(RetryEINTR(read)(sockets->second_fd(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(sizeof(buf)));
+}
+
+TEST_P(TCPSocketPairTest, WaitTillMSSWithCorkOption) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+  ASSERT_THAT(setsockopt(sockets->first_fd(), IPPROTO_TCP, TCP_CORK,
+                         &kSockOptOn, sizeof(kSockOptOn)),
+              SyscallSucceeds());
+
+  constexpr int kTCPMaxSeg = 1024;
+  EXPECT_THAT(setsockopt(sockets->first_fd(), IPPROTO_TCP, TCP_MAXSEG,
+                         &kTCPMaxSeg, sizeof(kTCPMaxSeg)),
+              SyscallSucceedsWithValue(0));
+
+  // Use the buffer size which is guaranteed to be >= MSS.
+  char buffer[1024] = {};
+  EXPECT_THAT(RetryEINTR(send)(sockets->first_fd(), buffer, sizeof(buffer), 0),
+              SyscallSucceedsWithValue(sizeof(buffer)));
+
+  char buf[1024] = {};
+  EXPECT_THAT(RetryEINTR(recv)(sockets->second_fd(), buf, sizeof(buf), 0),
+              SyscallSucceedsWithValue(sizeof(buf)));
+}
+
+TEST_P(TCPSocketPairTest, WaitTillTimeoutWithCorkOption) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+  ASSERT_THAT(setsockopt(sockets->first_fd(), IPPROTO_TCP, TCP_CORK,
+                         &kSockOptOn, sizeof(kSockOptOn)),
+              SyscallSucceeds());
+
+  constexpr int kTCPMaxSeg = 1024;
+  EXPECT_THAT(setsockopt(sockets->first_fd(), IPPROTO_TCP, TCP_MAXSEG,
+                         &kTCPMaxSeg, sizeof(kTCPMaxSeg)),
+              SyscallSucceedsWithValue(0));
+
+  // Use buffer size less than MSS.
+  char buffer[512] = {};
+  EXPECT_THAT(RetryEINTR(send)(sockets->first_fd(), buffer, sizeof(buffer), 0),
+              SyscallSucceedsWithValue(sizeof(buffer)));
+
+  char buf[512] = {};
+  EXPECT_THAT(RetryEINTR(recv)(sockets->second_fd(), buf, sizeof(buf), 0),
               SyscallSucceedsWithValue(sizeof(buf)));
 }
 

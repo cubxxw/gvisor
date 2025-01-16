@@ -44,10 +44,13 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 
 	// Find a usable range.
 	addr, err := mm.findAvailableLocked(opts.Length, findAvailableOpts{
-		Addr:     opts.Addr,
-		Fixed:    opts.Fixed,
-		Unmap:    opts.Unmap,
-		Map32Bit: opts.Map32Bit,
+		Addr:      opts.Addr,
+		Fixed:     opts.Fixed,
+		GrowsDown: opts.GrowsDown,
+		Stack:     opts.Stack,
+		Private:   opts.Private,
+		Unmap:     opts.Unmap,
+		Map32Bit:  opts.Map32Bit,
 	})
 	if err != nil {
 		// Can't force without opts.Unmap and opts.Fixed.
@@ -119,10 +122,12 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 		maxPerms:       opts.MaxPerms,
 		private:        opts.Private,
 		growsDown:      opts.GrowsDown,
+		isStack:        opts.Stack,
 		mlockMode:      opts.MLockMode,
 		numaPolicy:     linux.MPOL_DEFAULT,
 		id:             opts.MappingIdentity,
-		hint:           opts.Hint,
+		name:           opts.Name,
+		nameMut:        opts.NameMut,
 	}
 
 	vseg := mm.vmas.Insert(vgap, ar, v)
@@ -144,10 +149,13 @@ type findAvailableOpts struct {
 	//
 	//	- Unmap allows existing guard pages in the returned range.
 
-	Addr     hostarch.Addr
-	Fixed    bool
-	Unmap    bool
-	Map32Bit bool
+	Addr      hostarch.Addr
+	Fixed     bool
+	GrowsDown bool
+	Stack     bool
+	Private   bool
+	Unmap     bool
+	Map32Bit  bool
 }
 
 // map32Start/End are the bounds to which MAP_32BIT mappings are constrained,
@@ -187,9 +195,10 @@ func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOp
 		return 0, linuxerr.ENOMEM
 	}
 
-	// Prefer hugepage alignment if a hugepage or more is requested.
+	// Prefer hugepage alignment if a hugepage or more is requested and the vma
+	// will actually be eligible for hugepages.
 	alignment := uint64(hostarch.PageSize)
-	if length >= hostarch.HugePageSize {
+	if length >= hostarch.HugePageSize && opts.Private && !opts.GrowsDown && !opts.Stack {
 		alignment = hostarch.HugePageSize
 	}
 
@@ -393,12 +402,7 @@ func (mm *MemoryManager) removeVMAsLocked(ctx context.Context, ar hostarch.AddrR
 			panic(fmt.Sprintf("invalid ar: %v", ar))
 		}
 	}
-	vseg, vgap := mm.vmas.Find(ar.Start)
-	if vgap.Ok() {
-		vseg = vgap.NextSegment()
-	}
-	for vseg.Ok() && vseg.Start() < ar.End {
-		vseg = mm.vmas.Isolate(vseg, ar)
+	vgap := mm.vmas.RemoveRangeWith(ar, func(vseg vmaIterator) {
 		vmaAR := vseg.Range()
 		vma := vseg.ValuePtr()
 		if vma.mappable != nil {
@@ -414,9 +418,7 @@ func (mm *MemoryManager) removeVMAsLocked(ctx context.Context, ar hostarch.AddrR
 		if vma.mlockMode != memmap.MLockNone {
 			mm.lockedAS -= uint64(vmaAR.Length())
 		}
-		vgap = mm.vmas.Remove(vseg)
-		vseg = vgap.NextSegment()
-	}
+	})
 	return vgap, droppedIDs
 }
 
@@ -454,7 +456,7 @@ func (vmaSetFunctions) MaxKey() hostarch.Addr {
 func (vmaSetFunctions) ClearValue(vma *vma) {
 	vma.mappable = nil
 	vma.id = nil
-	vma.hint = ""
+	vma.name = ""
 	atomic.StoreUintptr(&vma.lastFault, 0)
 }
 
@@ -465,12 +467,14 @@ func (vmaSetFunctions) Merge(ar1 hostarch.AddrRange, vma1 vma, ar2 hostarch.Addr
 		vma1.maxPerms != vma2.maxPerms ||
 		vma1.private != vma2.private ||
 		vma1.growsDown != vma2.growsDown ||
+		vma1.isStack != vma2.isStack ||
 		vma1.mlockMode != vma2.mlockMode ||
 		vma1.numaPolicy != vma2.numaPolicy ||
 		vma1.numaNodemask != vma2.numaNodemask ||
 		vma1.dontfork != vma2.dontfork ||
 		vma1.id != vma2.id ||
-		vma1.hint != vma2.hint {
+		vma1.name != vma2.name ||
+		vma1.nameMut != vma2.nameMut {
 		return vma{}, false
 	}
 

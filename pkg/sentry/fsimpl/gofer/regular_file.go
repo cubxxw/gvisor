@@ -295,12 +295,9 @@ func (fd *regularFileFD) writeCache(ctx context.Context, d *dentry, offset int64
 	var freed []memmap.FileRange
 
 	d.dataMu.Lock()
-	cseg := d.cache.LowerBoundSegment(mr.Start)
-	for cseg.Ok() && cseg.Start() < mr.End {
-		cseg = d.cache.Isolate(cseg, mr)
+	d.cache.RemoveRangeWith(mr, func(cseg fsutil.FileRangeIterator) {
 		freed = append(freed, memmap.FileRange{cseg.Value(), cseg.Value() + cseg.Range().Length()})
-		cseg = d.cache.Remove(cseg).NextSegment()
-	}
+	})
 	d.dataMu.Unlock()
 
 	// Invalidate mappings of removed pages.
@@ -309,7 +306,7 @@ func (fd *regularFileFD) writeCache(ctx context.Context, d *dentry, offset int64
 	d.mapsMu.Unlock()
 
 	// Finally free pages removed from the cache.
-	mf := d.fs.mfp.MemoryFile()
+	mf := d.fs.mf
 	for _, freedFR := range freed {
 		mf.DecRef(freedFR)
 	}
@@ -374,7 +371,8 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 	}
 
 	// Otherwise read from/through the cache.
-	mf := rw.d.fs.mfp.MemoryFile()
+	memCgID := pgalloc.MemoryCgroupIDFromContext(rw.ctx)
+	mf := rw.d.fs.mf
 	fillCache := mf.ShouldCacheEvictable()
 	var dataMuUnlock func()
 	if fillCache {
@@ -435,7 +433,11 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 					End:   gapEnd,
 				}
 				optMR := gap.Range()
-				_, err := rw.d.cache.Fill(rw.ctx, reqMR, maxFillRange(reqMR, optMR), rw.d.size.Load(), mf, usage.PageCache, pgalloc.AllocateAndWritePopulate, h.readToBlocksAt)
+				_, err := rw.d.cache.Fill(rw.ctx, reqMR, maxFillRange(reqMR, optMR), rw.d.size.Load(), mf, pgalloc.AllocOpts{
+					Kind:    usage.PageCache,
+					MemCgID: memCgID,
+					Mode:    pgalloc.AllocateAndWritePopulate,
+				}, h.readToBlocksAt)
 				mf.MarkEvictable(rw.d, pgalloc.EvictableRange{optMR.Start, optMR.End})
 				seg, gap = rw.d.cache.Find(rw.off)
 				if !seg.Ok() {
@@ -501,7 +503,7 @@ func (rw *dentryReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, erro
 	}
 
 	// Otherwise write to/through the cache.
-	mf := rw.d.fs.mfp.MemoryFile()
+	mf := rw.d.fs.mf
 	rw.d.dataMu.Lock()
 
 	// Compute the range to write (overflow-checked).
@@ -608,7 +610,7 @@ func (d *dentry) writeback(ctx context.Context, offset, size int64) error {
 	return fsutil.SyncDirty(ctx, memmap.MappableRange{
 		Start: uint64(offset),
 		End:   uint64(end),
-	}, &d.cache, &d.dirty, dentrySize, d.fs.mfp.MemoryFile(), h.writeFromBlocksAt)
+	}, &d.cache, &d.dirty, dentrySize, d.fs.mf, h.writeFromBlocksAt)
 }
 
 // Seek implements vfs.FileDescriptionImpl.Seek.
@@ -716,7 +718,7 @@ func (d *dentry) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar host
 	if d.fs.mayCachePagesInMemoryFile() {
 		// d.Evict() will refuse to evict memory-mapped pages, so tell the
 		// MemoryFile to not bother trying.
-		mf := d.fs.mfp.MemoryFile()
+		mf := d.fs.mf
 		for _, r := range mapped {
 			mf.MarkUnevictable(d, pgalloc.EvictableRange{r.Start, r.End})
 		}
@@ -736,7 +738,7 @@ func (d *dentry) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar h
 		// Pages that are no longer referenced by any application memory
 		// mappings are now considered unused; allow MemoryFile to evict them
 		// when necessary.
-		mf := d.fs.mfp.MemoryFile()
+		mf := d.fs.mf
 		d.dataMu.Lock()
 		for _, r := range unmapped {
 			// Since these pages are no longer mapped, they are no longer
@@ -773,6 +775,7 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 		}, nil
 	}
 
+	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 	d.dataMu.Lock()
 
 	// Constrain translations to d.size (rounded up) to prevent translation to
@@ -792,9 +795,13 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 		optional.End = pgend
 	}
 
-	mf := d.fs.mfp.MemoryFile()
+	mf := d.fs.mf
 	h := d.readHandle()
-	_, cerr := d.cache.Fill(ctx, required, maxFillRange(required, optional), d.size.Load(), mf, usage.PageCache, pgalloc.AllocateAndWritePopulate, h.readToBlocksAt)
+	_, cerr := d.cache.Fill(ctx, required, maxFillRange(required, optional), d.size.Load(), mf, pgalloc.AllocOpts{
+		Kind:    usage.PageCache,
+		MemCgID: memCgID,
+		Mode:    pgalloc.AllocateAndWritePopulate,
+	}, h.readToBlocksAt)
 
 	var ts []memmap.Translation
 	var translatedEnd uint64
@@ -802,10 +809,7 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 		segMR := seg.Range().Intersect(optional)
 		// TODO(jamieliu): Make Translations writable even if writability is
 		// not required if already kept-dirty by another writable translation.
-		perms := hostarch.AccessType{
-			Read:    true,
-			Execute: true,
-		}
+		perms := hostarch.ReadExecute
 		if at.Write {
 			// From this point forward, this memory can be dirtied through the
 			// mapping at any time.
@@ -862,7 +866,7 @@ func (d *dentry) InvalidateUnsavable(ctx context.Context) error {
 
 	// Write the cache's contents back to the remote file so that if we have a
 	// host fd after restore, the remote file's contents are coherent.
-	mf := d.fs.mfp.MemoryFile()
+	mf := d.fs.mf
 	d.handleMu.RLock()
 	defer d.handleMu.RUnlock()
 	h := d.writeHandle()
@@ -884,7 +888,7 @@ func (d *dentry) InvalidateUnsavable(ctx context.Context) error {
 // Evict implements pgalloc.EvictableMemoryUser.Evict.
 func (d *dentry) Evict(ctx context.Context, er pgalloc.EvictableRange) {
 	mr := memmap.MappableRange{er.Start, er.End}
-	mf := d.fs.mfp.MemoryFile()
+	mf := d.fs.mf
 	d.mapsMu.Lock()
 	defer d.mapsMu.Unlock()
 	d.handleMu.RLock()
@@ -916,6 +920,8 @@ func (d *dentry) Evict(ctx context.Context, er pgalloc.EvictableRange) {
 //
 // +stateify savable
 type dentryPlatformFile struct {
+	memmap.NoBufferedIOFallback
+
 	*dentry
 
 	// fdRefs counts references on memmap.File offsets. fdRefs is protected
@@ -949,6 +955,11 @@ func (d *dentryPlatformFile) MapInternal(fr memmap.FileRange, at hostarch.Access
 	d.handleMu.RLock()
 	defer d.handleMu.RUnlock()
 	return d.hostFileMapper.MapInternal(fr, int(d.mmapFD.RacyLoad()), at.Write)
+}
+
+// DataFD implements memmap.File.DataFD.
+func (d *dentryPlatformFile) DataFD(fr memmap.FileRange) (int, error) {
+	return d.FD(), nil
 }
 
 // FD implements memmap.File.FD.

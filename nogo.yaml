@@ -106,6 +106,7 @@ analyzers:
         - "\\[amd64\\].*sysret: RET without writing to 8-byte"
         - "\\[amd64\\].*iret: RET without writing to 8-byte"
         - "\\[amd64\\].*exception: use of .* points beyond argument frame"
+        - "\\[amd64\\].*retjmp: use of .* points beyond argument frame"
         - "\\[arm64\\].*HaltEl1ExceptionAndResume: unknown variable"
         - "\\[arm64\\].*HaltEl1ExceptionAndResume: use of .* points beyond argument frame"
   assign:
@@ -155,6 +156,7 @@ analyzers:
     external: # Enabled.
       suppress:
         - "fmt.Fprintln arg list ends with redundant newline"
+        - "non-constant format string in call to .*"
   shift:
     generated: # Disabled for generated code; these shifts are well-defined.
       exclude: [".*"]
@@ -189,9 +191,14 @@ analyzers:
         - "pkg/flipcall/.*_unsafe.go"                              # Special case.
         - pkg/gohacks/noescape_unsafe.go                           # Special case.
         - pkg/ring0/pagetables/allocator_unsafe.go                 # Special case.
+        - pkg/sentry/devices/nvproxy/frontend_mmap_unsafe.go       # Special case.
         - pkg/sentry/fsutil/host_file_mapper_unsafe.go             # Special case.
+        - pkg/sentry/pgalloc/pgalloc_unsafe.go                     # Special case.
         - pkg/sentry/platform/kvm/bluepill_unsafe.go               # Special case.
         - pkg/sentry/platform/kvm/machine_unsafe.go                # Special case.
+        - pkg/sentry/platform/kvm/bluepill_amd64_unsafe.go         # Special case.
+        - pkg/sentry/platform/pgalloc/pgalloc_unsafe.go            # Special case.
+        - pkg/sentry/platform/ptrace/stub_unsafe.go                # Special case.
         - pkg/sentry/platform/systrap/stub_unsafe.go               # Special case.
         - pkg/sentry/platform/systrap/syscall_thread_unsafe.go     # Special case.
         - pkg/sentry/platform/systrap/sysmsg_thread_unsafe.go      # Special case.
@@ -199,6 +206,7 @@ analyzers:
         - pkg/sentry/platform/safecopy/safecopy_unsafe.go          # Special case.
         - pkg/sentry/usage/memory_unsafe.go                        # Special case.
         - pkg/sentry/vfs/mount_unsafe.go                           # Special case.
+        - pkg/sigframe/sigframe_amd64_unsafe.go                    # Special case.
         - pkg/state/decode_unsafe.go                               # Special case.
   unusedresult:
     external: # Enabled.
@@ -256,7 +264,3 @@ analyzers:
       suppress:
         - "comment on exported type Translation" # Intentional.
         - "comment on exported type PinnedRange" # Intentional.
-  ST1016: # CheckReceiverNamesIdentical
-    internal:
-      exclude:
-        - pkg/tcpip/stack/packet_buffer.go # TODO(b/233086175): Remove.

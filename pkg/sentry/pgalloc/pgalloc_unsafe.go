@@ -15,21 +15,18 @@
 package pgalloc
 
 import (
-	"reflect"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
 
-func unsafeSlice(addr uintptr, length int) (slice []byte) {
-	sh := (*reflect.SliceHeader)(unsafe.Pointer(&slice))
-	sh.Data = addr
-	sh.Len = length
-	sh.Cap = length
-	return
+// Preconditions: The FileRange represented by c is a superset of fr.
+func (c *chunkInfo) sliceAt(fr memmap.FileRange) []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(c.mapping+uintptr(fr.Start&chunkMask))), fr.Length())
 }
 
-func mincore(s []byte, buf []byte) error {
+func mincore(s []byte, buf []byte, off uint64, wasCommitted bool) error {
 	if _, _, errno := unix.RawSyscall(
 		unix.SYS_MINCORE,
 		uintptr(unsafe.Pointer(&s[0])),
@@ -38,4 +35,12 @@ func mincore(s []byte, buf []byte) error {
 		return errno
 	}
 	return nil
+}
+
+func sliceFromIovec(iov unix.Iovec) []byte {
+	return unsafe.Slice(iov.Base, iov.Len)
+}
+
+func canMergeIovecAndSlice(iov unix.Iovec, bs []byte) bool {
+	return uintptr(unsafe.Pointer(iov.Base))+uintptr(iov.Len) == uintptr(unsafe.Pointer(unsafe.SliceData(bs)))
 }

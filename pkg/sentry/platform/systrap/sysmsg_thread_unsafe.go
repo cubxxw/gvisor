@@ -20,12 +20,13 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform/systrap/sysmsg"
 )
 
 func (p *sysmsgThread) unmapStackFromSentry() {
-	_, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, sysmsg.MsgToStackAddr(uintptr(unsafe.Pointer(p.msg))), sysmsg.PerThreadSharedStackSize, 0)
+	errno := hostsyscall.RawSyscallErrno(unix.SYS_MUNMAP, sysmsg.MsgToStackAddr(uintptr(unsafe.Pointer(p.msg))), sysmsg.PerThreadSharedStackSize, 0)
 	if errno != 0 {
 		panic("failed to unmap: " + errno.Error())
 	}
@@ -39,20 +40,6 @@ func (p *sysmsgThread) setMsg(addr uintptr) {
 
 func (p *sysmsgThread) init(sentryAddr, guestAddr uintptr) {
 	t := p.thread
-
-	// Set the parent death signal to SIGKILL.
-	_, err := t.syscallIgnoreInterrupt(&t.initRegs, unix.SYS_PRCTL,
-		arch.SyscallArgument{Value: linux.PR_SET_PDEATHSIG},
-		arch.SyscallArgument{Value: uintptr(unix.SIGKILL)},
-		arch.SyscallArgument{Value: 0},
-		arch.SyscallArgument{Value: 0},
-		arch.SyscallArgument{Value: 0},
-		arch.SyscallArgument{Value: 0},
-	)
-	if err != nil {
-		panic(fmt.Sprintf("prctl: %v", err))
-	}
-
 	// Set the sysmsg signal stack.
 	//
 	// sentryAddr is from the stub mapping which is mapped once and never
@@ -61,7 +48,7 @@ func (p *sysmsgThread) init(sentryAddr, guestAddr uintptr) {
 	*alt = linux.SignalStack{}
 	alt.Addr = uint64(guestAddr)
 	alt.Size = uint64(sysmsg.MsgOffsetFromSharedStack)
-	_, err = t.syscallIgnoreInterrupt(&t.initRegs, unix.SYS_SIGALTSTACK,
+	_, err := t.syscallIgnoreInterrupt(&t.initRegs, unix.SYS_SIGALTSTACK,
 		arch.SyscallArgument{Value: guestAddr},
 		arch.SyscallArgument{Value: 0},
 		arch.SyscallArgument{Value: 0},
@@ -99,7 +86,7 @@ func sysmsgSigactions(stubSysmsgStart uintptr) unix.Errno {
 		unix.SIGTRAP,
 		unix.SIGSEGV,
 	} {
-		_, _, errno := unix.RawSyscall6(unix.SYS_RT_SIGACTION, uintptr(s), uintptr(unsafe.Pointer(&act)), 0, 8, 0, 0)
+		errno := hostsyscall.RawSyscallErrno6(unix.SYS_RT_SIGACTION, uintptr(s), uintptr(unsafe.Pointer(&act)), 0, 8, 0, 0)
 		if errno != 0 {
 			return errno
 		}

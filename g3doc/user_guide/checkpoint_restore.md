@@ -15,9 +15,8 @@ runsc run <container id>
 ```
 
 To checkpoint the container, the `--image-path` flag must be provided. This is
-the directory path within which the checkpoint state-file will be created. The
-file will be called `checkpoint.img` and necessary directories will be created
-if they do not yet exist.
+the directory path within which the checkpoint related files will be created.
+All necessary directories will be created if they do not yet exist.
 
 > Note: Two checkpoints cannot be saved to the same directory; every image-path
 > provided must be unique.
@@ -41,9 +40,10 @@ their processes after committing a checkpoint.)
 runsc checkpoint --image-path=<path> --leave-running <container id>
 ```
 
-To restore, provide the image path to the `checkpoint.img` file created during
-the checkpoint. Because containers stop by default after checkpointing, restore
-needs to happen in a new container (restore is a command which parallels start).
+To restore, provide the image path to the directory containing all the files
+created during the checkpoint. Because containers stop by default after
+checkpointing, restore needs to happen in a new container (restore is a command
+which parallels start).
 
 ```bash
 runsc create <container id>
@@ -56,32 +56,22 @@ runsc restore --image-path=<path> <container id>
 
 ## How to use checkpoint/restore in Docker:
 
-Currently checkpoint/restore through `runsc` is not entirely compatible with
-Docker, although there has been progress made from both gVisor and Docker to
-enable compatibility. Here, we document the ideal workflow.
-
 Run a container:
 
 ```bash
-docker run [options] --runtime=runsc <image>`
+docker run [options] --runtime=runsc --name=<container-name> <image>
 ```
 
-Checkpoint a container:
+Checkpoint the container:
 
 ```bash
-docker checkpoint create <container> <checkpoint_name>`
+docker checkpoint create <container-name> <checkpoint-name>
 ```
 
-Create a new container into which to restore:
+Restore into the same container:
 
 ```bash
-docker create [options] --runtime=runsc <image>
-```
-
-Restore a container:
-
-```bash
-docker start --checkpoint --checkpoint-dir=<directory> <container>
+docker start --checkpoint <checkpoint-name> <container-name>
 ```
 
 ### Issues Preventing Compatibility with Docker
@@ -93,9 +83,7 @@ docker start --checkpoint --checkpoint-dir=<directory> <container>
     `--leave-running` flag. This issue is fixed in newer releases.
 -   **Docker does not support restoration into new containers:** Docker
     currently expects the container which created the checkpoint to be the same
-    container used to restore which is not possible in runsc. When Docker
-    supports container migration and therefore restoration into new containers,
-    this will be the flow.
+    container used to restore. This is needed to support container migration.
 -   **[Moby #37344][checkpoint-dir]:** Docker does not currently support the
     `--checkpoint-dir` flag but this will be required when restoring from a
     checkpoint made in another container.

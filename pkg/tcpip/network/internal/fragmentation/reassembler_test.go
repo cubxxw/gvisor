@@ -29,7 +29,7 @@ type processParams struct {
 	first     uint16
 	last      uint16
 	more      bool
-	pkt       stack.PacketBufferPtr
+	pkt       *stack.PacketBuffer
 	wantDone  bool
 	wantError error
 }
@@ -45,7 +45,7 @@ func TestReassemblerProcess(t *testing.T) {
 		return payload
 	}
 
-	pkt := func(sizes ...int) stack.PacketBufferPtr {
+	pkt := func(sizes ...int) *stack.PacketBuffer {
 		var buf buffer.Buffer
 		for _, size := range sizes {
 			buf.Append(v(size))
@@ -59,7 +59,7 @@ func TestReassemblerProcess(t *testing.T) {
 		name    string
 		params  []processParams
 		want    []hole
-		wantPkt stack.PacketBufferPtr
+		wantPkt *stack.PacketBuffer
 	}{
 		{
 			name:   "No fragments",
@@ -191,19 +191,19 @@ func TestReassemblerProcess(t *testing.T) {
 			// reassembler will leak PacketBuffers.
 			defer func() {
 				for _, h := range r.holes {
-					if !h.pkt.IsNil() {
+					if h.pkt != nil {
 						h.pkt.DecRef()
 					}
 				}
-				if !r.pkt.IsNil() {
+				if r.pkt != nil {
 					r.pkt.DecRef()
 				}
 			}()
-			var resPkt stack.PacketBufferPtr
+			var resPkt *stack.PacketBuffer
 			var isDone bool
 			for _, param := range test.params {
 				pkt, _, done, _, err := r.process(param.first, param.last, param.more, proto, param.pkt)
-				if !pkt.IsNil() {
+				if pkt != nil {
 					defer pkt.DecRef()
 				}
 				if done != param.wantDone || err != param.wantError {
@@ -215,9 +215,9 @@ func TestReassemblerProcess(t *testing.T) {
 				}
 			}
 
-			ignorePkt := func(a, b stack.PacketBufferPtr) bool { return true }
-			cmpPktData := func(a, b stack.PacketBufferPtr) bool {
-				if a.IsNil() || b.IsNil() {
+			ignorePkt := func(a, b *stack.PacketBuffer) bool { return true }
+			cmpPktData := func(a, b *stack.PacketBuffer) bool {
+				if a == nil || b == nil {
 					return a == b
 				}
 				return bytes.Equal(a.Data().AsRange().ToSlice(), b.Data().AsRange().ToSlice())
@@ -246,16 +246,16 @@ func TestReassemblerProcess(t *testing.T) {
 			}
 		})
 		for _, p := range test.params {
-			if !p.pkt.IsNil() {
+			if p.pkt != nil {
 				p.pkt.DecRef()
 			}
 		}
 		for _, w := range test.want {
-			if !w.pkt.IsNil() {
+			if w.pkt != nil {
 				w.pkt.DecRef()
 			}
 		}
-		if !test.wantPkt.IsNil() {
+		if test.wantPkt != nil {
 			test.wantPkt.DecRef()
 		}
 	}

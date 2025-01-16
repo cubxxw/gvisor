@@ -225,11 +225,18 @@ func (fd *DeviceFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.
 		return 0, linuxerr.EPERM
 	}
 
-	if _, err := src.CopyIn(ctx, fd.writeBuf[:]); err != nil {
+	var hdr linux.FUSEHeaderOut
+	if src.NumBytes() < int64(hdr.SizeBytes()) {
+		return 0, linuxerr.EINVAL
+	}
+	n, err := src.CopyIn(ctx, fd.writeBuf[:])
+	if err != nil {
 		return 0, err
 	}
-	var hdr linux.FUSEHeaderOut
 	hdr.UnmarshalBytes(fd.writeBuf[:])
+	if src.NumBytes() != int64(hdr.Len) {
+		return 0, linuxerr.EINVAL
+	}
 
 	fut, ok := fd.completions[hdr.Unique]
 	if !ok {
@@ -243,9 +250,14 @@ func (fd *DeviceFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.
 	// will be copied over to the FR's data in the next iteration.
 	fut.hdr = &hdr
 	fut.data = make([]byte, fut.hdr.Len)
-	n, err := src.CopyIn(ctx, fut.data)
-	if err != nil {
-		return 0, err
+	copy(fut.data, fd.writeBuf[:])
+	if fut.hdr.Len > uint32(len(fd.writeBuf)) {
+		src = src.DropFirst(len(fd.writeBuf))
+		n2, err := src.CopyIn(ctx, fut.data[len(fd.writeBuf):])
+		if err != nil {
+			return 0, err
+		}
+		n += n2
 	}
 	if err := fd.sendResponse(ctx, fut); err != nil {
 		return 0, err

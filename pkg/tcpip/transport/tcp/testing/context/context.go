@@ -129,6 +129,13 @@ type Options struct {
 
 	// Clock that is used by Stack.
 	Clock tcpip.Clock
+
+	// Probe is a probe function to attach to the stack.
+	Probe tcp.TCPProbeFunc
+
+	// EnableExperimentIPOption indicates whether the NIC is responsible for
+	// passing the experiment IP option.
+	EnableExperimentIPOption bool
 }
 
 // Context provides an initialized Network stack and a link layer endpoint
@@ -180,6 +187,16 @@ func New(t *testing.T, mtu uint32) *Context {
 	})
 }
 
+// NewWithProbe is like New, but also attaches a TCP probe function.
+func NewWithProbe(t *testing.T, mtu uint32, probe tcp.TCPProbeFunc) *Context {
+	return NewWithOpts(t, Options{
+		EnableV4: true,
+		EnableV6: true,
+		MTU:      mtu,
+		Probe:    probe,
+	})
+}
+
 // NewWithOpts allocates and initializes a test context containing a new
 // stack and a link-layer endpoint with specific options.
 func NewWithOpts(t *testing.T, opts Options) *Context {
@@ -188,7 +205,7 @@ func NewWithOpts(t *testing.T, opts Options) *Context {
 	}
 
 	stackOpts := stack.Options{
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocolProbe(opts.Probe)},
 		Clock:              opts.Clock,
 	}
 	if opts.EnableV4 {
@@ -234,7 +251,7 @@ func NewWithOpts(t *testing.T, opts Options) *Context {
 	if testing.Verbose() {
 		wep = sniffer.New(ep)
 	}
-	nicOpts := stack.NICOptions{Name: "nic1"}
+	nicOpts := stack.NICOptions{Name: "nic1", EnableExperimentIPOption: opts.EnableExperimentIPOption}
 	if err := s.CreateNICWithOptions(1, wep, nicOpts); err != nil {
 		t.Fatalf("CreateNICWithOptions(_, _, %+v) failed: %v", opts, err)
 	}
@@ -242,7 +259,7 @@ func NewWithOpts(t *testing.T, opts Options) *Context {
 	if testing.Verbose() {
 		wep2 = sniffer.New(channel.New(1000, opts.MTU, ""))
 	}
-	opts2 := stack.NICOptions{Name: "nic2"}
+	opts2 := stack.NICOptions{Name: "nic2", EnableExperimentIPOption: opts.EnableExperimentIPOption}
 	if err := s.CreateNICWithOptions(2, wep2, opts2); err != nil {
 		t.Fatalf("CreateNICWithOptions(_, _, %+v) failed: %v", opts2, err)
 	}
@@ -317,7 +334,7 @@ func (c *Context) CheckNoPacketTimeout(errMsg string, wait time.Duration) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), wait)
 	defer cancel()
-	if pkt := c.linkEP.ReadContext(ctx); !pkt.IsNil() {
+	if pkt := c.linkEP.ReadContext(ctx); pkt != nil {
 		c.t.Fatal(errMsg)
 	}
 }
@@ -337,7 +354,7 @@ func (c *Context) GetPacketWithTimeout(timeout time.Duration) *buffer.View {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	pkt := c.linkEP.ReadContext(ctx)
-	if pkt.IsNil() {
+	if pkt == nil {
 		return nil
 	}
 	defer pkt.DecRef()
@@ -387,7 +404,7 @@ func (c *Context) GetPacketNonBlocking() *buffer.View {
 	c.t.Helper()
 
 	pkt := c.linkEP.Read()
-	if pkt.IsNil() {
+	if pkt == nil {
 		return nil
 	}
 	defer pkt.DecRef()
@@ -634,7 +651,7 @@ func (c *Context) GetV6Packet() *buffer.View {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	pkt := c.linkEP.ReadContext(ctx)
-	if pkt.IsNil() {
+	if pkt == nil {
 		c.t.Fatalf("Packet wasn't written out")
 		return nil
 	}

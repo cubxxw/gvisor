@@ -29,6 +29,8 @@ struct Link {
   int index;
   int16_t type;
   std::string name;
+  uint32_t mtu;
+  std::string address;
 };
 
 PosixError DumpLinks(const FileDescriptor& fd, uint32_t seq,
@@ -40,21 +42,22 @@ PosixErrorOr<std::vector<Link>> DumpLinks();
 PosixErrorOr<Link> LoopbackLink();
 
 // LinkAddLocalAddr adds a new IFA_LOCAL address to the interface.
-PosixError LinkAddLocalAddr(int index, int family, int prefixlen,
-                            const void* addr, int addrlen);
+PosixError LinkAddLocalAddr(FileDescriptor& fd, int index, int family,
+                            int prefixlen, const void* addr, int addrlen);
 
 // LinkAddExclusiveLocalAddr adds a new IFA_LOCAL address with NLM_F_EXCL flag
 // to the interface.
-PosixError LinkAddExclusiveLocalAddr(int index, int family, int prefixlen,
-                                     const void* addr, int addrlen);
+PosixError LinkAddExclusiveLocalAddr(FileDescriptor& fd, int index, int family,
+                                     int prefixlen, const void* addr,
+                                     int addrlen);
 
 // LinkReplaceLocalAddr replaces an IFA_LOCAL address on the interface.
-PosixError LinkReplaceLocalAddr(int index, int family, int prefixlen,
-                                const void* addr, int addrlen);
+PosixError LinkReplaceLocalAddr(FileDescriptor& fd, int index, int family,
+                                int prefixlen, const void* addr, int addrlen);
 
 // LinkDelLocalAddr removes IFA_LOCAL attribute on the interface.
-PosixError LinkDelLocalAddr(int index, int family, int prefixlen,
-                            const void* addr, int addrlen);
+PosixError LinkDelLocalAddr(FileDescriptor& fd, int index, int family,
+                            int prefixlen, const void* addr, int addrlen);
 
 // LinkChangeFlags changes interface flags. E.g. IFF_UP.
 PosixError LinkChangeFlags(int index, unsigned int flags, unsigned int change);

@@ -26,6 +26,9 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -41,7 +44,7 @@ func afterFork()
 //go:linkname afterForkInChild syscall.runtime_AfterForkInChild
 func afterForkInChild()
 
-//go:linkname cputicks runtime.cputicks
+// cputicks is implemented in assembly.
 func cputicks() int64
 
 // spinloop is implemented in assembly.
@@ -62,7 +65,7 @@ func mmapContextQueueForSentry(memoryFile *pgalloc.MemoryFile, opts pgalloc.Allo
 	if err != nil {
 		panic(fmt.Sprintf("failed to allocate a new subprocess context memory region"))
 	}
-	addr, _, errno := unix.RawSyscall6(
+	addr, errno := hostsyscall.RawSyscall6(
 		unix.SYS_MMAP,
 		0,
 		uintptr(fr.Length()),
@@ -78,14 +81,14 @@ func mmapContextQueueForSentry(memoryFile *pgalloc.MemoryFile, opts pgalloc.Allo
 
 func saveFPState(ctx *sharedContext, ac *arch.Context64) {
 	fpState := ac.FloatingPointData().BytePointer()
-	dst := unsafeSlice(uintptr(unsafe.Pointer(fpState)), archState.FpLen())
+	dst := unsafe.Slice(fpState, archState.FpLen())
 	src := ctx.shared.FPState[:]
 	copy(dst, src)
 }
 
 // restoreFPStateDecoupledContext writes FPState from c to the thread context
 // shared memory region if there is any need to do so.
-func restoreFPState(ctx *sharedContext, c *context, ac *arch.Context64) {
+func restoreFPState(ctx *sharedContext, c *platformContext, ac *arch.Context64) {
 	if !c.needRestoreFPState {
 		return
 	}
@@ -93,7 +96,38 @@ func restoreFPState(ctx *sharedContext, c *context, ac *arch.Context64) {
 	ctx.setFPStateChanged()
 
 	fpState := ac.FloatingPointData().BytePointer()
-	src := unsafeSlice(uintptr(unsafe.Pointer(fpState)), archState.FpLen())
+	src := unsafe.Slice(fpState, archState.FpLen())
 	dst := ctx.shared.FPState[:]
 	copy(dst, src)
+}
+
+// alive returns true if the subprocess is alive.
+func (s *subprocess) alive() bool {
+	if s.dead.Load() {
+		return false
+	}
+
+	// Wait4 doesn't support WNOWAIT, but here is no other way to find out
+	// whether a process exited or was stopped by ptrace.
+	siginfo := linux.SignalInfo{}
+	_, _, errno := unix.Syscall6(
+		unix.SYS_WAITID,
+		unix.P_PID,
+		uintptr(s.syscallThread.thread.tid),
+		uintptr(unsafe.Pointer(&siginfo)),
+		uintptr(unix.WEXITED|unix.WNOHANG|unix.WNOWAIT),
+		0, 0)
+	if errno == 0 && siginfo.PID() == 0 {
+		return true
+	}
+	if errno == 0 && siginfo.Code != linux.CLD_EXITED && siginfo.Code != linux.CLD_KILLED {
+		return true
+	}
+
+	// The process is dead, let's collect its zombie.
+	wstatus := unix.WaitStatus(0)
+	pid, err := unix.Wait4(int(s.syscallThread.thread.tid), &wstatus, unix.WNOHANG, nil)
+	log.Warningf("the subprocess %d exited (status: %s, err %s)", pid, wstatus, err)
+	s.dead.Store(true)
+	return false
 }

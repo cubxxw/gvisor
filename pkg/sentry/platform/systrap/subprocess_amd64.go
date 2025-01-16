@@ -23,6 +23,8 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform/systrap/sysmsg"
@@ -127,14 +129,13 @@ func dumpRegs(regs *arch.Registers) string {
 }
 
 // adjustInitregsRip adjust the current register RIP value to
-// be just before the system call instruction excution
+// be just before the system call instruction execution
 func (t *thread) adjustInitRegsRip() {
 	t.initRegs.Rip -= initRegsRipAdjustment
 }
 
 // Pass the expected PPID to the child via R15 when creating stub process.
 func initChildProcessPPID(initregs *arch.Registers, ppid int32) {
-	initregs.R15 = uint64(ppid)
 	// Rbx has to be set to 1 when creating stub process.
 	initregs.Rbx = _NEW_STUB
 }
@@ -175,7 +176,7 @@ func maybePatchSignalInfo(regs *arch.Registers, signalInfo *linux.SignalInfo) bo
 //go:nosplit
 //go:norace
 func enableCpuidFault() {
-	unix.RawSyscall6(unix.SYS_ARCH_PRCTL, linux.ARCH_SET_CPUID, 0, 0, 0, 0, 0)
+	hostsyscall.RawSyscall(unix.SYS_ARCH_PRCTL, linux.ARCH_SET_CPUID, 0, 0)
 }
 
 // appendArchSeccompRules append architecture specific seccomp rules when creating BPF program.
@@ -184,22 +185,22 @@ func appendArchSeccompRules(rules []seccomp.RuleSet) []seccomp.RuleSet {
 	return append(rules, []seccomp.RuleSet{
 		// Rules for trapping vsyscall access.
 		{
-			Rules: seccomp.SyscallRules{
-				unix.SYS_GETTIMEOFDAY: {},
-				unix.SYS_TIME:         {},
-				unix.SYS_GETCPU:       {}, // SYS_GETCPU was not defined in package syscall on amd64.
-			},
+			Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+				unix.SYS_GETTIMEOFDAY: seccomp.MatchAll{},
+				unix.SYS_TIME:         seccomp.MatchAll{},
+				unix.SYS_GETCPU:       seccomp.MatchAll{}, // SYS_GETCPU was not defined in package syscall on amd64.
+			}),
 			Action:   linux.SECCOMP_RET_TRAP,
 			Vsyscall: true,
 		},
 		{
-			Rules: seccomp.SyscallRules{
-				unix.SYS_ARCH_PRCTL: []seccomp.Rule{
-					{seccomp.EqualTo(linux.ARCH_SET_CPUID), seccomp.EqualTo(0)},
-					{seccomp.EqualTo(linux.ARCH_SET_FS)},
-					{seccomp.EqualTo(linux.ARCH_GET_FS)},
+			Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+				unix.SYS_ARCH_PRCTL: seccomp.Or{
+					seccomp.PerArg{seccomp.EqualTo(linux.ARCH_SET_CPUID), seccomp.EqualTo(0)},
+					seccomp.PerArg{seccomp.EqualTo(linux.ARCH_SET_FS)},
+					seccomp.PerArg{seccomp.EqualTo(linux.ARCH_GET_FS)},
 				},
-			},
+			}),
 			Action: linux.SECCOMP_RET_ALLOW,
 		},
 	}...)
@@ -222,4 +223,17 @@ func retrieveArchSpecificState(ctx *sysmsg.ThreadContext, ac *arch.Context64) {
 }
 
 func archSpecificSysmsgThreadInit(sysThread *sysmsgThread) {
+}
+
+func sigErrorToAccessType(sigError uint64) hostarch.AccessType {
+	switch {
+	case sigError&linux.X86_PF_WRITE != 0:
+		return hostarch.Write
+	case sigError&linux.X86_PF_INSTR != 0:
+		return hostarch.Execute
+	case sigError&linux.X86_PF_USER != 0:
+		return hostarch.Read
+	default:
+		return hostarch.NoAccess
+	}
 }

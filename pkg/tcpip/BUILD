@@ -19,10 +19,24 @@ go_template_instance(
     },
 )
 
+go_template_instance(
+    name = "route_list",
+    out = "route_list.go",
+    package = "tcpip",
+    prefix = "Route",
+    template = "//pkg/ilist:generic_list",
+    types = {
+        "Element": "*Route",
+        "Linker": "*Route",
+    },
+)
+
 go_library(
     name = "tcpip",
     srcs = [
         "errors.go",
+        "errors_linux.go",
+        "route_list.go",
         "sock_err_list.go",
         "socketops.go",
         "stdclock.go",
@@ -35,8 +49,10 @@ go_library(
     deps = [
         "//pkg/atomicbitops",
         "//pkg/buffer",
+        "//pkg/rand",
         "//pkg/sync",
         "//pkg/waiter",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 
@@ -62,6 +78,7 @@ deps_test(
         "//pkg/log",
         "//pkg/pool",
         "//pkg/rand",
+        "//pkg/rawfile",
         "//pkg/refs",
         "//pkg/sleep",
         "//pkg/state",
@@ -104,9 +121,15 @@ deps_test(
 go_test(
     name = "tcpip_test",
     size = "small",
-    srcs = ["tcpip_test.go"],
+    srcs = [
+        "errors_test.go",
+        "tcpip_test.go",
+    ],
     library = ":tcpip",
-    deps = ["@com_github_google_go_cmp//cmp:go_default_library"],
+    deps = [
+        "@com_github_google_go_cmp//cmp:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
 )
 
 go_test(

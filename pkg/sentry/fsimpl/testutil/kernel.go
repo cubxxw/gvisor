@@ -35,10 +35,12 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
+	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 
-	// Platforms are plugable.
+	// Platforms are pluggable.
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/kvm"
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/ptrace"
 )
@@ -52,6 +54,10 @@ var (
 func Boot() (*kernel.Kernel, error) {
 	cpuid.Initialize()
 	seccheck.Initialize()
+
+	if err := usage.Init(); err != nil {
+		return nil, fmt.Errorf("setting up memory accounting: %v", err)
+	}
 
 	platformCtr, err := platform.Lookup(*platformFlag)
 	if err != nil {
@@ -77,29 +83,31 @@ func Boot() (*kernel.Kernel, error) {
 	k.SetMemoryFile(mf)
 
 	// Pass k as the platform since it is savable, unlike the actual platform.
-	vdso, err := loader.PrepareVDSO(k)
+	vdso, err := loader.PrepareVDSO(k.MemoryFile())
 	if err != nil {
 		return nil, fmt.Errorf("creating vdso: %v", err)
 	}
 
 	// Create timekeeper.
-	tk := kernel.NewTimekeeper(k, vdso.ParamPage.FileRange())
-	tk.SetClocks(time.NewCalibratedClocks())
+	tk := kernel.NewTimekeeper()
+	params := kernel.NewVDSOParamPage(k.MemoryFile(), vdso.ParamPage.FileRange())
+	tk.SetClocks(time.NewCalibratedClocks(), params)
 
 	creds := auth.NewRootCredentials(auth.NewRootUserNamespace())
 
 	// Initiate the Kernel object, which is required by the Context passed
 	// to createVFS in order to mount (among other things) procfs.
 	if err = k.Init(kernel.InitKernelArgs{
-		ApplicationCores:            uint(runtime.GOMAXPROCS(-1)),
-		FeatureSet:                  cpuid.HostFeatureSet(),
-		Timekeeper:                  tk,
-		RootUserNamespace:           creds.UserNamespace,
-		Vdso:                        vdso,
-		RootUTSNamespace:            kernel.NewUTSNamespace("hostname", "domain", creds.UserNamespace),
-		RootIPCNamespace:            kernel.NewIPCNamespace(creds.UserNamespace),
-		RootAbstractSocketNamespace: kernel.NewAbstractSocketNamespace(),
-		PIDNamespace:                kernel.NewRootPIDNamespace(creds.UserNamespace),
+		ApplicationCores:  uint(runtime.GOMAXPROCS(-1)),
+		FeatureSet:        cpuid.HostFeatureSet(),
+		Timekeeper:        tk,
+		RootUserNamespace: creds.UserNamespace,
+		Vdso:              vdso,
+		VdsoParams:        params,
+		RootUTSNamespace:  kernel.NewUTSNamespace("hostname", "domain", creds.UserNamespace),
+		RootIPCNamespace:  kernel.NewIPCNamespace(creds.UserNamespace),
+		PIDNamespace:      kernel.NewRootPIDNamespace(creds.UserNamespace),
+		UnixSocketOpts:    transport.UnixSocketOpts{},
 	}); err != nil {
 		return nil, fmt.Errorf("initializing kernel: %v", err)
 	}
@@ -130,24 +138,23 @@ func CreateTask(ctx context.Context, name string, tc *kernel.ThreadGroup, mntns 
 	if err != nil {
 		return nil, err
 	}
-	m := mm.NewMemoryManager(k, k, k.SleepForAddressSpaceActivation)
+	m := mm.NewMemoryManager(k, k.MemoryFile(), k.SleepForAddressSpaceActivation)
 	m.SetExecutable(ctx, exe)
 
 	creds := auth.CredentialsFromContext(ctx)
 	config := &kernel.TaskConfig{
-		Kernel:                  k,
-		ThreadGroup:             tc,
-		TaskImage:               &kernel.TaskImage{Name: name, MemoryManager: m},
-		Credentials:             auth.CredentialsFromContext(ctx),
-		NetworkNamespace:        k.RootNetworkNamespace(),
-		AllowedCPUMask:          sched.NewFullCPUSet(k.ApplicationCores()),
-		UTSNamespace:            kernel.UTSNamespaceFromContext(ctx),
-		IPCNamespace:            kernel.IPCNamespaceFromContext(ctx),
-		AbstractSocketNamespace: kernel.NewAbstractSocketNamespace(),
-		MountNamespace:          mntns,
-		FSContext:               kernel.NewFSContext(root, cwd, 0022),
-		FDTable:                 k.NewFDTable(),
-		UserCounters:            k.GetUserCounters(creds.RealKUID),
+		Kernel:           k,
+		ThreadGroup:      tc,
+		TaskImage:        &kernel.TaskImage{Name: name, MemoryManager: m},
+		Credentials:      auth.CredentialsFromContext(ctx),
+		NetworkNamespace: k.RootNetworkNamespace(),
+		AllowedCPUMask:   sched.NewFullCPUSet(k.ApplicationCores()),
+		UTSNamespace:     kernel.UTSNamespaceFromContext(ctx),
+		IPCNamespace:     kernel.IPCNamespaceFromContext(ctx),
+		MountNamespace:   mntns,
+		FSContext:        kernel.NewFSContext(root, cwd, 0022),
+		FDTable:          k.NewFDTable(),
+		UserCounters:     k.GetUserCounters(creds.RealKUID),
 	}
 	config.NetworkNamespace.IncRef()
 	t, err := k.TaskSet().NewTask(ctx, config)

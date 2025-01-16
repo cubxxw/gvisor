@@ -1871,11 +1871,26 @@ TEST(Inotify, SpliceOnWatchTarget) {
   EXPECT_THAT(splice(pipefds[0], nullptr, fd.get(), nullptr, 1, /*flags=*/0),
               SyscallSucceedsWithValue(1));
 
+  // On Linux, between 983652c69199 ("splice: report related fsnotify events")
+  // and d53471ba6f7a ("splice: remove permission hook from
+  // iter_file_splice_write()"), splice(2) generates two modification events in
+  // many cases, by calling fsnotify_modify() in both fs/splice.c:do_splice()
+  // and fs/splice.c:iter_file_splice_write() =>
+  // fs/read_write.c:vfs_iter_write() => do_iter_write().
   events = ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
-  ASSERT_THAT(events, Are({
-                          Event(IN_MODIFY, dir_wd, Basename(file.path())),
-                          Event(IN_MODIFY, file_wd),
-                      }));
+  if (events.size() == 4) {
+    EXPECT_THAT(events, Are({
+                            Event(IN_MODIFY, dir_wd, Basename(file.path())),
+                            Event(IN_MODIFY, file_wd),
+                            Event(IN_MODIFY, dir_wd, Basename(file.path())),
+                            Event(IN_MODIFY, file_wd),
+                        }));
+  } else {
+    EXPECT_THAT(events, Are({
+                            Event(IN_MODIFY, dir_wd, Basename(file.path())),
+                            Event(IN_MODIFY, file_wd),
+                        }));
+  }
 }
 
 // Watches on a parent should not be triggered by actions on a hard link to one
@@ -1972,14 +1987,18 @@ TEST(Inotify, Xattr) {
 TEST(Inotify, Exec) {
   const FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
-  const int wd = ASSERT_NO_ERRNO_AND_VALUE(
-      InotifyAddWatch(fd.get(), "/bin/true", IN_ALL_EVENTS));
+  // Create a new executable file instead of using /bin/true directly in case
+  // the test suite uses it at any point and generates extra events.
+  TempPath p = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "#!/bin/true", 0755));
 
+  const int wd = ASSERT_NO_ERRNO_AND_VALUE(
+      InotifyAddWatch(fd.get(), p.path(), IN_ALL_EVENTS));
   // Perform exec.
   pid_t child = -1;
   int execve_errno = -1;
   auto kill = ASSERT_NO_ERRNO_AND_VALUE(
-      ForkAndExec("/bin/true", {}, {}, nullptr, &child, &execve_errno));
+      ForkAndExec(p.path(), {}, {}, nullptr, &child, &execve_errno));
   ASSERT_EQ(0, execve_errno);
 
   int status;

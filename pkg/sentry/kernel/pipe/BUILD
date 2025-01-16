@@ -1,5 +1,5 @@
-load("//tools:defs.bzl", "go_library", "go_test")
 load("//pkg/sync/locking:locking.bzl", "declare_mutex")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -46,6 +46,7 @@ go_library(
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/hostarch",
+        "//pkg/log",
         "//pkg/marshal/primitive",
         "//pkg/safemem",
         "//pkg/sentry/arch",

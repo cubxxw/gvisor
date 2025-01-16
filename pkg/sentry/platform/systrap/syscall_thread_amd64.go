@@ -22,6 +22,7 @@ import (
 	"runtime"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 )
 
@@ -36,15 +37,25 @@ func (t *syscallThread) detach() {
 	regs.Rsp = 0
 	regs.R12 = uint64(t.stubAddr)
 	regs.R13 = uint64(t.sentryMessage.state + 1)
-	regs.Rbx = _RUN_SYSCALL_LOOP
+	if t.seccompNotify != nil {
+		regs.Rbx = _RUN_SECCOMP_LOOP
+	} else {
+		regs.Rbx = _RUN_SYSCALL_LOOP
+	}
 	// Skip the syscall instruction.
 	regs.Rip += arch.SyscallWidth
 	if err := p.setRegs(&regs); err != nil {
 		panic(fmt.Sprintf("ptrace set regs failed: %v", err))
 	}
 	p.detach()
-	if _, _, e := unix.RawSyscall(unix.SYS_TGKILL, uintptr(p.tgid), uintptr(p.tid), uintptr(unix.SIGCONT)); e != 0 {
+	if e := hostsyscall.RawSyscallErrno(unix.SYS_TGKILL, uintptr(p.tgid), uintptr(p.tid), uintptr(unix.SIGCONT)); e != 0 {
 		panic(fmt.Sprintf("tkill failed: %v", e))
 	}
 	runtime.UnlockOSThread()
+
+	if t.seccompNotify != nil {
+		if err := t.waitForSeccompNotify(); err != nil {
+			panic(fmt.Sprintf("%s", err))
+		}
+	}
 }

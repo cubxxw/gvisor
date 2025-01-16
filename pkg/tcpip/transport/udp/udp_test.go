@@ -18,7 +18,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math"
 	"math/rand"
 	"os"
@@ -303,7 +303,7 @@ func TestV4ReadSelfSource(t *testing.T) {
 				t.Errorf("c.Stack.Stats().IP.InvalidSourceAddressesReceived got %d, want %d", got, tt.wantInvalidSource)
 			}
 
-			if _, err := c.EP.Read(ioutil.Discard, tcpip.ReadOptions{}); err != tt.wantErr {
+			if _, err := c.EP.Read(io.Discard, tcpip.ReadOptions{}); err != tt.wantErr {
 				t.Errorf("got c.EP.Read = %s, want = %s", err, tt.wantErr)
 			}
 		})
@@ -591,7 +591,7 @@ func testWriteAndVerifyInternal(c *context.Context, flow context.TestFlow, setDe
 	// Received the packet and check the payload.
 
 	p := c.LinkEP.Read()
-	if p.IsNil() {
+	if p == nil {
 		c.T.Fatalf("Packet wasn't written out")
 	}
 	defer p.DecRef()
@@ -1553,7 +1553,7 @@ func TestV4UnknownDestination(t *testing.T) {
 				}
 			}
 			if !tc.icmpRequired {
-				if p := c.LinkEP.Read(); !p.IsNil() {
+				if p := c.LinkEP.Read(); p != nil {
 					t.Fatalf("unexpected packet received: %+v", p)
 				}
 				return
@@ -1561,7 +1561,7 @@ func TestV4UnknownDestination(t *testing.T) {
 
 			// ICMP required.
 			p := c.LinkEP.Read()
-			if p.IsNil() {
+			if p == nil {
 				t.Fatalf("packet wasn't written out")
 			}
 
@@ -1650,7 +1650,7 @@ func TestV6UnknownDestination(t *testing.T) {
 				}
 			}
 			if !tc.icmpRequired {
-				if p := c.LinkEP.Read(); !p.IsNil() {
+				if p := c.LinkEP.Read(); p != nil {
 					t.Fatalf("unexpected packet received: %+v", p)
 				}
 				return
@@ -1658,7 +1658,7 @@ func TestV6UnknownDestination(t *testing.T) {
 
 			// ICMP required.
 			p := c.LinkEP.Read()
-			if p.IsNil() {
+			if p == nil {
 				t.Fatalf("packet wasn't written out")
 			}
 
@@ -2212,7 +2212,7 @@ func TestChecksumWithZeroValueOnesComplementSum(t *testing.T) {
 		}
 
 		pkt := c.LinkEP.Read()
-		if pkt.IsNil() {
+		if pkt == nil {
 			t.Fatal("Packet wasn't written out")
 		}
 
@@ -2249,7 +2249,7 @@ func TestChecksumWithZeroValueOnesComplementSum(t *testing.T) {
 
 	{
 		pkt := c.LinkEP.Read()
-		if pkt.IsNil() {
+		if pkt == nil {
 			t.Fatal("Packet wasn't written out")
 		}
 		defer pkt.DecRef()
@@ -2291,6 +2291,85 @@ func TestWritePayloadSizeTooBig(t *testing.T) {
 		}
 		c.Cleanup()
 	}
+}
+
+func TestSetExperimentOption(t *testing.T) {
+	opts := context.Options{
+		EnableExperimentIPOption: true,
+		MTU:                      context.DefaultMTU,
+		HandleLocal:              true,
+	}
+	c := context.NewWithOptions(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4}, opts)
+	defer c.Cleanup()
+
+	c.CreateEndpoint(ipv4.ProtocolNumber, udp.ProtocolNumber)
+
+	if err := c.EP.Connect(tcpip.FullAddress{Addr: context.TestAddr, Port: context.TestPort}); err != nil {
+		c.T.Fatalf("Connect failed: %s", err)
+	}
+
+	var expval uint16 = 99
+	c.EP.SocketOptions().SetExperimentOptionValue(expval)
+
+	var r bytes.Reader
+	r.Reset(make([]byte, 1))
+	_, err := c.EP.Write(&r, tcpip.WriteOptions{})
+	if err != nil {
+		t.Fatalf("Write failed: %s", err)
+	}
+
+	want := header.IPv4Options{
+		byte(header.IPv4OptionExperimentType),
+		byte(header.IPv4OptionExperimentLength),
+		0,
+		byte(expval),
+	}
+
+	pkt := c.LinkEP.Read()
+	if pkt == nil {
+		t.Fatal("Packet wasn't written out")
+	}
+	defer pkt.DecRef()
+
+	v := stack.PayloadSince(pkt.LinkHeader())
+	defer v.Release()
+	checker.IPv4(t, v, checker.IPv4Options(want))
+}
+
+func TestSetExperimentOptionIPv6(t *testing.T) {
+	opts := context.Options{
+		EnableExperimentIPOption: true,
+		MTU:                      context.DefaultMTU,
+		HandleLocal:              true,
+	}
+	c := context.NewWithOptions(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4}, opts)
+	defer c.Cleanup()
+
+	c.CreateEndpoint(ipv6.ProtocolNumber, udp.ProtocolNumber)
+
+	if err := c.EP.Connect(tcpip.FullAddress{Addr: context.TestV6Addr, Port: context.TestPort}); err != nil {
+		c.T.Fatalf("Connect failed: %s", err)
+	}
+
+	var expval uint16 = 99
+	c.EP.SocketOptions().SetExperimentOptionValue(expval)
+
+	var r bytes.Reader
+	r.Reset(make([]byte, 1))
+	_, err := c.EP.Write(&r, tcpip.WriteOptions{})
+	if err != nil {
+		t.Fatalf("Write failed: %s", err)
+	}
+
+	pkt := c.LinkEP.Read()
+	if pkt == nil {
+		t.Fatal("Packet wasn't written out")
+	}
+	defer pkt.DecRef()
+
+	v := stack.PayloadSince(pkt.LinkHeader())
+	defer v.Release()
+	checker.IPv6WithExtHdr(t, v, checker.IPv6ExtHdr(checker.IPv6ExperimentHeader(expval)))
 }
 
 func TestMain(m *testing.M) {

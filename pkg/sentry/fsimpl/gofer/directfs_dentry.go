@@ -91,7 +91,8 @@ func (fs *filesystem) getDirectfsRootDentry(ctx context.Context, rootHostFD int,
 type directfsDentry struct {
 	dentry
 
-	// controlFD is the host FD to this file. controlFD is immutable.
+	// controlFD is the host FD to this file. controlFD is immutable until
+	// destruction, which is synchronized with dentry.handleMu.
 	controlFD int
 
 	// controlFDLisa is a lisafs control FD on this dentry.
@@ -148,7 +149,8 @@ func (fs *filesystem) newDirectfsDentry(controlFD int) (*dentry, error) {
 
 // Precondition: fs.renameMu is locked.
 func (d *directfsDentry) openHandle(ctx context.Context, flags uint32) (handle, error) {
-	if d.parent == nil {
+	parent := d.parent.Load()
+	if parent == nil {
 		// This is a mount point. We don't have parent. Fallback to using lisafs.
 		if !d.controlFDLisa.Ok() {
 			panic("directfsDentry.controlFDLisa is not set for mount point dentry")
@@ -168,7 +170,7 @@ func (d *directfsDentry) openHandle(ctx context.Context, flags uint32) (handle, 
 	// The only way to re-open an FD with different flags is via procfs or
 	// openat(2) from the parent. Procfs does not exist here. So use parent.
 	flags |= hostOpenFlags
-	openFD, err := unix.Openat(d.parent.impl.(*directfsDentry).controlFD, d.name, int(flags), 0)
+	openFD, err := unix.Openat(parent.impl.(*directfsDentry).controlFD, d.name, int(flags), 0)
 	if err != nil {
 		return noHandle, err
 	}
@@ -185,9 +187,9 @@ func (d *directfsDentry) ensureLisafsControlFD(ctx context.Context) error {
 
 	var names []string
 	root := d
-	for root.parent != nil {
+	for root.parent.Load() != nil {
 		names = append(names, root.name)
-		root = root.parent.impl.(*directfsDentry)
+		root = root.parent.Load().impl.(*directfsDentry)
 	}
 	if !root.controlFDLisa.Ok() {
 		panic("controlFDLisa is not set for mount point dentry")
@@ -264,24 +266,25 @@ func (d *directfsDentry) updateMetadataLocked(h handle) error {
 
 // Precondition: fs.renameMu is locked if d is a socket.
 func (d *directfsDentry) chmod(ctx context.Context, mode uint16) error {
+	if d.isSymlink() {
+		// Linux does not support changing the mode of symlinks. See
+		// fs/attr.c:notify_change().
+		return unix.EOPNOTSUPP
+	}
 	if !d.isSocket() {
 		return unix.Fchmod(d.controlFD, uint32(mode))
 	}
 
-	// fchmod(2) on socket files created via bind(2) fails. We need to
-	// fchmodat(2) it from its parent.
-	if d.parent != nil {
-		// We have parent FD, just use that. Note that AT_SYMLINK_NOFOLLOW flag is
-		// currently not supported. So we don't use it.
-		return unix.Fchmodat(d.parent.impl.(*directfsDentry).controlFD, d.name, uint32(mode), 0 /* flags */)
+	// Sockets use O_PATH control FDs. However, fchmod(2) fails with EBADF for
+	// O_PATH FDs. Try to fchmodat(2) it from its parent.
+	if parent := d.parent.Load(); parent != nil {
+		return unix.Fchmodat(parent.impl.(*directfsDentry).controlFD, d.name, uint32(mode), 0 /* flags */)
 	}
 
-	// This is a mount point socket. We don't have a parent FD. Fallback to using
-	// lisafs.
-	if !d.controlFDLisa.Ok() {
-		panic("directfsDentry.controlFDLisa is not set for mount point socket")
+	// This is a mount point socket (no parent). Fallback to using lisafs.
+	if err := d.ensureLisafsControlFD(ctx); err != nil {
+		return err
 	}
-
 	return chmod(ctx, d.controlFDLisa, mode)
 }
 
@@ -320,8 +323,8 @@ func (d *directfsDentry) utimensat(ctx context.Context, stat *linux.Statx) error
 	// utimensat operates different that other syscalls. To operate on a
 	// symlink it *requires* AT_SYMLINK_NOFOLLOW with dirFD and a non-empty
 	// name.
-	if d.parent != nil {
-		return fsutil.Utimensat(d.parent.impl.(*directfsDentry).controlFD, d.name, utimes, unix.AT_SYMLINK_NOFOLLOW)
+	if parent := d.parent.Load(); parent != nil {
+		return fsutil.Utimensat(parent.impl.(*directfsDentry).controlFD, d.name, utimes, unix.AT_SYMLINK_NOFOLLOW)
 	}
 
 	// This is a mount point symlink. We don't have a parent FD. Fallback to
@@ -400,9 +403,11 @@ func fchown(fd, uid, gid int) error {
 	return unix.Fchownat(fd, "", uid, gid, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 }
 
+// Precondition: d.handleMu must be locked.
 func (d *directfsDentry) destroy(ctx context.Context) {
 	if d.controlFD >= 0 {
 		_ = unix.Close(d.controlFD)
+		d.controlFD = -1
 	}
 	if d.controlFDLisa.Ok() {
 		d.controlFDLisa.Close(ctx, true /* flush */)
@@ -419,6 +424,22 @@ func (d *directfsDentry) getHostChild(name string) (*dentry, error) {
 	return d.fs.newDirectfsDentry(childFD)
 }
 
+func (d *directfsDentry) getXattr(ctx context.Context, name string, size uint64) (string, error) {
+	if ftype := d.fileType(); ftype == linux.S_IFSOCK || ftype == linux.S_IFLNK {
+		// Sockets and symlinks use O_PATH control FDs. However, fgetxattr(2) fails
+		// with EBADF for O_PATH FDs. Fallback to lisafs.
+		if err := d.ensureLisafsControlFD(ctx); err != nil {
+			return "", err
+		}
+		return d.controlFDLisa.GetXattr(ctx, name, size)
+	}
+	data := make([]byte, size)
+	if _, err := unix.Fgetxattr(d.controlFD, name, data); err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
 // getCreatedChild opens the newly created child, sets its uid/gid, constructs
 // a disconnected dentry and returns it.
 func (d *directfsDentry) getCreatedChild(name string, uid, gid int, isDir bool) (*dentry, error) {
@@ -431,7 +452,7 @@ func (d *directfsDentry) getCreatedChild(name string, uid, gid int, isDir bool) 
 	deleteChild := func() {
 		// Best effort attempt to remove the newly created child on failure.
 		if err := unix.Unlinkat(d.controlFD, name, unlinkFlags); err != nil {
-			log.Warningf("error unlinking newly created child %q after failure: %v", filepath.Join(genericDebugPathname(&d.dentry), name), err)
+			log.Warningf("error unlinking newly created child %q after failure: %v", filepath.Join(genericDebugPathname(d.fs, &d.dentry), name), err)
 		}
 	}
 
@@ -497,7 +518,7 @@ func (d *directfsDentry) bindAt(ctx context.Context, name string, creds *auth.Cr
 	hbep := opts.Endpoint.(transport.HostBoundEndpoint)
 	if err := hbep.SetBoundSocketFD(ctx, boundSocketFD); err != nil {
 		if err := unix.Unlinkat(d.controlFD, name, 0); err != nil {
-			log.Warningf("error unlinking newly created socket %q after failure: %v", filepath.Join(genericDebugPathname(&d.dentry), name), err)
+			log.Warningf("error unlinking newly created socket %q after failure: %v", filepath.Join(genericDebugPathname(d.fs, &d.dentry), name), err)
 		}
 		return nil, err
 	}
@@ -507,8 +528,10 @@ func (d *directfsDentry) bindAt(ctx context.Context, name string, creds *auth.Cr
 		hbep.ResetBoundSocketFD(ctx)
 		return nil, err
 	}
-	// Set the endpoint on the newly created child dentry.
+	// Set the endpoint on the newly created child dentry, and take the
+	// corresponding extra dentry reference.
 	child.endpoint = opts.Endpoint
+	child.IncRef()
 	return child, nil
 }
 
@@ -521,11 +544,13 @@ func (d *directfsDentry) link(target *directfsDentry, name string) (*dentry, err
 	// using olddirfd to call linkat(2).
 	// Also note that d and target are from the same mount. Given target is a
 	// non-directory and d is a directory, target.parent must exist.
-	if err := unix.Linkat(target.parent.impl.(*directfsDentry).controlFD, target.name, d.controlFD, name, 0); err != nil {
+	if err := unix.Linkat(target.parent.Load().impl.(*directfsDentry).controlFD, target.name, d.controlFD, name, 0); err != nil {
 		return nil, err
 	}
 	// Note that we don't need to set uid/gid for the new child. This is a hard
 	// link. The original file already has the right owner.
+	// TODO(gvisor.dev/issue/6739): Hard linked dentries should share the same
+	// inode fields.
 	return d.getCreatedChild(name, -1 /* uid */, -1 /* gid */, false /* isDir */)
 }
 
@@ -564,39 +589,27 @@ func (d *directfsDentry) getDirentsLocked(recordDirent func(name string, key ino
 		return err
 	}
 
-	var direntsBuf [8192]byte
-	for {
-		n, err := unix.Getdents(readFD, direntsBuf[:])
+	return fsutil.ForEachDirent(readFD, func(ino uint64, off int64, ftype uint8, name string, reclen uint16) {
+		// We also want the device ID, which annoyingly incurs an additional
+		// syscall per dirent.
+		// TODO(gvisor.dev/issue/6665): Get rid of per-dirent stat.
+		stat, err := fsutil.StatAt(d.controlFD, name)
 		if err != nil {
-			return err
+			log.Warningf("Getdent64: skipping file %q with failed stat, err: %v", path.Join(genericDebugPathname(d.fs, &d.dentry), name), err)
+			return
 		}
-		if n <= 0 {
-			return nil
-		}
-
-		fsutil.ParseDirents(direntsBuf[:n], func(ino uint64, off int64, ftype uint8, name string, reclen uint16) bool {
-			// We also want the device ID, which annoyingly incurs an additional
-			// syscall per dirent.
-			// TODO(gvisor.dev/issue/6665): Get rid of per-dirent stat.
-			stat, err := fsutil.StatAt(d.controlFD, name)
-			if err != nil {
-				log.Warningf("Getdent64: skipping file %q with failed stat, err: %v", path.Join(genericDebugPathname(&d.dentry), name), err)
-				return true
-			}
-			recordDirent(name, inoKeyFromStat(&stat), ftype)
-			return true
-		})
-	}
+		recordDirent(name, inoKeyFromStat(&stat), ftype)
+	})
 }
 
 // Precondition: fs.renameMu is locked.
-func (d *directfsDentry) connect(ctx context.Context, sockType linux.SockType) (int, error) {
+func (d *directfsDentry) connect(ctx context.Context, sockType linux.SockType, euid lisafs.UID, egid lisafs.GID) (int, error) {
 	// There are no filesystems mounted in the sandbox process's mount namespace.
 	// So we can't perform absolute path traversals. So fallback to using lisafs.
 	if err := d.ensureLisafsControlFD(ctx); err != nil {
 		return -1, err
 	}
-	return d.controlFDLisa.Connect(ctx, sockType)
+	return d.controlFDLisa.Connect(ctx, sockType, euid, egid)
 }
 
 func (d *directfsDentry) readlink() (string, error) {
@@ -634,13 +647,12 @@ func (d *directfsDentry) statfs() (linux.Statfs, error) {
 
 func (d *directfsDentry) restoreFile(ctx context.Context, controlFD int, opts *vfs.CompleteRestoreOptions) error {
 	if controlFD < 0 {
-		log.Warningf("directfsDentry.restoreFile called with invalid controlFD")
-		return unix.EINVAL
+		return fmt.Errorf("directfsDentry.restoreFile called with invalid controlFD")
 	}
 	var stat unix.Stat_t
 	if err := unix.Fstat(controlFD, &stat); err != nil {
 		_ = unix.Close(controlFD)
-		return err
+		return fmt.Errorf("failed to stat %q: %w", genericDebugPathname(d.fs, &d.dentry), err)
 	}
 
 	d.controlFD = controlFD
@@ -662,12 +674,12 @@ func (d *directfsDentry) restoreFile(ctx context.Context, controlFD int, opts *v
 	if d.isRegularFile() {
 		if opts.ValidateFileSizes {
 			if d.size.RacyLoad() != uint64(stat.Size) {
-				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: file size validation failed: size changed from %d to %d", genericDebugPathname(&d.dentry), d.size.Load(), stat.Size)}
+				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: file size validation failed: size changed from %d to %d", genericDebugPathname(d.fs, &d.dentry), d.size.Load(), stat.Size)}
 			}
 		}
 		if opts.ValidateFileModificationTimestamps {
 			if want := dentryTimestampFromUnix(stat.Mtim); d.mtime.RacyLoad() != want {
-				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: mtime validation failed: mtime changed from %+v to %+v", genericDebugPathname(&d.dentry), linux.NsecToStatxTimestamp(d.mtime.RacyLoad()), linux.NsecToStatxTimestamp(want))}
+				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: mtime validation failed: mtime changed from %+v to %+v", genericDebugPathname(d.fs, &d.dentry), linux.NsecToStatxTimestamp(d.mtime.RacyLoad()), linux.NsecToStatxTimestamp(want))}
 			}
 		}
 	}
@@ -677,7 +689,7 @@ func (d *directfsDentry) restoreFile(ctx context.Context, controlFD int, opts *v
 
 	if rw, ok := d.fs.savedDentryRW[&d.dentry]; ok {
 		if err := d.ensureSharedHandle(ctx, rw.read, rw.write, false /* trunc */); err != nil {
-			return err
+			return fmt.Errorf("failed to restore file handles (read=%t, write=%t) for %q: %w", rw.read, rw.write, genericDebugPathname(d.fs, &d.dentry), err)
 		}
 	}
 

@@ -58,6 +58,22 @@ doc(
 )
 
 doc(
+    name = "gpu",
+    src = "gpu.md",
+    category = "User Guide",
+    permalink = "/docs/user_guide/gpu/",
+    weight = "51",
+)
+
+doc(
+    name = "tpu",
+    src = "tpu.md",
+    category = "User Guide",
+    permalink = "/docs/user_guide/tpu/",
+    weight = "51",
+)
+
+doc(
     name = "runtime_monitoring",
     src = "runtime_monitoring.md",
     category = "User Guide",
@@ -95,4 +111,12 @@ doc(
     category = "User Guide",
     permalink = "/docs/user_guide/faq/",
     weight = "90",
+)
+
+doc(
+    name = "systemd",
+    src = "systemd.md",
+    category = "User Guide",
+    permalink = "/docs/user_guide/systemd/",
+    weight = "91",
 )

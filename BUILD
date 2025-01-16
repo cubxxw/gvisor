@@ -1,8 +1,8 @@
+load("@rules_license//rules:license.bzl", "license")
 load("//tools:defs.bzl", "build_test", "gazelle", "go_path")
 load("//tools/nogo:defs.bzl", "nogo_config")
 load("//tools/yamltest:defs.bzl", "yaml_test")
 load("//website:defs.bzl", "doc")
-load("@rules_license//rules:license.bzl", "license")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -19,7 +19,9 @@ exports_files(["LICENSE"])
 nogo_config(
     name = "nogo_config",
     srcs = ["nogo.yaml"],
-    visibility = ["//:sandbox"],
+    visibility = [
+        "//visibility:public",
+    ],
 )
 
 doc(
@@ -137,6 +139,7 @@ go_path(
 
         # Packages that are not dependencies of the above.
         "//pkg/sentry/kernel/memevent",
+        "//pkg/sentry/socket/plugin/stack",
         "//pkg/tcpip/adapters/gonet",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/link/channel",
