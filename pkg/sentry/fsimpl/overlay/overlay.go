@@ -23,10 +23,11 @@
 //			dentry.dirMu
 //		    dentry.copyMu
 //		      filesystem.devMu
-//		      *** "memmap.Mappable locks" below this point
+//		      *** "memmap.Mappable/MappingIdentity locks" below this point
 //		      dentry.mapsMu
 //		        *** "memmap.Mappable locks taken by Translate" below this point
 //		        dentry.dataMu
+//		      filesystem.ancestryMu
 //
 // Locking dentry.dirMu in multiple dentries requires that parent dentries are
 // locked before child dentries, and that filesystem.renameMu is locked to
@@ -36,6 +37,7 @@ package overlay
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
@@ -116,6 +118,10 @@ type filesystem struct {
 	// dentries.
 	renameMu renameRWMutex `state:"nosave"`
 
+	// ancestryMu additionally protects dentry.parent and dentry.name as
+	// required by genericfstree.
+	ancestryMu ancestryRWMutex `state:"nosave"`
+
 	// dirInoCache caches overlay-private directory inode numbers by mapped
 	// bottommost device numbers and inode number. dirInoCache is protected by
 	// dirInoCacheMu.
@@ -164,7 +170,29 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		delete(mopts, "upperdir")
 		// Linux overlayfs also requires a workdir when upperdir is
 		// specified; we don't, so silently ignore this option.
-		delete(mopts, "workdir")
+		if workdir, ok := mopts["workdir"]; ok {
+			// Linux creates the "work" directory in `workdir`.
+			// Docker calls chown on it and fails if it doesn't
+			// exist.
+			workdirPath := fspath.Parse(workdir + "/work")
+			if !workdirPath.Absolute {
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: workdir %q must be absolute", workdir)
+				return nil, nil, linuxerr.EINVAL
+			}
+			pop := vfs.PathOperation{
+				Root:               vfsroot,
+				Start:              vfsroot,
+				Path:               workdirPath,
+				FollowFinalSymlink: false,
+			}
+			mode := vfs.MkdirOptions{
+				Mode: linux.ModeUserAll,
+			}
+			if err := vfsObj.MkdirAt(ctx, creds, &pop, &mode); err != nil && err != linuxerr.EEXIST {
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to create %s/work: %v", workdir, err)
+			}
+			delete(mopts, "workdir")
+		}
 		upperPath := fspath.Parse(upperPathname)
 		if !upperPath.Absolute {
 			ctx.Infof("overlay.FilesystemType.GetFilesystem: upperdir %q must be absolute", upperPathname)
@@ -181,6 +209,14 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		if err != nil {
 			ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to resolve upperdir %q: %v", upperPathname, err)
 			return nil, nil, err
+		}
+		// TODO(b/286942303): Only tmpfs supports whiteouts and
+		// trusted.overlay attributes. Don't allow to use non-tmpfs
+		// mounts on upper levels for mounts created through the mount
+		// syscall. In gVisor configs, users can specify any
+		// configurations on their own risk.
+		if !opts.InternalMount && upperRoot.Mount().Filesystem().FilesystemType().Name() != "tmpfs" {
+			return nil, nil, linuxerr.EINVAL
 		}
 		privateUpperRoot, err := clonePrivateMount(vfsObj, upperRoot, false /* forceReadOnly */)
 		upperRoot.DecRef(ctx)
@@ -329,7 +365,12 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		root.devMinor = atomicbitops.FromUint32(fs.dirDevMinor)
 		// For root dir, it is okay to use top most level's stat to compute inode
 		// number because we don't allow copy ups on root dentries.
-		root.ino.Store(fs.newDirIno(rootStat.DevMajor, rootStat.DevMinor, rootStat.Ino))
+		orig := layerDevNoAndIno{
+			layerDevNumber: layerDevNumber{rootStat.DevMajor, rootStat.DevMinor},
+			ino:            rootStat.Ino,
+		}
+		root.ino.Store(fs.newDirIno(orig))
+		root.dirInoHash = orig
 	} else if !root.upperVD.Ok() {
 		root.devMajor = atomicbitops.FromUint32(linux.UNNAMED_MAJOR)
 		rootDevMinor, err := fs.getLowerDevMinor(rootStat.DevMajor, rootStat.DevMinor)
@@ -420,13 +461,9 @@ func (fs *filesystem) statFS(ctx context.Context) (linux.Statfs, error) {
 	return fsstat, nil
 }
 
-func (fs *filesystem) newDirIno(layerMajor, layerMinor uint32, layerIno uint64) uint64 {
+func (fs *filesystem) newDirIno(orig layerDevNoAndIno) uint64 {
 	fs.dirInoCacheMu.Lock()
 	defer fs.dirInoCacheMu.Unlock()
-	orig := layerDevNoAndIno{
-		layerDevNumber: layerDevNumber{layerMajor, layerMinor},
-		ino:            layerIno,
-	}
 	if ino, ok := fs.dirInoCache[orig]; ok {
 		return ino
 	}
@@ -434,6 +471,12 @@ func (fs *filesystem) newDirIno(layerMajor, layerMinor uint32, layerIno uint64) 
 	newIno := fs.lastDirIno
 	fs.dirInoCache[orig] = newIno
 	return newIno
+}
+
+func (fs *filesystem) releaseDirIno(orig layerDevNoAndIno) {
+	fs.dirInoCacheMu.Lock()
+	defer fs.dirInoCacheMu.Unlock()
+	delete(fs.dirInoCache, orig)
 }
 
 func (fs *filesystem) getLowerDevMinor(layerMajor, layerMinor uint32) (uint32, error) {
@@ -478,7 +521,7 @@ type dentry struct {
 	// name is this dentry's name in parent. If this dentry is a filesystem
 	// root, parent is nil and name is the empty string. parent and name are
 	// protected by fs.renameMu.
-	parent *dentry
+	parent atomic.Pointer[dentry] `state:".(*dentry)"`
 	name   string
 
 	// If this dentry represents a directory, children maps the names of
@@ -545,12 +588,16 @@ type dentry struct {
 
 	locks vfs.FileLocks
 
-	// watches is the set of inotify watches on the file repesented by this dentry.
+	// watches is the set of inotify watches on the file represented by this dentry.
 	//
 	// Note that hard links to the same file will not share the same set of
 	// watches, due to the fact that we do not have inode structures in this
 	// overlay implementation.
 	watches vfs.Watches
+
+	// dirInoHash is the entry hash in fs.dirInoCache. This is only set for
+	// directories.
+	dirInoHash layerDevNoAndIno
 }
 
 // newDentry creates a new dentry. The dentry initially has no references; it
@@ -671,15 +718,15 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 
 	d.watches.HandleDeletion(ctx)
 
-	if d.parent != nil {
-		d.parent.dirMu.Lock()
+	if parent := d.parent.Load(); parent != nil {
+		parent.dirMu.Lock()
 		if !d.vfsd.IsDead() {
-			delete(d.parent.children, d.name)
+			delete(parent.children, d.name)
 		}
-		d.parent.dirMu.Unlock()
+		parent.dirMu.Unlock()
 		// Drop the reference held by d on its parent without recursively
 		// locking d.fs.renameMu.
-		d.parent.decRefLocked(ctx)
+		parent.decRefLocked(ctx)
 	}
 	refs.Unregister(d)
 }
@@ -712,13 +759,13 @@ func (d *dentry) InotifyWithParent(ctx context.Context, events uint32, cookie ui
 	// that d was deleted.
 	deleted := d.vfsd.IsDead()
 
-	d.fs.renameMu.RLock()
+	d.fs.ancestryMu.RLock()
 	// The ordering below is important, Linux always notifies the parent first.
-	if d.parent != nil {
-		d.parent.watches.Notify(ctx, d.name, events, cookie, et, deleted)
+	if parent := d.parent.Load(); parent != nil {
+		parent.watches.Notify(ctx, d.name, events, cookie, et, deleted)
 	}
 	d.watches.Notify(ctx, "", events, cookie, et, deleted)
-	d.fs.renameMu.RUnlock()
+	d.fs.ancestryMu.RUnlock()
 }
 
 // Watches implements vfs.DentryImpl.Watches.

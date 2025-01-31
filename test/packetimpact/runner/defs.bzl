@@ -73,8 +73,8 @@ _packetimpact_test = rule(
 )
 
 PACKETIMPACT_TAGS = [
-    "local",
     "manual",
+    "notap",
     "packetimpact",
 ]
 
@@ -169,8 +169,8 @@ def packetimpact_testbench(name, size = "small", pure = True, **kwargs):
         pure = pure,
         nogo = False,  # FIXME(gvisor.dev/issue/3374): Not working with all build systems.
         tags = [
-            "local",
             "manual",
+            "notap",
         ],
         **kwargs
     )
@@ -304,7 +304,15 @@ ALL_TESTS = [
         name = "tcp_fin_retransmission",
     ),
     PacketimpactTestInfo(
-        name = "generic_dgram_socket_send_recv",
+        name = "icmpv4_socket_send_recv",
+        timeout = "long",
+    ),
+    PacketimpactTestInfo(
+        name = "icmpv6_socket_send_recv",
+        timeout = "long",
+    ),
+    PacketimpactTestInfo(
+        name = "udp_socket_send_recv",
         timeout = "long",
     ),
     PacketimpactTestInfo(

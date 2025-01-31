@@ -290,6 +290,11 @@ func (fs *anonFilesystem) RemoveXattrAt(ctx context.Context, rp *ResolvingPath, 
 	return linuxerr.EPERM
 }
 
+// IsDescendant implements FilesystemImpl.IsDescendant.
+func (fs *anonFilesystem) IsDescendant(vfsroot, vd VirtualDentry) bool {
+	return vfsroot == vd
+}
+
 // PrependPath implements FilesystemImpl.PrependPath.
 func (fs *anonFilesystem) PrependPath(ctx context.Context, vfsroot, vd VirtualDentry, b *fspath.Builder) error {
 	b.PrependComponent(fmt.Sprintf("anon_inode:%s", vd.dentry.impl.(*anonDentry).name))

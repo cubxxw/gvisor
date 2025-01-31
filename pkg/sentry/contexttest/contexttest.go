@@ -24,7 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -44,7 +44,9 @@ func Context(tb testing.TB) context.Context {
 		tb.Fatalf("error creating application memory file: %v", err)
 	}
 	memfile := os.NewFile(uintptr(memfd), memfileName)
-	mf, err := pgalloc.NewMemoryFile(memfile, pgalloc.MemoryFileOpts{})
+	mf, err := pgalloc.NewMemoryFile(memfile, pgalloc.MemoryFileOpts{
+		DisableMemoryAccounting: true,
+	})
 	if err != nil {
 		memfile.Close()
 		tb.Fatalf("error creating pgalloc.MemoryFile: %v", err)
@@ -90,7 +92,7 @@ func (*globalUniqueIDProvider) UniqueID() uint64 {
 // inotify cookies.
 var lastInotifyCookie atomicbitops.Uint32
 
-// hostClock implements ktime.Clock.
+// hostClock implements ktime.SampledClock.
 type hostClock struct {
 	ktime.WallRateClock
 	ktime.NoClockEvents
@@ -99,6 +101,16 @@ type hostClock struct {
 // Now implements ktime.Clock.Now.
 func (*hostClock) Now() ktime.Time {
 	return ktime.FromNanoseconds(time.Now().UnixNano())
+}
+
+// SupportsTimers implements ktime.Clock.Now.
+func (*hostClock) SupportsTimers() bool {
+	return true
+}
+
+// NewTimer implements ktime.Clock.NewTimer.
+func (c *hostClock) NewTimer(l ktime.Listener) ktime.Timer {
+	return ktime.NewSampledTimer(c, l)
 }
 
 // RegisterValue registers additional values with this test context. Useful for
@@ -116,8 +128,6 @@ func (t *TestContext) Value(key any) any {
 		return t.l
 	case pgalloc.CtxMemoryFile:
 		return t.mf
-	case pgalloc.CtxMemoryFileProvider:
-		return t
 	case platform.CtxPlatform:
 		return t.platform
 	case uniqueid.CtxGlobalUniqueID:
@@ -134,11 +144,6 @@ func (t *TestContext) Value(key any) any {
 		}
 		return t.Context.Value(key)
 	}
-}
-
-// MemoryFile implements pgalloc.MemoryFileProvider.MemoryFile.
-func (t *TestContext) MemoryFile() *pgalloc.MemoryFile {
-	return t.mf
 }
 
 // RootContext returns a Context that may be used in tests that need root

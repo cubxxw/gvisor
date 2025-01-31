@@ -15,6 +15,8 @@
 package kernel
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/sentry/time"
 )
 
@@ -22,6 +24,11 @@ import (
 func (t *Timekeeper) beforeSave() {
 	if t.stop != nil {
 		panic("pauseUpdates must be called before Save")
+	}
+
+	if t.clocks == nil {
+		t.restored = nil
+		return
 	}
 
 	// N.B. we want the *offset* monotonic time.
@@ -36,6 +43,6 @@ func (t *Timekeeper) beforeSave() {
 }
 
 // afterLoad is invoked by stateify.
-func (t *Timekeeper) afterLoad() {
+func (t *Timekeeper) afterLoad(context.Context) {
 	t.restored = make(chan struct{})
 }

@@ -16,7 +16,6 @@ package container
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
@@ -56,7 +55,7 @@ func TestTraceStartup(t *testing.T) {
 			}
 			defer server.Close()
 
-			podInitConfig, err := ioutil.TempFile(testutil.TmpDir(), "config")
+			podInitConfig, err := os.CreateTemp(testutil.TmpDir(), "config")
 			if err != nil {
 				t.Fatalf("error creating tmp file: %v", err)
 			}
@@ -307,7 +306,6 @@ func TestProcfsDump(t *testing.T) {
 	spec.Process.Rlimits = []specs.POSIXRlimit{
 		{Type: "RLIMIT_NOFILE", Hard: fdLimit.Max, Soft: fdLimit.Cur},
 	}
-	conf.Cgroupfs = true
 	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
 	if err != nil {
 		t.Fatalf("error setting up container: %v", err)
@@ -347,7 +345,7 @@ func TestProcfsDump(t *testing.T) {
 
 	// Check that bin/sleep is part of the executable path.
 	if wantExeSubStr := "bin/sleep"; !strings.HasSuffix(procfsDump[0].Exe, wantExeSubStr) {
-		t.Errorf("expected %q to be part of execuable path %q", wantExeSubStr, procfsDump[0].Exe)
+		t.Errorf("expected %q to be part of executable path %q", wantExeSubStr, procfsDump[0].Exe)
 	}
 
 	if len(procfsDump[0].Args) != 2 {
@@ -377,7 +375,7 @@ func TestProcfsDump(t *testing.T) {
 		t.Errorf("expected at least 3 FDs for the sleep process, got %+v", procfsDump[0].FDs)
 	} else {
 		modes := [3]uint32{}
-		for i, _ := range []*os.File{os.Stdin, os.Stdout, os.Stderr} {
+		for i := range []*os.File{os.Stdin, os.Stdout, os.Stderr} {
 			stat := unix.Stat_t{}
 			err := unix.Fstat(i, &stat)
 			if err != nil {
@@ -414,11 +412,16 @@ func TestProcfsDump(t *testing.T) {
 	}
 
 	wantCgroup := []kernel.TaskCgroupEntry{
-		kernel.TaskCgroupEntry{HierarchyID: 2, Controllers: "memory", Path: "/"},
-		kernel.TaskCgroupEntry{HierarchyID: 1, Controllers: "cpu", Path: "/"},
+		{HierarchyID: 7, Controllers: "pids", Path: "/"},
+		{HierarchyID: 6, Controllers: "memory", Path: "/"},
+		{HierarchyID: 5, Controllers: "job", Path: "/"},
+		{HierarchyID: 4, Controllers: "devices", Path: "/"},
+		{HierarchyID: 3, Controllers: "cpuset", Path: "/"},
+		{HierarchyID: 2, Controllers: "cpuacct", Path: "/"},
+		{HierarchyID: 1, Controllers: "cpu", Path: "/"},
 	}
 	if len(procfsDump[0].Cgroup) != len(wantCgroup) {
-		t.Errorf("expected 2 cgroup controllers, got %+v", procfsDump[0].Cgroup)
+		t.Errorf("expected 7 cgroup controllers, got %+v", procfsDump[0].Cgroup)
 	} else {
 		for i, cgroup := range procfsDump[0].Cgroup {
 			if cgroup != wantCgroup[i] {

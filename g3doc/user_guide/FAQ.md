@@ -8,9 +8,8 @@ Today, gVisor requires Linux.
 
 ### What CPU architectures are supported? {#supported-cpus}
 
-gVisor currently supports [x86_64/AMD64](https://en.wikipedia.org/wiki/X86-64)
-compatible processors. Preliminary support is also available for
-[ARM64](https://en.wikipedia.org/wiki/ARM_architecture#AArch64).
+gVisor supports [x86_64/AMD64](https://en.wikipedia.org/wiki/X86-64) and
+[ARM64](https://en.wikipedia.org/wiki/ARM_architecture#AArch64) processors.
 
 ### Do I need to modify my Linux application to use gVisor? {#modify-app}
 
@@ -60,7 +59,7 @@ This is tracked in [bug #268](https://gvisor.dev/issue/268).
 
 You're using an old version of Docker. See [Docker Quick Start][docker].
 
-### I can’t see a file copied with: `docker cp` {#fs-cache}
+### I can't see a file copied with: `docker cp` {#fs-cache}
 
 For performance reasons, gVisor caches directory contents, and therefore it may
 not realize a new file was copied to a given directory. To invalidate the cache
@@ -82,19 +81,6 @@ Make sure that permissions is correct on the `runsc` binary.
 
 ```bash
 sudo chmod a+rx /usr/local/bin/runsc
-```
-
-If your Kernel is configured with YAMA LSM (see
-https://www.kernel.org/doc/Documentation/security/Yama.txt and
-https://man7.org/linux/man-pages/man2/ptrace.2.html) gVisor may fail in certain
-modes (i.e., systrap and/or directfs) with this error if
-`/proc/sys/kernel/yama/ptrace_scope` is set to 2. If this is the case, try
-setting `/proc/sys/kernel/yama/ptrace_scope` to max of mode 1:
-
-```bash
-sudo cat /proc/sys/kernel/yama/ptrace_scope
-2
-sudo bash -c 'echo 1 > /proc/sys/kernel/yama/ptrace_scope'
 ```
 
 ### I'm getting an error like `mount submount "/etc/hostname": creating mount with source ".../hostname": input/output error: unknown.` {#memlock}
@@ -159,6 +145,38 @@ sandbox isolation. There are a few different workarounds you can try:
 This error may happen when using `gvisor-containerd-shim` with a `containerd`
 that does not contain the fix for [CVE-2020-15257]. The resolve the issue,
 update containerd to 1.3.9 or 1.4.3 (or newer versions respectively).
+
+### I'm getting an error like `SELinux is not supported: system_u:system_r:container_t:s0:...`
+
+This error may happen in systems where SELinux is enabled. You can check this is
+the case with the `sestatus` command:
+
+```
+$ sudo sestatus
+SELinux status:                 enabled
+[...]
+```
+
+Since gVisor does not support setting SELinux labels, you can disable SELinux
+specifically for the new container by passing the `--security-opt label=disable`
+argument during its creation.
+
+### I'm getting an error like `error remounting chroot in read-only: permission denied` {#selinux-nested}
+
+This error may happen when gVisor is running **within** a container, in a system
+with SELinux in **enforcing** mode. To ensure this is the case, check your
+system's audit logs (e.g., `journalctl`) for SELinux denials like the following:
+
+```
+AVC avc: denied { mounton  } for ... scontext=... tcontext=... permissive=0
+```
+
+To resolve this issue, label the **outer** container with the
+`container_engine_t` SELinux label, by passing the `--security-opt
+label=type:container_engine_t` argument during its creation.
+
+This SELinux label is reserved for running a container engine (here gVisor)
+within another container (e.g., Docker or Podman).
 
 [security-model]: /docs/architecture_guide/security/
 [host-net]: /docs/user_guide/networking/#network-passthrough

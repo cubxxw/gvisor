@@ -42,7 +42,7 @@ func (*State) Synopsis() string {
 
 // Usage implements subcommands.Command.Usage.
 func (*State) Usage() string {
-	return `state [flags] <container id> - get the state of a container`
+	return "state [flags] <container id> - get the state of a container\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -62,18 +62,15 @@ func (*State) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomman
 	if err != nil {
 		util.Fatalf("loading container: %v", err)
 	}
-	log.Debugf("Returning state for container %+v", c)
 
 	state := c.State()
-	log.Debugf("State: %+v", state)
+	log.Debugf("Returning state for container %q: %+v", c.ID, state)
 
 	// Write json-encoded state directly to stdout.
-	b, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		util.Fatalf("marshaling container state: %v", err)
-	}
-	if _, err := os.Stdout.Write(b); err != nil {
-		util.Fatalf("Error writing to stdout: %v", err)
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(state); err != nil {
+		util.Fatalf("error marshaling container state: %v", err)
 	}
 	return subcommands.ExitSuccess
 }

@@ -47,7 +47,7 @@ func TestGetMountAccessType(t *testing.T) {
 			want: config.FileAccessShared,
 		},
 		{
-			name: "shared=shared",
+			name: "share=shared",
 			annotations: map[string]string{
 				MountPrefix + "mount1.source": source,
 				MountPrefix + "mount1.type":   "bind",
@@ -64,6 +64,24 @@ func TestGetMountAccessType(t *testing.T) {
 			},
 			want: config.FileAccessShared,
 		},
+		{
+			name: "tmpfs+container=exclusive",
+			annotations: map[string]string{
+				MountPrefix + "mount1.source": source,
+				MountPrefix + "mount1.type":   "tmpfs",
+				MountPrefix + "mount1.share":  "container",
+			},
+			want: config.FileAccessExclusive,
+		},
+		{
+			name: "tmpfs+pod=exclusive",
+			annotations: map[string]string{
+				MountPrefix + "mount1.source": source,
+				MountPrefix + "mount1.type":   "tmpfs",
+				MountPrefix + "mount1.share":  "pod",
+			},
+			want: config.FileAccessExclusive,
+		},
 	} {
 		t.Run(tst.name, func(t *testing.T) {
 			spec := &specs.Spec{Annotations: tst.annotations}
@@ -72,8 +90,7 @@ func TestGetMountAccessType(t *testing.T) {
 				t.Fatalf("newPodMountHints failed: %v", err)
 			}
 			conf := &config.Config{FileAccessMounts: config.FileAccessShared}
-			mnt := &specs.Mount{Source: source}
-			if got := getMountAccessType(conf, mnt, podHints.FindMount(mnt)); got != tst.want {
+			if got := getMountAccessType(conf, podHints.FindMount(source)); got != tst.want {
 				t.Errorf("getMountAccessType(), got: %v, want: %v", got, tst.want)
 			}
 		})

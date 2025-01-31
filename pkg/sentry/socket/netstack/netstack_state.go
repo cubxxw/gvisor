@@ -15,7 +15,10 @@
 package netstack
 
 import (
+	"context"
 	"time"
+
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 func (s *sock) saveTimestamp() int64 {
@@ -24,8 +27,22 @@ func (s *sock) saveTimestamp() int64 {
 	return s.timestamp.UnixNano()
 }
 
-func (s *sock) loadTimestamp(nsec int64) {
+func (s *sock) loadTimestamp(_ context.Context, nsec int64) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 	s.timestamp = time.Unix(0, nsec)
+}
+
+func (s *Stack) saveStack() *stack.Stack {
+	if s.IsSaveRestoreEnabled() {
+		return s.Stack
+	}
+
+	// Netstack s/r is not enabled. Do not save netstack, during
+	// restore a new stack will be configured.
+	return nil
+}
+
+func (s *Stack) loadStack(_ context.Context, st *stack.Stack) {
+	s.Stack = st
 }

@@ -63,6 +63,7 @@ struct sysmsg {
 
   int32_t fault_jump;
   int32_t err;
+  int32_t err_additional;
   int32_t err_line;
   uint64_t debug;
   uint32_t thread_id;
@@ -93,9 +94,21 @@ struct thread_context {
   uint32_t thread_id;
   uint32_t last_thread_id;
   uint32_t sentry_fast_path;
-  uint32_t acked;
+  uint64_t acked_time;
+  uint64_t state_changed_time;
   uint64_t tls;
   uint64_t debug;
+  uint64_t err;
+};
+
+enum stub_error {
+  STUB_ERROR_BAD_SYSMSG = 0x0bad0000,
+  STUB_ERROR_BAD_THREAD_STATE,
+  STUB_ERROR_SPINNING_QUEUE_DECREF,
+  STUB_ERROR_ARCH_PRCTL,
+  STUB_ERROR_FUTEX,
+  STUB_ERROR_BAD_CONTEXT_ID,
+  STUB_ERROR_FPSTATE_BAD_HEADER,
 };
 
 #ifndef PAGE_SIZE
@@ -142,11 +155,12 @@ struct __kernel_timespec;
 long sys_futex(uint32_t *addr, int op, int val, struct __kernel_timespec *tv,
                uint32_t *addr2, int val3);
 
-static void __panic(int err, long line) {
+static void __panic(int err, int err_additional, long line) {
   void *sp = sysmsg_sp();
   struct sysmsg *sysmsg = sysmsg_addr(sp);
   struct thread_context *ctx = sysmsg->context;
   sysmsg->err = err;
+  sysmsg->err_additional = err_additional;
   sysmsg->err_line = line;
   // Wake up the goroutine waiting on the current context.
   __atomic_store_n(&ctx->state, CONTEXT_STATE_FAULT, __ATOMIC_RELEASE);
@@ -176,7 +190,7 @@ struct thread_context *switch_context(struct sysmsg *sysmsg,
 int wait_state(struct sysmsg *sysmsg, enum thread_state new_thread_state);
 void init_new_thread(void);
 
-#define panic(err) __panic(err, __LINE__)
+#define panic(err, err_additional) __panic(err, err_additional, __LINE__)
 // NOLINTEND(runtime/int)
 
 #endif  // THIRD_PARTY_GVISOR_PKG_SENTRY_PLATFORM_SYSTRAP_SYSMSG_SYSMSG_H_

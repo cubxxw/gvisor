@@ -29,7 +29,7 @@ var _ stack.QueueingDiscipline = (*discipline)(nil)
 
 const (
 	// BatchSize is the number of packets to write in each syscall. It is 47
-	// because when GvisorGSO is in use then a single 65KB TCP segment can get
+	// because when GVisorGSO is in use then a single 65KB TCP segment can get
 	// split into 46 segments of 1420 bytes and a single 216 byte segment.
 	BatchSize = 47
 
@@ -38,11 +38,13 @@ const (
 
 // discipline represents a QueueingDiscipline which implements a FIFO queue for
 // all outgoing packets. discipline can have 1 or more underlying
-// queueDispatchers. All outgoing packets are consistenly hashed to a single
+// queueDispatchers. All outgoing packets are consistently hashed to a single
 // underlying queue using the PacketBuffer.Hash if set, otherwise all packets
 // are queued to the first queue to avoid reordering in case of missing hash.
+//
+// +stateify savable
 type discipline struct {
-	wg          sync.WaitGroup
+	wg          sync.WaitGroup `state:"nosave"`
 	dispatchers []queueDispatcher
 
 	closed atomicbitops.Int32
@@ -51,15 +53,17 @@ type discipline struct {
 // queueDispatcher is responsible for dispatching all outbound packets in its
 // queue. It will also smartly batch packets when possible and write them
 // through the lower LinkWriter.
+//
+// +stateify savable
 type queueDispatcher struct {
 	lower stack.LinkWriter
 
-	mu sync.Mutex
+	mu queueDispatcherMutex `state:"nosave"`
 	// +checklocks:mu
 	queue packetBufferCircularList
 
-	newPacketWaker sleep.Waker
-	closeWaker     sleep.Waker
+	newPacketWaker sleep.Waker `state:"nosave"`
+	closeWaker     sleep.Waker `state:"nosave"`
 }
 
 // New creates a new fifo queuing discipline with the n queues with maximum
@@ -97,7 +101,7 @@ func (qd *queueDispatcher) dispatchLoop() {
 		case &qd.newPacketWaker:
 		case &qd.closeWaker:
 			qd.mu.Lock()
-			for p := qd.queue.removeFront(); !p.IsNil(); p = qd.queue.removeFront() {
+			for p := qd.queue.removeFront(); p != nil; p = qd.queue.removeFront() {
 				p.DecRef()
 			}
 			qd.queue.decRef()
@@ -107,7 +111,7 @@ func (qd *queueDispatcher) dispatchLoop() {
 			panic("unknown waker")
 		}
 		qd.mu.Lock()
-		for pkt := qd.queue.removeFront(); !pkt.IsNil(); pkt = qd.queue.removeFront() {
+		for pkt := qd.queue.removeFront(); pkt != nil; pkt = qd.queue.removeFront() {
 			batch.PushBack(pkt)
 			if batch.Len() < BatchSize && !qd.queue.isEmpty() {
 				continue
@@ -127,7 +131,7 @@ func (qd *queueDispatcher) dispatchLoop() {
 //   - pkt.EgressRoute
 //   - pkt.GSOOptions
 //   - pkt.NetworkProtocolNumber
-func (d *discipline) WritePacket(pkt stack.PacketBufferPtr) tcpip.Error {
+func (d *discipline) WritePacket(pkt *stack.PacketBuffer) tcpip.Error {
 	if d.closed.Load() == qDiscClosed {
 		return &tcpip.ErrClosedForSend{}
 	}

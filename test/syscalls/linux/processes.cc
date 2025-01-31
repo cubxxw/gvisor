@@ -19,7 +19,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/flags/flag.h"
 #include "absl/strings/str_format.h"
@@ -28,6 +30,7 @@
 #include "absl/time/time.h"
 #include "test/util/capability_util.h"
 #include "test/util/multiprocess_util.h"
+#include "test/util/save_util.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
 
@@ -64,7 +67,7 @@ int testSetPGIDOfZombie(void* arg) {
     if (pid == 0) {
       pid = getpid();
       TEST_PCHECK(setpgid(pid, 0) == 0);
-      TEST_PCHECK(write(p[1], &pid, sizeof(pid)) == sizeof(pid));
+      TEST_PCHECK(WriteFd(p[1], &pid, sizeof(pid)) == sizeof(pid));
       _exit(0);
     }
     TEST_PCHECK(pid > 0);
@@ -75,11 +78,11 @@ int testSetPGIDOfZombie(void* arg) {
 
   // Get PID of the second child.
   pid_t cpid;
-  TEST_PCHECK(read(p[0], &cpid, sizeof(cpid)) == sizeof(cpid));
+  TEST_PCHECK(ReadFd(p[0], &cpid, sizeof(cpid)) == sizeof(cpid));
 
   // Wait when both child processes will die.
   int c;
-  TEST_PCHECK(read(p[0], &c, sizeof(c)) == 0);
+  TEST_PCHECK(ReadFd(p[0], &c, sizeof(c)) == 0);
 
   // Wait the second child process to collect its zombie.
   int status;
@@ -120,7 +123,7 @@ void WritePIDToPipe(int* pipe_fds) {
   pid_t child_pid;
   TEST_PCHECK(child_pid = getpid());
   TEST_PCHECK(child_pid != gettid());
-  TEST_PCHECK(write(pipe_fds[1], &child_pid, sizeof(child_pid)) ==
+  TEST_PCHECK(WriteFd(pipe_fds[1], &child_pid, sizeof(child_pid)) ==
               sizeof(child_pid));
 }
 
@@ -133,13 +136,36 @@ TEST(Processes, TheadSharesSamePID) {
   ScopedThread([&pipe_fds]() { WritePIDToPipe(pipe_fds); }).Join();
   ASSERT_THAT(close(pipe_fds[1]), SyscallSucceeds());
   pid_t pid_from_child;
-  TEST_PCHECK(read(pipe_fds[0], &pid_from_child, sizeof(pid_from_child)) ==
+  TEST_PCHECK(ReadFd(pipe_fds[0], &pid_from_child, sizeof(pid_from_child)) ==
               sizeof(pid_from_child));
   int buf;
-  TEST_PCHECK(read(pipe_fds[0], &buf, sizeof(buf)) ==
+  TEST_PCHECK(ReadFd(pipe_fds[0], &buf, sizeof(buf)) ==
               0);  // Wait for cloned thread to exit
   ASSERT_THAT(close(pipe_fds[0]), SyscallSucceeds());
   EXPECT_EQ(test_pid, pid_from_child);
+}
+
+TEST(Processes, ThousandsOfThreads) {
+  const DisableSave ds;  // Too many syscalls.
+  const int kThreadCount = 1000;
+  const int kSyscallsPerThread = 1000;
+  std::unique_ptr<ScopedThread> threads[kThreadCount];
+  int pipe_fds[2];
+  ASSERT_THAT(pipe(pipe_fds), SyscallSucceeds());
+
+  for (int i = 0; i < kThreadCount; i++) {
+    threads[i] = std::make_unique<ScopedThread>([&pipe_fds]() {
+      char c;
+      EXPECT_THAT(ReadFd(pipe_fds[0], &c, 1), SyscallSucceedsWithValue(0));
+      for (int j = 0; j < kSyscallsPerThread; j++) {
+        syscall(SYS_close, -1);
+      }
+    });
+  }
+  close(pipe_fds[1]);
+  for (int i = 0; i < kThreadCount; i++) {
+    threads[i]->Join();
+  }
 }
 
 // ExecSwapResult is used to carry PIDs and TIDs in ExecSwapThreadGroupLeader.
@@ -181,8 +207,8 @@ struct ExecSwapArg {
 };
 
 // ExecSwapPostExec is the third part of the ExecSwapThreadGroupLeader test.
-// It is called after the test has fork()'d, clone()'d, and exec()'d into this.
-// It writes all the PIDs and TIDs from each part of the test to a pipe.
+// It is called after the test has fork()'d, clone()'d, and exec()'d into
+// this. It writes all the PIDs and TIDs from each part of the test to a pipe.
 int ExecSwapPostExec() {
   std::cerr << "Test exec'd." << std::endl;
   pid_t pid;
@@ -202,7 +228,8 @@ int ExecSwapPostExec() {
   result.post_exec_pid = pid;
   result.post_exec_tid = tid;
   std::cerr << "Test writing results to pipe FD." << std::endl;
-  TEST_PCHECK(write(result.pipe_fd, &result, sizeof(result)) == sizeof(result));
+  TEST_PCHECK(WriteFd(result.pipe_fd, &result, sizeof(result)) ==
+              sizeof(result));
   if (close(result.pipe_fd) != 0) {
     std::cerr << "Failed to close pipe FD: " << errno << std::endl;
   }
@@ -214,12 +241,12 @@ int ExecSwapPostExec() {
 // It is called after the test has fork()'d and clone()'d.
 // It calls exec() with flags that cause the test binary to run
 // ExecSwapPostExec.
-int ExecSwapPreExec(void* void_arg) {
+[[noreturn]] int ExecSwapPreExec(void* void_arg) {
   ExecSwapArg* arg = reinterpret_cast<ExecSwapArg*>(void_arg);
-  pid_t pid;
-  TEST_PCHECK(pid = getpid());
-  pid_t tid;
-  TEST_PCHECK(tid = gettid());
+  pid_t pid = getpid();
+  TEST_PCHECK(pid > 0);
+  pid_t tid = gettid();
+  TEST_PCHECK(tid > 0);
 
   strncpy(arg->execve_array[0], "/proc/self/exe", kExecveArrayComponentsSize);
   strncpy(arg->execve_array[1], "--processes_test_exec_swap",
@@ -241,19 +268,18 @@ int ExecSwapPreExec(void* void_arg) {
     std::cerr << "  execve_array[" << i << "] = " << arg->execve_array[i]
               << std::endl;
   }
-  TEST_PCHECK(execv("/proc/self/exe", arg->execve_array));
-  std::cerr << "execve: " << errno << std::endl;
+  TEST_PCHECK(execv("/proc/self/exe", arg->execve_array) == 0);
   _exit(1);  // Should be unreachable.
 }
 
 // ExecSwapPreClone is the first part of the ExecSwapThreadGroupLeader test.
 // It is called after the test has fork()'d.
 // It calls clone() to run ExecSwapPreExec.
-void ExecSwapPreClone(ExecSwapArg* exec_swap_arg) {
-  pid_t pid;
-  ASSERT_THAT(pid = getpid(), SyscallSucceeds());
-  pid_t tid;
-  ASSERT_THAT(tid = gettid(), SyscallSucceeds());
+[[noreturn]] void ExecSwapPreClone(ExecSwapArg* exec_swap_arg) {
+  pid_t pid = getpid();
+  TEST_PCHECK(pid > 0);
+  pid_t tid = gettid();
+  TEST_PCHECK(tid > 0);
   struct clone_arg {
     char stack[4096] __attribute__((aligned(16)));
     char stack_ptr[0];
@@ -261,12 +287,13 @@ void ExecSwapPreClone(ExecSwapArg* exec_swap_arg) {
   exec_swap_arg->pre_clone_pid = pid;
   exec_swap_arg->pre_clone_tid = tid;
   std::cerr << "Test cloning." << std::endl;
-  ASSERT_THAT(
-      clone(ExecSwapPreExec, ca.stack_ptr,
-            CLONE_THREAD | CLONE_SIGHAND | CLONE_VM | CLONE_FS, exec_swap_arg),
-      SyscallSucceeds());
+  TEST_PCHECK(clone(ExecSwapPreExec, ca.stack_ptr,
+                    CLONE_THREAD | CLONE_SIGHAND | CLONE_VM | CLONE_FS,
+                    exec_swap_arg) > 0);
   // The clone thread will call exec, so just sit around here until it does.
-  absl::SleepFor(absl::Milliseconds(500));
+  while (true) {
+    absl::SleepFor(absl::Milliseconds(500));
+  }
 }
 
 TEST(Processes, ExecSwapThreadGroupLeader) {
@@ -302,13 +329,12 @@ TEST(Processes, ExecSwapThreadGroupLeader) {
   pid_t fork_pid = fork();
   if (fork_pid == 0) {
     ExecSwapPreClone(exec_swap_arg);
-    ASSERT_TRUE(false) << "Did not get replaced by execed child";
   }
   ASSERT_THAT(close(pipe_fds[1]), SyscallSucceeds());
 
   std::cerr << "Waiting for test results." << std::endl;
   ExecSwapResult result;
-  TEST_PCHECK(read(pipe_fds[0], &result, sizeof(result)) == sizeof(result));
+  TEST_PCHECK(ReadFd(pipe_fds[0], &result, sizeof(result)) == sizeof(result));
 
   std::cerr << "ExecSwap results:" << std::endl;
   std::cerr << "  Parent test process PID / TID:" << test_pid << " / "
@@ -331,7 +357,8 @@ TEST(Processes, ExecSwapThreadGroupLeader) {
   EXPECT_NE(test_pid, fork_pid);
   EXPECT_EQ(fork_pid, result.pre_clone_pid);  // Sanity check.
 
-  // Before cloning, PID == TID, the child thread is leader of its thread group.
+  // Before cloning, PID == TID, the child thread is leader of its thread
+  // group.
   EXPECT_EQ(result.pre_clone_pid, result.pre_clone_tid);
 
   // PID should not change with clone.

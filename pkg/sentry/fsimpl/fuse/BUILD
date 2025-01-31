@@ -28,6 +28,20 @@ go_template_instance(
     },
 )
 
+go_template_instance(
+    name = "seqatomic_time",
+    out = "seqatomic_time_unsafe.go",
+    imports = {
+        "ktime": "gvisor.dev/gvisor/pkg/sentry/ktime",
+    },
+    package = "fuse",
+    suffix = "Time",
+    template = "//pkg/sync/seqatomic:generic_seqatomic",
+    types = {
+        "Value": "ktime.Time",
+    },
+)
+
 go_library(
     name = "fuse",
     srcs = [
@@ -45,6 +59,8 @@ go_library(
         "regular_file.go",
         "request_list.go",
         "request_response.go",
+        "save_restore.go",
+        "seqatomic_time_unsafe.go",
     ],
     marshal = True,
     visibility = ["//pkg/sentry:internal"],
@@ -59,16 +75,16 @@ go_library(
         "//pkg/marshal/primitive",
         "//pkg/refs",
         "//pkg/safemem",
-        "//pkg/sentry/fsimpl/devtmpfs",
         "//pkg/sentry/fsimpl/kernfs",
         "//pkg/sentry/fsutil",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/kernel/pipe",
-        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/memmap",
         "//pkg/sentry/vfs",
         "//pkg/sync",
+        "//pkg/syserr",
         "//pkg/usermem",
         "//pkg/waiter",
         "@org_golang_x_sys//unix:go_default_library",

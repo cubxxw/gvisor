@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -46,6 +45,11 @@ const (
 	annotationSeccompRuntimeDefault = "RuntimeDefault"
 
 	annotationContainerName = "io.kubernetes.cri.container-name"
+)
+
+const (
+	// AnnotationTPU is the annotation used to enable TPU proxy on a pod.
+	AnnotationTPU = "dev.gvisor.internal.tpuproxy"
 )
 
 // ExePath must point to runsc binary, which is normally the same binary. It's
@@ -188,7 +192,7 @@ func ReadSpecFromFile(bundleDir string, specFile *os.File, conf *config.Config) 
 	if _, err := specFile.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("error seeking to beginning of file %q: %v", specFile.Name(), err)
 	}
-	specBytes, err := ioutil.ReadAll(specFile)
+	specBytes, err := io.ReadAll(specFile)
 	if err != nil {
 		return nil, fmt.Errorf("error reading spec from file %q: %v", specFile.Name(), err)
 	}
@@ -240,15 +244,7 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 		}
 	}
 
-	// Check annotation to see if container name is available.
-	var containerName string
-	for key, val := range spec.Annotations {
-		if key == annotationContainerName {
-			containerName = val
-			log.Debugf("Container name: %q", containerName)
-			break
-		}
-	}
+	containerName := ContainerName(spec)
 	for annotation, val := range spec.Annotations {
 		if strings.HasPrefix(annotation, annotationFlagPrefix) {
 			// Override flags using annotation to allow customization per sandbox
@@ -260,7 +256,7 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 			}
 		} else if len(containerName) > 0 {
 			// If we know the container name, then check to see if seccomp
-			// instructions were given to the the container.
+			// instructions were given to the container.
 			if annotation == annotationSeccomp+containerName && val == annotationSeccompRuntimeDefault {
 				// Container seccomp rules are redundant when using gVisor, so remove
 				// them when seccomp is set to RuntimeDefault.
@@ -276,7 +272,7 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 
 // ReadMounts reads mount list from a file.
 func ReadMounts(f *os.File) ([]specs.Mount, error) {
-	bytes, err := ioutil.ReadAll(f)
+	bytes, err := io.ReadAll(f)
 	if err != nil {
 		return nil, fmt.Errorf("error reading mounts: %v", err)
 	}
@@ -285,6 +281,27 @@ func ReadMounts(f *os.File) ([]specs.Mount, error) {
 		return nil, fmt.Errorf("error unmarshaling mounts: %v\nJSON bytes:\n%s", err, string(bytes))
 	}
 	return mounts, nil
+}
+
+// ChangeMountType changes m.Type to the specified type. It may do necessary
+// amends to m.Options.
+func ChangeMountType(m *specs.Mount, newType string) {
+	m.Type = newType
+
+	// OCI spec allows bind mounts to be specified in options only. So if new type
+	// is not bind, remove bind/rbind from options.
+	//
+	// "For bind mounts (when options include either bind or rbind), the type is
+	// a dummy, often "none" (not listed in /proc/filesystems)."
+	if newType != "bind" {
+		newOpts := make([]string, 0, len(m.Options))
+		for _, opt := range m.Options {
+			if opt != "rbind" && opt != "bind" {
+				newOpts = append(newOpts, opt)
+			}
+		}
+		m.Options = newOpts
+	}
 }
 
 // Capabilities takes in spec and returns a TaskCapabilities corresponding to
@@ -340,7 +357,7 @@ func AllCapabilitiesUint64() uint64 {
 	return rv
 }
 
-// MergeCapabilities merges the capabilites from first and second.
+// MergeCapabilities merges the capabilities from first and second.
 func MergeCapabilities(first, second *specs.LinuxCapabilities) *specs.LinuxCapabilities {
 	return &specs.LinuxCapabilities{
 		Bounding:    mergeUnique(first.Bounding, second.Bounding),
@@ -437,7 +454,7 @@ func capsFromNames(names []string, skipSet map[linux.Capability]struct{}) (auth.
 		if !ok {
 			return 0, fmt.Errorf("unknown capability %q", n)
 		}
-		// Should we skip this capabilty?
+		// Should we skip this capability?
 		if _, ok := skipSet[c]; ok {
 			continue
 		}
@@ -509,12 +526,12 @@ func WaitForReady(pid int, timeout time.Duration, ready func() (bool, error)) er
 //     <yyyymmdd-hhmmss.uuuuuu>
 //   - %COMMAND%: is replaced with 'command'
 //   - %TEST%: is replaced with 'test' (omitted by default)
-func DebugLogFile(logPattern, command, test string) (*os.File, error) {
+func DebugLogFile(logPattern, command, test string, timestamp time.Time) (*os.File, error) {
 	if strings.HasSuffix(logPattern, "/") {
 		// Default format: <debug-log>/runsc.log.<yyyymmdd-hhmmss.uuuuuu>.<command>.txt
 		logPattern += "runsc.log.%TIMESTAMP%.%COMMAND%.txt"
 	}
-	logPattern = strings.Replace(logPattern, "%TIMESTAMP%", time.Now().Format("20060102-150405.000000"), -1)
+	logPattern = strings.Replace(logPattern, "%TIMESTAMP%", timestamp.Format("20060102-150405.000000"), -1)
 	logPattern = strings.Replace(logPattern, "%COMMAND%", command, -1)
 	logPattern = strings.Replace(logPattern, "%TEST%", test, -1)
 
@@ -545,6 +562,43 @@ func IsDebugCommand(conf *config.Config, command string) bool {
 		}
 	}
 	return !rv
+}
+
+// TPUProxyIsEnabled checks if tpuproxy is enabled in the config or annotations.
+func TPUProxyIsEnabled(spec *specs.Spec, conf *config.Config) bool {
+	if conf.TPUProxy {
+		return true
+	}
+	return AnnotationToBool(spec, AnnotationTPU)
+}
+
+// VFIOFunctionalityRequested returns true if the container should have access
+// to VFIO functionality.
+func VFIOFunctionalityRequested(dev *specs.LinuxDevice) bool {
+	return strings.HasPrefix(dev.Path, "/dev/vfio")
+}
+
+// AcceleratorFunctionalityRequested returns true if the container should have
+// access to compute accelerators. Compute accelerators are different from GPUs
+// by using a different major number and different device char files.
+func AcceleratorFunctionalityRequested(dev *specs.LinuxDevice) bool {
+	return strings.HasPrefix(dev.Path, "/dev/accel")
+}
+
+// TPUFunctionalityRequested returns true if the container should have access
+// to TPU functionality.
+func TPUFunctionalityRequested(spec *specs.Spec, conf *config.Config) bool {
+	if !TPUProxyIsEnabled(spec, conf) {
+		return false
+	}
+	if spec.Linux != nil {
+		for _, dev := range spec.Linux.Devices {
+			if AcceleratorFunctionalityRequested(&dev) || VFIOFunctionalityRequested(&dev) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // SafeSetupAndMount creates the mount point and calls Mount with the given
@@ -627,16 +681,6 @@ func SafeMount(src, dst, fstype string, flags uintptr, data, procPath string) er
 	return unix.Mount(src, safePath, fstype, flags, data)
 }
 
-// ContainsStr returns true if 'str' is inside 'strs'.
-func ContainsStr(strs []string, str string) bool {
-	for _, s := range strs {
-		if s == str {
-			return true
-		}
-	}
-	return false
-}
-
 // RetryEintr retries the function until an error different than EINTR is
 // returned.
 func RetryEintr(f func() (uintptr, uintptr, error)) (uintptr, uintptr, error) {
@@ -650,16 +694,22 @@ func RetryEintr(f func() (uintptr, uintptr, error)) (uintptr, uintptr, error) {
 
 // GetOOMScoreAdj reads the given process' oom_score_adj
 func GetOOMScoreAdj(pid int) (int, error) {
-	data, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid))
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid))
 	if err != nil {
 		return 0, err
 	}
 	return strconv.Atoi(strings.TrimSpace(string(data)))
 }
 
-// EnvVar looks for a varible value in the env slice assuming the following
-// format: "NAME=VALUE".
+// EnvVar looks for a variable value in the env slice assuming the following
+// format: "NAME=VALUE". If a variable is defined multiple times, the last
+// value is used.
 func EnvVar(env []string, name string) (string, bool) {
+	var err error
+	env, err = ResolveEnvs(env)
+	if err != nil {
+		return "", false
+	}
 	prefix := name + "="
 	for _, e := range env {
 		if strings.HasPrefix(e, prefix) {
@@ -697,4 +747,25 @@ func ResolveEnvs(envs ...[]string) ([]string, error) {
 // FaqErrorMsg returns an error message pointing to the FAQ.
 func FaqErrorMsg(anchor, msg string) string {
 	return fmt.Sprintf("%s; see https://gvisor.dev/faq#%s for more details", msg, anchor)
+}
+
+// ContainerName looks for an annotation in the spec with the container name. Returns empty string
+// if no annotation is found.
+func ContainerName(spec *specs.Spec) string {
+	return spec.Annotations[annotationContainerName]
+}
+
+// AnnotationToBool parses the annotation value as a bool. On failure, it logs a warning and
+// returns false.
+func AnnotationToBool(spec *specs.Spec, annotation string) bool {
+	val, ok := spec.Annotations[annotation]
+	if !ok {
+		return false
+	}
+	ret, err := strconv.ParseBool(val)
+	if err != nil {
+		log.Warningf("Failed to parse annotation %q=%q as a bool: %v", annotation, val, err)
+		return false
+	}
+	return ret
 }

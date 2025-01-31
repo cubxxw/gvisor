@@ -16,10 +16,14 @@ package systrap
 
 import (
 	"fmt"
+	"os"
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
+	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -70,9 +74,12 @@ type syscallThread struct {
 	// stubMessage is the second page of the shared message that can be
 	// modified by the stub thread.
 	stubMessage *syscallStubMessage
+
+	seccompNotify     *os.File
+	seccompNotifyResp linux.SeccompNotifResp
 }
 
-func (t *syscallThread) init() error {
+func (t *syscallThread) init(seccompNotify bool) error {
 	// Allocate a new shared memory message.
 	opts := pgalloc.AllocOpts{
 		Kind: usage.System,
@@ -91,8 +98,15 @@ func (t *syscallThread) init() error {
 		return err
 	}
 
+	if seccompNotify && seccompNotifyIsSupported {
+		if t.seccompNotify, err = t.installSeccompNotify(); err != nil {
+			t.destroy()
+			return fmt.Errorf("failed to install seccomp notify rules: %w", err)
+		}
+	}
+
 	// Map the stack into the sentry.
-	sentryAddr, _, errno := unix.RawSyscall6(
+	sentryAddr, errno := hostsyscall.RawSyscall6(
 		unix.SYS_MMAP,
 		0,
 		syscallThreadMessageSize,
@@ -111,11 +125,11 @@ func (t *syscallThread) init() error {
 
 func (t *syscallThread) destroy() {
 	if t.sentryAddr != 0 {
-		_, _, errno := unix.RawSyscall6(
+		errno := hostsyscall.RawSyscallErrno(
 			unix.SYS_MUNMAP,
 			t.sentryAddr,
 			syscallThreadMessageSize,
-			0, 0, 0, 0)
+			0)
 		if errno != 0 {
 			panic(fmt.Sprintf("mumap failed: %v", errno))
 		}
@@ -130,6 +144,21 @@ func (t *syscallThread) destroy() {
 	}
 	t.subproc.memoryFile.DecRef(t.stackRange)
 	t.subproc.sysmsgStackPool.Put(t.thread.sysmsgStackID)
+}
+
+func (t *syscallThread) installSeccompNotify() (*os.File, error) {
+	fd, err := t.thread.syscallIgnoreInterrupt(&t.thread.initRegs, seccomp.SYS_SECCOMP,
+		arch.SyscallArgument{Value: uintptr(linux.SECCOMP_SET_MODE_FILTER)},
+		arch.SyscallArgument{Value: uintptr(linux.SECCOMP_FILTER_FLAG_NEW_LISTENER)},
+		arch.SyscallArgument{Value: stubSyscallRules})
+	if err != nil {
+		return nil, err
+	}
+	errno := hostsyscall.RawSyscallErrno(unix.SYS_IOCTL, fd, linux.SECCOMP_IOCTL_NOTIF_SET_FLAGS, linux.SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP)
+	if errno != 0 {
+		t.thread.Debugf("failed to set SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP")
+	}
+	return os.NewFile(fd, "seccomp_notify"), nil
 }
 
 // mapMessageIntoStub maps the syscall message into the stub process address space.
@@ -157,14 +186,22 @@ func (t *syscallThread) mapMessageIntoStub() error {
 }
 
 // attach attaches to the stub thread with ptrace and unlock signals.
-func (t *syscallThread) attach() {
-	t.thread.attach()
+func (t *syscallThread) attach() error {
+	if err := t.thread.attach(); err != nil {
+		return err
+	}
 	// We need to unblock signals, because the TRAP signal is used to run
 	// syscalls via ptrace.
 	t.unmaskAllSignalsAttached()
+	return nil
 }
 
+const maxErrno = 4095
+
 func (t *syscallThread) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintptr, error) {
+	if t.subproc.dead.Load() {
+		return 0, errDeadSubprocess
+	}
 	sentryMsg := t.sentryMessage
 	stubMsg := t.stubMessage
 	sentryMsg.sysno = uint64(sysno)
@@ -176,15 +213,33 @@ func (t *syscallThread) syscall(sysno uintptr, args ...arch.SyscallArgument) (ui
 		}
 	}
 
-	// Notify the syscall thread about a new syscall request.
-	atomic.AddUint32(&sentryMsg.state, 1)
-	futexWakeUint32(&sentryMsg.state)
+	if t.seccompNotify != nil {
+		if errno := t.kickSeccompNotify(); errno != 0 {
+			t.thread.kill()
+			t.thread.Warningf("failed sending request to syscall thread: %s", errno)
+			return 0, errDeadSubprocess
+		}
+		if err := t.waitForSeccompNotify(); err != nil {
+			t.thread.Warningf("failed waiting for seccomp notify: %s", err)
+			return 0, errDeadSubprocess
+		}
+	} else {
 
-	// Wait for reply.
-	//
-	// futex waits for sentryMsg.state that isn't changed, so it will
-	// returns only only when the other side will call FUTEX_WAKE.
-	futexWaitWake(&sentryMsg.state, atomic.LoadUint32(&sentryMsg.state))
+		// Notify the syscall thread about a new syscall request.
+		atomic.AddUint32(&sentryMsg.state, 1)
+		futexWakeUint32(&sentryMsg.state)
+
+		// Wait for reply.
+		//
+		// futex waits for sentryMsg.state that isn't changed, so it will
+		// returns only only when the other side will call FUTEX_WAKE.
+		futexWaitWake(&sentryMsg.state, atomic.LoadUint32(&sentryMsg.state))
+	}
+
+	errno := -uintptr(stubMsg.ret)
+	if errno > 0 && errno < maxErrno {
+		return 0, fmt.Errorf("stub syscall (%x, %#v) failed with %w", sysno, args, unix.Errno(errno))
+	}
 
 	return uintptr(stubMsg.ret), nil
 }

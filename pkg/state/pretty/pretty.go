@@ -18,7 +18,6 @@ package pretty
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"reflect"
 	"strings"
 
@@ -195,7 +194,9 @@ func (p *printer) format(graph uint64, depth int, encoded wire.Object) (string, 
 }
 
 // printStream is the basic print implementation.
-func (p *printer) printStream(w io.Writer, r wire.Reader) (err error) {
+func (p *printer) printStream(w io.Writer, r io.Reader) (err error) {
+	wr := wire.Reader{Reader: r}
+
 	// current graph ID.
 	var graph uint64
 
@@ -218,7 +219,7 @@ func (p *printer) printStream(w io.Writer, r wire.Reader) (err error) {
 
 	for {
 		// Find the first object to begin generation.
-		length, object, err := state.ReadHeader(r)
+		length, object, err := state.ReadHeader(&wr)
 		if err == io.EOF {
 			// Nothing else to do.
 			break
@@ -229,7 +230,7 @@ func (p *printer) printStream(w io.Writer, r wire.Reader) (err error) {
 			graph++ // Increment the graph.
 			if length > 0 {
 				fmt.Fprintf(w, "(%d bytes non-object data)\n", length)
-				io.Copy(ioutil.Discard, &io.LimitedReader{
+				io.Copy(io.Discard, &io.LimitedReader{
 					R: r,
 					N: int64(length),
 				})
@@ -252,7 +253,7 @@ func (p *printer) printStream(w io.Writer, r wire.Reader) (err error) {
 		)
 		for i := uint64(0); i < length; {
 			// Unmarshal either a type object or object ID.
-			encoded := wire.Load(r)
+			encoded := wire.Load(&wr)
 			switch we := encoded.(type) {
 			case *wire.Type:
 				str, _ := p.format(graph, 0, encoded)
@@ -270,7 +271,7 @@ func (p *printer) printStream(w io.Writer, r wire.Reader) (err error) {
 				// Unmarshal the actual object.
 				objects = append(objects, objectAndID{
 					id:  uint64(we),
-					obj: wire.Load(r),
+					obj: wire.Load(&wr),
 				})
 				i++
 			default:
@@ -296,11 +297,11 @@ func (p *printer) printStream(w io.Writer, r wire.Reader) (err error) {
 }
 
 // PrintText reads the stream from r and prints text to w.
-func PrintText(w io.Writer, r wire.Reader) error {
+func PrintText(w io.Writer, r io.Reader) error {
 	return (&printer{}).printStream(w, r)
 }
 
 // PrintHTML reads the stream from r and prints html to w.
-func PrintHTML(w io.Writer, r wire.Reader) error {
+func PrintHTML(w io.Writer, r io.Reader) error {
 	return (&printer{html: true}).printStream(w, r)
 }

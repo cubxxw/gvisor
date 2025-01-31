@@ -21,7 +21,6 @@ go_library(
     srcs = [
         "dir_refs.go",
         "kcov.go",
-        "net.go",
         "pci.go",
         "sys.go",
     ],
@@ -51,6 +50,12 @@ go_library(
 go_test(
     name = "sys_test",
     srcs = ["sys_test.go"],
+    library = ":sys",
+)
+
+go_test(
+    name = "sys_integration_test",
+    srcs = ["sys_integration_test.go"],
     deps = [
         ":sys",
         "//pkg/abi/linux",

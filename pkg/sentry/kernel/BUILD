@@ -1,6 +1,6 @@
+load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 load("//tools:defs.bzl", "go_library", "go_test", "proto_library")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
-load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -38,13 +38,6 @@ go_template_instance(
     types = {
         "Value": "descriptor",
     },
-)
-
-declare_mutex(
-    name = "cpu_clock_mutex",
-    out = "cpu_clock_mutex.go",
-    package = "kernel",
-    prefix = "cpuClock",
 )
 
 declare_mutex(
@@ -112,6 +105,20 @@ declare_mutex(
     prefix = "threadGroupTimer",
 )
 
+declare_mutex(
+    name = "timekeeper_tcpip_timer_mutex",
+    out = "timekeeper_tcpip_timer_mutex.go",
+    package = "kernel",
+    prefix = "timekeeperTcpipTimer",
+)
+
+declare_mutex(
+    name = "cgroup_mounts_mutex",
+    out = "cgroup_mounts_mutex.go",
+    package = "kernel",
+    prefix = "cgroupMounts",
+)
+
 go_template_instance(
     name = "pending_signals_list",
     out = "pending_signals_list.go",
@@ -133,17 +140,6 @@ go_template_instance(
     types = {
         "Element": "*ProcessGroup",
         "Linker": "*ProcessGroup",
-    },
-)
-
-go_template_instance(
-    name = "seqatomic_taskgoroutineschedinfo",
-    out = "seqatomic_taskgoroutineschedinfo_unsafe.go",
-    package = "kernel",
-    suffix = "TaskGoroutineSchedInfo",
-    template = "//pkg/sync/seqatomic:generic_seqatomic",
-    types = {
-        "Value": "TaskGoroutineSchedInfo",
     },
 )
 
@@ -225,15 +221,14 @@ proto_library(
 go_library(
     name = "kernel",
     srcs = [
-        "abstract_socket_namespace.go",
         "aio.go",
         "atomicptr_bucket_slice_unsafe.go",
         "atomicptr_bucket_unsafe.go",
         "atomicptr_descriptor_unsafe.go",
         "cgroup.go",
+        "cgroup_mounts_mutex.go",
         "cgroup_mutex.go",
         "context.go",
-        "cpu_clock_mutex.go",
         "fd_table.go",
         "fd_table_mutex.go",
         "fd_table_refs.go",
@@ -245,6 +240,7 @@ go_library(
         "kcov_unsafe.go",
         "kernel.go",
         "kernel_opts.go",
+        "kernel_restore.go",
         "kernel_state.go",
         "pending_signals.go",
         "pending_signals_list.go",
@@ -259,7 +255,6 @@ go_library(
         "running_tasks_mutex.go",
         "seccheck.go",
         "seccomp.go",
-        "seqatomic_taskgoroutineschedinfo_unsafe.go",
         "session_list.go",
         "session_refs.go",
         "sessions.go",
@@ -280,6 +275,7 @@ go_library(
         "task_futex.go",
         "task_identity.go",
         "task_image.go",
+        "task_key.go",
         "task_list.go",
         "task_log.go",
         "task_mutex.go",
@@ -296,10 +292,12 @@ go_library(
         "taskset_mutex.go",
         "thread_group.go",
         "thread_group_timer_mutex.go",
+        "thread_group_unsafe.go",
         "threads.go",
         "threads_impl.go",
         "timekeeper.go",
         "timekeeper_state.go",
+        "timekeeper_tcpip_timer_mutex.go",
         "tty.go",
         "user_counters_mutex.go",
         "uts_namespace.go",
@@ -317,6 +315,7 @@ go_library(
         "//pkg/abi",
         "//pkg/abi/linux",
         "//pkg/abi/linux/errno",
+        "//pkg/abi/sentry",
         "//pkg/atomicbitops",
         "//pkg/bitmap",
         "//pkg/bits",
@@ -325,9 +324,11 @@ go_library(
         "//pkg/context",
         "//pkg/coverage",
         "//pkg/cpuid",
+        "//pkg/devutil",
         "//pkg/errors",
         "//pkg/errors/linuxerr",
         "//pkg/eventchannel",
+        "//pkg/fd",
         "//pkg/fspath",
         "//pkg/goid",
         "//pkg/hostarch",
@@ -357,7 +358,7 @@ go_library(
         "//pkg/sentry/kernel/sched",
         "//pkg/sentry/kernel/semaphore",
         "//pkg/sentry/kernel/shm",
-        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/limits",
         "//pkg/sentry/loader",
         "//pkg/sentry/memmap",
@@ -375,7 +376,6 @@ go_library(
         "//pkg/sentry/usage",
         "//pkg/sentry/vfs",
         "//pkg/state",
-        "//pkg/state/statefile",
         "//pkg/state/wire",
         "//pkg/sync",
         "//pkg/sync/locking",

@@ -7,20 +7,29 @@ generate images using a GPU from within gVisor. Both the
 and the [PyTorch] code used by Stable Diffusion were run entirely within gVisor
 while being able to leverage the NVIDIA GPU.
 
+<!--/excerpt-->
+
 ![A sandboxed GPU](/assets/images/2023-06-20-sandboxed-gpu.png "A sandboxed GPU.")
 <span class="attribution">**Sand**boxing a GPU. Generated with Stable Diffusion
 v1.5.<br/>This picture gets a lot deeper once you realize that GPUs are made out
 of sand.</span>
 
---------------------------------------------------------------------------------
 
 ## Disclaimer
 
 As of this writing (2023-06), [gVisor's GPU support][gVisor GPU support] is not
 generalized. Only some PyTorch workloads have been tested on NVIDIA T4, L4,
-A100, and H100 GPUs, using the specific driver versions `525.60.13` and
-`525.105.17`. Contributions are welcome to expand this set to support other GPUs
-and driver versions!
+A100, and H100 GPUs, using the specific driver versions that your runsc version
+supports using the command below. Contributions are welcome to expand this set
+to support other GPUs and driver versions!
+
+```
+# From a cloned gVisor repository:
+$ make run TARGETS=runsc ARGS="nvproxy list-supported-drivers"
+
+# From a runsc binary:
+$ runsc nvproxy list-supported-drivers
+```
 
 Additionally, while gVisor does its best to sandbox the workload, interacting
 with the GPU inherently requires running code on GPU hardware, where isolation
@@ -52,8 +61,10 @@ Diffusion) are packaged using the more secure [safetensors] format, **the
 majority of models available online today are distributed using the
 [Pickle format], which can execute arbitrary Python code** upon deserialization.
 As such, even when using trustworthy software, using Pickle-formatted models may
-still be risky. gVisor provides a layer of protection around this process which
-helps protect the host machine.
+still be risky (**Edited 2024-04-04:
+[this exact vulnerability vector was found in Hugging Face's Inference API](https://www.wiz.io/blog/wiz-and-hugging-face-address-risks-to-ai-infrastructure)**).
+gVisor provides a layer of protection around this process which helps protect
+the host machine.
 
 Third, **machine learning applications are typically not I/O heavy**, which
 means they tend not to experience a significant performance overhead. The
@@ -95,14 +106,15 @@ currently compatible with.
 ```shell
 $ sudo apt-get update && sudo apt-get -y upgrade
 $ sudo apt-get install -y build-essential linux-headers-$(uname -r)
-$ DRIVER_VERSION=525.60.13
+$ runsc nvproxy list-supported-drivers
+$ DRIVER_VERSION=some-driver-version # Get from your runsc binary.
 $ curl -fSsl -O "https://us.download.nvidia.com/tesla/$DRIVER_VERSION/NVIDIA-Linux-x86_64-$DRIVER_VERSION.run"
 $ sudo sh NVIDIA-Linux-x86_64-$DRIVER_VERSION.run
 ```
 
 <!--
-The above in a single live, for convenience:
-DRIVER_VERSION=525.60.13; sudo apt-get update && sudo apt-get -y upgrade && sudo apt-get install -y build-essential linux-headers-$(uname -r) && curl -fSsl -O "https://us.download.nvidia.com/tesla/$DRIVER_VERSION/NVIDIA-Linux-x86_64-$DRIVER_VERSION.run" && sudo sh NVIDIA-Linux-x86_64-$DRIVER_VERSION.run
+The above in a single line, for convenience:
+DRIVER_VERSION=some-driver-version; sudo apt-get update && sudo apt-get -y upgrade && sudo apt-get install -y build-essential linux-headers-$(uname -r) && curl -fSsl -O "https://us.download.nvidia.com/tesla/$DRIVER_VERSION/NVIDIA-Linux-x86_64-$DRIVER_VERSION.run" && sudo sh NVIDIA-Linux-x86_64-$DRIVER_VERSION.run
 -->
 
 Next, we install Docker, per [its instructions][Docker installation on Debian].
@@ -154,7 +166,7 @@ more of what we just set up.
 $ sudo nvidia-smi -L
 GPU 0: Tesla T4 (UUID: GPU-6a96a2af-2271-5627-34c5-91dcb4f408aa)
 $ sudo cat /proc/driver/nvidia/version
-NVRM version: NVIDIA UNIX x86_64 Kernel Module  525.60.13  Wed Nov 30 06:39:21 UTC 2022
+NVRM version: NVIDIA UNIX x86_64 Kernel Module  DRIVER_VERSION  Wed Nov 30 06:39:21 UTC 2022
 
 ＃ Check that Docker works.
 $ sudo docker version

@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/test/benchmarks/harness"
 	"gvisor.dev/gvisor/test/benchmarks/tools"
+	"gvisor.dev/gvisor/test/metricsviz"
 )
 
 // BenchmarSyscallbench runs a syscall b.N times on the runtime.
@@ -67,6 +68,7 @@ func BenchmarkSyscallbench(b *testing.B) {
 			); err != nil {
 				b.Fatalf("run failed with: %v", err)
 			}
+			defer metricsviz.FromContainerLogs(ctx, b, container)
 			b.Run(name, func(b *testing.B) {
 				cmd := []string{"syscallbench", fmt.Sprintf("--loops=%d", b.N), fmt.Sprintf("--syscall=%d", tc.syscallArg)}
 				b.ResetTimer()
@@ -77,5 +79,57 @@ func BenchmarkSyscallbench(b *testing.B) {
 			})
 		}()
 	}
+}
 
+// BenchmarkSyscallUnderSeccomp runs a syscall b.N times with a seccomp filter
+// enabled for it.
+func BenchmarkSyscallUnderSeccomp(b *testing.B) {
+	ctx := context.Background()
+	machine, err := harness.GetMachine()
+	if err != nil {
+		b.Fatalf("failed to get machine: %v", err)
+	}
+	defer machine.CleanUp()
+
+	for _, tc := range []tools.Parameter{
+		{
+			Name:  "cacheable",
+			Value: "false",
+		},
+		{
+			Name:  "cacheable",
+			Value: "true",
+		},
+	} {
+		name, err := tools.ParametersToName(tc)
+		if err != nil {
+			b.Fatalf("Failed to parse params: %v", err)
+		}
+		func() {
+			container := machine.GetContainer(ctx, b)
+			defer container.CleanUp(ctx)
+			if err := container.Spawn(
+				ctx, dockerutil.RunOpts{
+					Image: "benchmarks/syscallbench",
+				},
+				"sleep", "24h",
+			); err != nil {
+				b.Fatalf("run failed with: %v", err)
+			}
+			defer metricsviz.FromContainerLogs(ctx, b, container)
+			b.Run(name, func(b *testing.B) {
+				cmd := []string{"syscallbench", "--syscall=1", fmt.Sprintf("--loops=%d", b.N)}
+				if tc.Value == "true" {
+					cmd = append(cmd, "--seccomp_cacheable")
+				} else {
+					cmd = append(cmd, "--seccomp_notcacheable")
+				}
+				b.ResetTimer()
+				out, err := container.Exec(ctx, dockerutil.ExecOpts{}, cmd...)
+				if err != nil {
+					b.Fatalf("failed to run syscallbench: %v, logs:%s", err, out)
+				}
+			})
+		}()
+	}
 }

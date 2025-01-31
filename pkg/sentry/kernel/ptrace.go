@@ -317,7 +317,7 @@ func (t *Task) SetYAMAException(tracer *Task) {
 
 // Tracer returns t's ptrace Tracer.
 func (t *Task) Tracer() *Task {
-	return t.ptraceTracer.Load().(*Task)
+	return t.ptraceTracer.Load()
 }
 
 // hasTracer returns true if t has a ptrace tracer attached.
@@ -488,7 +488,7 @@ func (t *Task) ptraceTraceme() error {
 	if !t.parent.canTraceLocked(t, true) {
 		return linuxerr.EPERM
 	}
-	if t.parent.exitState != TaskExitNone {
+	if t.parent.exitStateLocked() != TaskExitNone {
 		// Fail silently, as if we were successfully attached but then
 		// immediately detached. This is consistent with Linux.
 		return nil
@@ -515,7 +515,7 @@ func (t *Task) ptraceAttach(target *Task, seize bool, opts uintptr) error {
 	// Attaching to zombies and dead tasks is not permitted; the exit
 	// notification logic relies on this. Linux allows attaching to PF_EXITING
 	// tasks, though.
-	if target.exitState >= TaskExitZombie {
+	if target.exitStateLocked() >= TaskExitZombie {
 		return linuxerr.EPERM
 	}
 	if seize {
@@ -567,10 +567,10 @@ func (t *Task) ptraceDetach(target *Task, sig linux.Signal) error {
 	return nil
 }
 
-// exitPtrace is called in the exit path to detach all of t's tracees.
-func (t *Task) exitPtrace() {
-	t.tg.pidns.owner.mu.Lock()
-	defer t.tg.pidns.owner.mu.Unlock()
+// exitPtraceLocked is called in the exit path to detach all of t's tracees.
+//
+// Preconditions: The TaskSet mutex must be locked for writing.
+func (t *Task) exitPtraceLocked() {
 	for target := range t.ptraceTracees {
 		if target.ptraceOpts.ExitKill {
 			target.tg.signalHandlers.mu.Lock()
@@ -584,8 +584,7 @@ func (t *Task) exitPtrace() {
 		// this is consistent with Linux.
 		target.forgetTracerLocked()
 	}
-	// "nil maps cannot be saved"
-	t.ptraceTracees = make(map[*Task]struct{})
+	clear(t.ptraceTracees) // nil maps cannot be saved
 
 	if t.ptraceYAMAExceptionAdded {
 		delete(t.k.ptraceExceptions, t)
@@ -606,7 +605,7 @@ func (t *Task) forgetTracerLocked() {
 	t.ptraceOpts = ptraceOptions{}
 	t.ptraceSyscallMode = ptraceSyscallNone
 	t.ptraceSinglestep = false
-	t.ptraceTracer.Store((*Task)(nil))
+	t.ptraceTracer.Store(nil)
 	if t.exitTracerNotified && !t.exitTracerAcked {
 		t.exitTracerAcked = true
 		t.exitNotifyLocked(true)
@@ -622,7 +621,7 @@ func (t *Task) forgetTracerLocked() {
 	// of restart from group-stop is currently buggy, but the "as planned"
 	// behavior is to leave tracee stopped and waiting for SIGCONT." -
 	// ptrace(2))
-	if (t.tg.groupStopComplete || t.tg.groupStopPendingCount != 0) && !t.groupStopPending && t.exitState < TaskExitInitiated {
+	if (t.tg.groupStopComplete || t.tg.groupStopPendingCount != 0) && !t.groupStopPending && t.exitStateLocked() < TaskExitInitiated {
 		t.groupStopPending = true
 		// t already participated in the group stop when it unset
 		// groupStopPending.
@@ -960,7 +959,7 @@ func (t *Task) ptraceInterrupt(target *Task) error {
 	}
 	target.tg.signalHandlers.mu.Lock()
 	defer target.tg.signalHandlers.mu.Unlock()
-	if target.killedLocked() || target.exitState >= TaskExitInitiated {
+	if target.killedLocked() || target.exitStateLocked() >= TaskExitInitiated {
 		return nil
 	}
 	target.trapStopPending = true

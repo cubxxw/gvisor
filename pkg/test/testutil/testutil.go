@@ -23,10 +23,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math"
-	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
@@ -41,6 +39,7 @@ import (
 	"github.com/cenkalti/backoff"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/runsc/config"
@@ -55,13 +54,13 @@ var (
 
 	// Flags controlling features for sandbox under test, prefixed with
 	// "test-" to avoid potential conflicts with runsc flags.
-	checkpointSupported  = flag.Bool("test-checkpoint", BoolFromEnv("TEST_CHECKPOINT", true), "control checkpoint/restore support")
-	isRunningWithOverlay = flag.Bool("test-overlay", BoolFromEnv("TEST_OVERLAY", false), "whether test is running with --overlay2")
-	isRunningWithNetRaw  = flag.Bool("test-net-raw", BoolFromEnv("TEST_NET_RAW", false), "whether test is running with raw socket support")
-	isRunningWithHostNet = flag.Bool("test-hostnet", BoolFromEnv("TEST_HOSTNET", false), "whether test is running with hostnet")
-
+	checkpointSupported              = flag.Bool("test-checkpoint", BoolFromEnv("TEST_CHECKPOINT", true), "control checkpoint/restore support")
+	isRunningWithOverlay             = flag.Bool("test-overlay", BoolFromEnv("TEST_OVERLAY", false), "whether test is running with --overlay2")
+	isRunningWithNetRaw              = flag.Bool("test-net-raw", BoolFromEnv("TEST_NET_RAW", false), "whether test is running with raw socket support")
+	isRunningWithHostNet             = flag.Bool("test-hostnet", BoolFromEnv("TEST_HOSTNET", false), "whether test is running with hostnet")
+	isRunningWithSaveRestoreNetstack = flag.Bool("test-save-restore-netstack", BoolFromEnv("TEST_SAVE_RESTORE_NETSTACK", false), "whether test is running with --TESTONLY-save-restore-netstack")
 	// TestEnvSupportsNetAdmin indicates whether a test sandbox can perform
-	// all net admin tasks. Note that some test environments cannot peform
+	// all net admin tasks. Note that some test environments cannot perform
 	// some tasks despite the presence of CAP_NET_ADMIN.
 	TestEnvSupportsNetAdmin = true
 )
@@ -137,6 +136,11 @@ func IsRunningWithNetRaw() bool {
 // IsRunningWithOverlay returns the relevant command line flag.
 func IsRunningWithOverlay() bool {
 	return *isRunningWithOverlay
+}
+
+// IsRunningWithSaveRestoreNetstack returns the relevant command line flag.
+func IsRunningWithSaveRestoreNetstack() bool {
+	return *isRunningWithSaveRestoreNetstack
 }
 
 // ImageByName mangles the image name used locally. This depends on the image
@@ -290,7 +294,7 @@ func NewSpecWithArgs(args ...string) *specs.Spec {
 			},
 			// Root is readonly, but many tests want to write to tmpdir.
 			// This creates a writable mount inside the root. Also, when tmpdir points
-			// to "/tmp", it makes the the actual /tmp to be mounted and not a tmpfs
+			// to "/tmp", it makes the actual /tmp to be mounted and not a tmpfs
 			// inside the sentry.
 			{
 				Type:        "bind",
@@ -304,7 +308,7 @@ func NewSpecWithArgs(args ...string) *specs.Spec {
 
 // SetupRootDir creates a root directory for containers.
 func SetupRootDir() (string, func(), error) {
-	rootDir, err := ioutil.TempDir(TmpDir(), "containers")
+	rootDir, err := os.MkdirTemp(TmpDir(), "containers")
 	if err != nil {
 		return "", nil, fmt.Errorf("error creating root dir: %v", err)
 	}
@@ -332,7 +336,7 @@ func SetupContainer(spec *specs.Spec, conf *config.Config) (rootDir, bundleDir s
 
 // SetupBundleDir creates a bundle dir and writes the spec to config.json.
 func SetupBundleDir(spec *specs.Spec) (string, func(), error) {
-	bundleDir, err := ioutil.TempDir(TmpDir(), "bundle")
+	bundleDir, err := os.MkdirTemp(TmpDir(), "bundle")
 	if err != nil {
 		return "", nil, fmt.Errorf("error creating bundle dir: %v", err)
 	}
@@ -350,31 +354,16 @@ func writeSpec(dir string, spec *specs.Spec) error {
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(filepath.Join(dir, "config.json"), b, 0755)
+	return os.WriteFile(filepath.Join(dir, "config.json"), b, 0755)
 }
-
-// idRandomSrc is a pseudo random generator used to in RandomID.
-var idRandomSrc = rand.New(rand.NewSource(time.Now().UnixNano()))
-
-// idRandomSrcMtx is the mutex protecting idRandomSrc.Read from being used
-// concurrently in differnt goroutines.
-var idRandomSrcMtx sync.Mutex
 
 // RandomID returns 20 random bytes following the given prefix.
 func RandomID(prefix string) string {
-	// Read 20 random bytes.
 	b := make([]byte, 20)
-	// Rand.Read is not safe for concurrent use. Packetimpact tests can be run in
-	// parallel now, so we have to protect the Read with a mutex. Otherwise we'll
-	// run into name conflicts.
-	// https://golang.org/pkg/math/rand/#Rand.Read
-	idRandomSrcMtx.Lock()
 	// "[Read] always returns len(p) and a nil error." --godoc
-	if _, err := idRandomSrc.Read(b); err != nil {
-		idRandomSrcMtx.Unlock()
+	if _, err := rand.Read(b); err != nil {
 		panic("rand.Read failed: " + err.Error())
 	}
-	idRandomSrcMtx.Unlock()
 	if prefix != "" {
 		prefix = prefix + "-"
 	}
@@ -466,20 +455,6 @@ func WaitForHTTP(ip string, port int, timeout time.Duration) error {
 		return nil
 	}
 	return Poll(cb, timeout)
-}
-
-// HTTPRequestSucceeds sends a request to a given url and checks that the status is OK.
-func HTTPRequestSucceeds(client http.Client, server string, port int) error {
-	url := fmt.Sprintf("http://%s:%d", server, port)
-	// Ensure that content is being served.
-	resp, err := client.Get(url)
-	if err != nil {
-		return fmt.Errorf("error reaching http server: %v", err)
-	}
-	if want := http.StatusOK; resp.StatusCode != want {
-		return fmt.Errorf("wrong response code, got: %d, want: %d", resp.StatusCode, want)
-	}
-	return nil
 }
 
 // Reaper reaps child processes.
@@ -602,7 +577,7 @@ func KillCommand(cmd *exec.Cmd) error {
 // WriteTmpFile writes text to a temporary file, closes the file, and returns
 // the name of the file. A cleanup function is also returned.
 func WriteTmpFile(pattern, text string) (string, func(), error) {
-	file, err := ioutil.TempFile(TmpDir(), pattern)
+	file, err := os.CreateTemp(TmpDir(), pattern)
 	if err != nil {
 		return "", nil, err
 	}

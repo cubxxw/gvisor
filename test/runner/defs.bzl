@@ -1,6 +1,6 @@
 """Defines a rule for syscall test targets."""
 
-load("//tools:defs.bzl", "default_platform", "platform_capabilities", "platforms")
+load("//tools:defs.bzl", "default_platform", "platform_capabilities", "platforms", "save_restore_platforms")
 
 # Maps platform names to a GVISOR_PLATFORM_SUPPORT environment variable consumed by platform_util.cc
 _platform_support_env_vars = {
@@ -76,6 +76,9 @@ def _syscall_test(
         one_sandbox = True,
         fusefs = False,
         directfs = False,
+        leak_check = False,
+        save = False,
+        save_resume = False,
         **kwargs):
     # Prepend "runsc" to non-native platform names.
     full_platform = platform if platform == "native" else "runsc_" + platform
@@ -92,15 +95,27 @@ def _syscall_test(
         name += "_fuse"
     if directfs:
         name += "_directfs"
+    if save:
+        name += "_save"
+    if save_resume:
+        name += "_save_resume"
 
     # Apply all tags.
     if tags == None:
         tags = []
 
     # Add the full_platform and file access in a tag to make it easier to run
-    # all the tests on a specific flavor. Use --test_tag_filters=runsc_ptrace,file_shared.
+    # all the tests on a specific flavor. Use --test_tag_filters=runsc_systrap,file_shared.
     tags = list(tags)
     tags += [full_platform, "file_" + file_access]
+
+    if save or save_resume:
+        tags.append("allsave")
+        if platform in save_restore_platforms:
+            if save:
+                tags.append("save_restore")
+            if save_resume:
+                tags.append("save_resume")
 
     # Hash this target into one of 15 buckets. This can be used to
     # randomly split targets between different workflows.
@@ -151,6 +166,9 @@ def _syscall_test(
         "--one-sandbox=" + str(one_sandbox),
         "--iouring=" + str(iouring),
         "--directfs=" + str(directfs),
+        "--leak-check=" + str(leak_check),
+        "--save=" + str(save),
+        "--save-resume=" + str(save_resume),
     ]
 
     # Trace points are platform agnostic, so enable them for ptrace only.
@@ -172,6 +190,166 @@ def all_platforms():
     available[default_platform] = platforms.get(default_platform, [])
     return available.items()
 
+def syscall_test_variants(
+        test,
+        use_tmpfs = False,
+        add_fusefs = False,
+        add_overlay = False,
+        add_host_uds = False,
+        add_host_connector = False,
+        add_host_fifo = False,
+        add_hostinet = False,
+        add_directfs = True,
+        one_sandbox = True,
+        iouring = False,
+        allow_native = True,
+        leak_check = True,
+        debug = True,
+        container = None,
+        tags = None,
+        save = False,
+        save_resume = False,
+        size = "medium",
+        timeout = None,
+        overlay = False,
+        **kwargs):
+    """Generates syscall tests for all variants.
+
+    Args:
+      test: the test target.
+      use_tmpfs: use tmpfs in the defined tests.
+      add_fusefs: add a fusefs test.
+      add_overlay: add an overlay test.
+      add_host_uds: setup bound UDS on the host.
+      add_host_connector: setup host threads to connect to bound UDS created by sandbox.
+      add_host_fifo: setup FIFO files on the host.
+      add_hostinet: add a hostinet test.
+      add_directfs: add a directfs test.
+      one_sandbox: runs each unit test in a new sandbox instance.
+      iouring: enable IO_URING support.
+      allow_native: generate a native test variant.
+      debug: enable debug output.
+      container: Run the test in a container. If None, determined from other information.
+      tags: starting test tags.
+      leak_check: enables leak check.
+      save: save restore test.
+      size: test size.
+      timeout: timeout for the test.
+      save_resume: save resume test.
+      **kwargs: additional test arguments.
+    """
+    for platform, platform_tags in all_platforms():
+        # Add directfs to the default platform variant.
+        directfs = add_directfs and platform == default_platform
+        _syscall_test(
+            test = test,
+            platform = platform,
+            use_tmpfs = use_tmpfs,
+            add_host_uds = add_host_uds,
+            add_host_connector = add_host_connector,
+            add_host_fifo = add_host_fifo,
+            tags = platform_tags + tags,
+            iouring = iouring,
+            directfs = directfs,
+            debug = debug,
+            container = container,
+            one_sandbox = one_sandbox,
+            leak_check = leak_check,
+            save = save,
+            save_resume = save_resume,
+            size = size,
+            timeout = timeout,
+            overlay = overlay,
+            **kwargs
+        )
+
+    if add_overlay:
+        _syscall_test(
+            test = test,
+            platform = default_platform,
+            use_tmpfs = use_tmpfs,
+            add_host_uds = add_host_uds,
+            add_host_connector = add_host_connector,
+            add_host_fifo = add_host_fifo,
+            tags = platforms.get(default_platform, []) + tags,
+            debug = debug,
+            iouring = iouring,
+            container = container,
+            one_sandbox = one_sandbox,
+            overlay = True,
+            leak_check = leak_check,
+            save = save,
+            save_resume = save_resume,
+            size = size,
+            timeout = timeout,
+            **kwargs
+        )
+
+    # TODO(b/192114729): hostinet is not supported with S/R.
+    if add_hostinet and not (save or save_resume):
+        _syscall_test(
+            test = test,
+            platform = default_platform,
+            use_tmpfs = use_tmpfs,
+            network = "host",
+            add_host_uds = add_host_uds,
+            add_host_connector = add_host_connector,
+            add_host_fifo = add_host_fifo,
+            tags = platforms.get(default_platform, []) + tags,
+            debug = debug,
+            iouring = iouring,
+            container = container,
+            one_sandbox = one_sandbox,
+            leak_check = leak_check,
+            save = save,
+            save_resume = save_resume,
+            size = size,
+            timeout = timeout,
+            **kwargs
+        )
+    if not use_tmpfs:
+        # Also test shared gofer access.
+        _syscall_test(
+            test = test,
+            platform = default_platform,
+            use_tmpfs = use_tmpfs,
+            add_host_uds = add_host_uds,
+            add_host_connector = add_host_connector,
+            add_host_fifo = add_host_fifo,
+            tags = platforms.get(default_platform, []) + tags,
+            iouring = iouring,
+            debug = debug,
+            container = container,
+            one_sandbox = one_sandbox,
+            file_access = "shared",
+            leak_check = leak_check,
+            save = save,
+            save_resume = save_resume,
+            size = size,
+            timeout = timeout,
+            **kwargs
+        )
+    if add_fusefs:
+        _syscall_test(
+            test = test,
+            platform = default_platform,
+            use_tmpfs = True,
+            fusefs = True,
+            add_host_uds = add_host_uds,
+            add_host_connector = add_host_connector,
+            add_host_fifo = add_host_fifo,
+            tags = platforms.get(default_platform, []) + tags,
+            debug = debug,
+            container = container,
+            one_sandbox = one_sandbox,
+            leak_check = leak_check,
+            save = save,
+            save_resume = save_resume,
+            size = size,
+            timeout = timeout,
+            **kwargs
+        )
+
 def syscall_test(
         test,
         use_tmpfs = False,
@@ -185,9 +363,13 @@ def syscall_test(
         one_sandbox = True,
         iouring = False,
         allow_native = True,
+        leak_check = True,
         debug = True,
         container = None,
         tags = None,
+        save = True,
+        size = "medium",
+        overlay = False,
         **kwargs):
     """syscall_test is a macro that will create targets for all platforms.
 
@@ -207,6 +389,9 @@ def syscall_test(
       debug: enable debug output.
       container: Run the test in a container. If None, determined from other information.
       tags: starting test tags.
+      leak_check: enables leak check.
+      save: enables save/restore and save/resume test variants.
+      size: test size.
       **kwargs: additional test arguments.
     """
     if not tags:
@@ -228,86 +413,79 @@ def syscall_test(
             **kwargs
         )
 
-    for platform, platform_tags in all_platforms():
-        # Add directfs to the default platform variant.
-        directfs = add_directfs and platform == default_platform
-        _syscall_test(
-            test = test,
-            platform = platform,
-            use_tmpfs = use_tmpfs,
-            add_host_uds = add_host_uds,
-            add_host_connector = add_host_connector,
-            add_host_fifo = add_host_fifo,
-            tags = platform_tags + tags,
-            iouring = iouring,
-            directfs = directfs,
-            debug = debug,
-            container = container,
-            one_sandbox = one_sandbox,
+    syscall_test_variants(
+        test,
+        use_tmpfs,
+        add_fusefs,
+        add_overlay,
+        add_host_uds,
+        add_host_connector,
+        add_host_fifo,
+        add_hostinet,
+        add_directfs,
+        one_sandbox,
+        iouring,
+        allow_native,
+        leak_check,
+        debug,
+        container,
+        tags,
+        False,  # save, generate all tests without save variant.
+        False,  # save_resume, generate all tests without save_resume variant.
+        size,
+        overlay = overlay,
+        **kwargs
+    )
+
+    # Add save and save_resume variants to all other variants generated above.
+    if save:
+        # Disable go sanitizers for save tests.
+        tags.append("nogotsan")
+        syscall_test_variants(
+            test,
+            use_tmpfs,
+            add_fusefs,
+            add_overlay,
+            add_host_uds,
+            add_host_connector,
+            add_host_fifo,
+            add_hostinet,
+            add_directfs,
+            one_sandbox,
+            iouring,
+            allow_native,
+            leak_check,
+            debug,
+            container,
+            tags,
+            True,  # save, generate all tests with save variant.
+            False,  # save_resume, generate all tests without save_resume variant.
+            "large",  # size, use size as large by default for all S/R tests.
+            "long",  # timeout, use long timeout for S/R tests.
             **kwargs
         )
 
-    if add_overlay:
-        _syscall_test(
-            test = test,
-            platform = default_platform,
-            use_tmpfs = use_tmpfs,
-            add_host_uds = add_host_uds,
-            add_host_connector = add_host_connector,
-            add_host_fifo = add_host_fifo,
-            tags = platforms.get(default_platform, []) + tags,
-            debug = debug,
-            iouring = iouring,
-            container = container,
-            one_sandbox = one_sandbox,
-            overlay = True,
-            **kwargs
-        )
-    if add_hostinet:
-        _syscall_test(
-            test = test,
-            platform = default_platform,
-            use_tmpfs = use_tmpfs,
-            network = "host",
-            add_host_uds = add_host_uds,
-            add_host_connector = add_host_connector,
-            add_host_fifo = add_host_fifo,
-            tags = platforms.get(default_platform, []) + tags,
-            debug = debug,
-            iouring = iouring,
-            container = container,
-            one_sandbox = one_sandbox,
-            **kwargs
-        )
-    if not use_tmpfs:
-        # Also test shared gofer access.
-        _syscall_test(
-            test = test,
-            platform = default_platform,
-            use_tmpfs = use_tmpfs,
-            add_host_uds = add_host_uds,
-            add_host_connector = add_host_connector,
-            add_host_fifo = add_host_fifo,
-            tags = platforms.get(default_platform, []) + tags,
-            iouring = iouring,
-            debug = debug,
-            container = container,
-            one_sandbox = one_sandbox,
-            file_access = "shared",
-            **kwargs
-        )
-    if add_fusefs:
-        _syscall_test(
-            test = test,
-            platform = default_platform,
-            use_tmpfs = True,
-            fusefs = True,
-            add_host_uds = add_host_uds,
-            add_host_connector = add_host_connector,
-            add_host_fifo = add_host_fifo,
-            tags = platforms.get(default_platform, []) + tags,
-            debug = debug,
-            container = container,
-            one_sandbox = one_sandbox,
+        # Add save resume variant to all other variants generated above.
+        syscall_test_variants(
+            test,
+            use_tmpfs,
+            add_fusefs,
+            add_overlay,
+            add_host_uds,
+            add_host_connector,
+            add_host_fifo,
+            add_hostinet,
+            add_directfs,
+            one_sandbox,
+            iouring,
+            allow_native,
+            leak_check,
+            debug,
+            container,
+            tags,
+            False,  # save, generate all tests without save variant.
+            True,  # save_resume, generate all tests with save_resume variant.
+            "large",  # size, use size as large by default for all S/R tests.
+            "long",  # timeout, use long timeout for S/R tests.
             **kwargs
         )

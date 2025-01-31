@@ -101,7 +101,7 @@ func (l *lockState) modify() {
 		l.stored = s
 
 		// Reset the used values.
-		l.used = make(map[ssa.Value]struct{})
+		clear(l.used)
 
 		// Copy the defers.
 		ds := make([]*ssa.Defer, len(l.defers))
@@ -247,7 +247,7 @@ type elemType interface {
 func (l *lockState) valueAndObject(v ssa.Value) (string, types.Object) {
 	switch x := v.(type) {
 	case *ssa.Parameter:
-		// Was this provided as a paramter for a local anonymous
+		// Was this provided as a parameter for a local anonymous
 		// function invocation?
 		v, ok := l.stored[x]
 		if ok {

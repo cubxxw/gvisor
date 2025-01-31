@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -117,7 +116,7 @@ func setValue(path, name, data string) error {
 	return writeFile(fullpath, []byte(data), 0700)
 }
 
-// writeFile is similar to ioutil.WriteFile() but doesn't create the file if it
+// writeFile is similar to os.WriteFile() but doesn't create the file if it
 // doesn't exist.
 func writeFile(path string, data []byte, perm os.FileMode) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, perm)
@@ -132,7 +131,7 @@ func writeFile(path string, data []byte, perm os.FileMode) error {
 
 func getValue(path, name string) (string, error) {
 	fullpath := filepath.Join(path, name)
-	out, err := ioutil.ReadFile(fullpath)
+	out, err := os.ReadFile(fullpath)
 	if err != nil {
 		return "", err
 	}
@@ -150,7 +149,7 @@ func getInt(path, name string) (int, error) {
 // fillFromAncestor sets the value of a cgroup file from the first ancestor
 // that has content. It does nothing if the file in 'path' has already been set.
 func fillFromAncestor(path string) (string, error) {
-	out, err := ioutil.ReadFile(path)
+	out, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
@@ -342,18 +341,6 @@ type cgroupV1 struct {
 	Own     map[string]bool   `json:"own"`
 }
 
-// NewFromSpec creates a new Cgroup instance if the spec includes a cgroup path.
-// Returns nil otherwise. Cgroup paths are loaded based on the current process.
-// If useSystemd is true, the Cgroup will be created and managed with
-// systemd. This requires systemd (>=v244) to be running on the host and the
-// cgroup path to be in the form `slice:prefix:name`.
-func NewFromSpec(spec *specs.Spec, useSystemd bool) (Cgroup, error) {
-	if spec.Linux == nil || spec.Linux.CgroupsPath == "" {
-		return nil, nil
-	}
-	return NewFromPath(spec.Linux.CgroupsPath, useSystemd)
-}
-
 // NewFromPath creates a new Cgroup instance from the specified relative path.
 // Cgroup paths are loaded based on the current process.
 // If useSystemd is true, the Cgroup will be created and managed with
@@ -369,6 +356,36 @@ func NewFromPath(cgroupsPath string, useSystemd bool) (Cgroup, error) {
 // cgroup path to be in the form `slice:prefix:name`.
 func NewFromPid(pid int, useSystemd bool) (Cgroup, error) {
 	return new(strconv.Itoa(pid), "", useSystemd)
+}
+
+// LikelySystemdPath returns true if the path looks like a systemd path. This is
+// by no means an exhaustive check, it's just a useful proxy for logging a
+// warning.
+func LikelySystemdPath(path string) bool {
+	parts := strings.SplitN(path, ":", 4)
+	return len(parts) == 3
+}
+
+// TransformSystemdPath transforms systemd path to be in the form
+// `slice:prefix:name`. It returns an error if path could not be parsed as a
+// valid systemd path.
+func TransformSystemdPath(path, cid string, rootless bool) (string, error) {
+	if len(path) == 0 {
+		path = fmt.Sprintf(":runsc:%s", cid)
+	}
+	parts := strings.SplitN(path, ":", 4)
+	if len(parts) != 3 {
+		return "", fmt.Errorf("invalid systemd path: %q", path)
+	}
+	slice, prefix, name := parts[0], parts[1], parts[2]
+	if len(slice) == 0 {
+		if rootless {
+			slice = "user.slice"
+		} else {
+			slice = "system.slice"
+		}
+	}
+	return fmt.Sprintf("%s:%s:%s", slice, prefix, name), nil
 }
 
 func new(pid, cgroupsPath string, useSystemd bool) (Cgroup, error) {
@@ -643,7 +660,7 @@ func (c *cgroupV1) CPUQuota() (float64, error) {
 	return float64(quota) / float64(period), nil
 }
 
-// CPUUsage returns the total CPU usage of the cgroup.
+// CPUUsage returns the total CPU usage of the cgroup in nanoseconds.
 func (c *cgroupV1) CPUUsage() (uint64, error) {
 	path := c.MakePath("cpuacct")
 	usage, err := getValue(path, "cpuacct.usage")

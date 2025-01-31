@@ -19,7 +19,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"strings"
@@ -112,10 +111,10 @@ func main() {
 
 	// The access token may be passed as a file so it doesn't show up in
 	// command line arguments. It also may be provided through the
-	// environment to faciliate use through GitHub's CI system.
+	// environment to facilitate use through GitHub's CI system.
 	token := os.Getenv("GITHUB_TOKEN")
 	if len(tokenFile) != 0 {
-		bytes, err := ioutil.ReadFile(tokenFile)
+		bytes, err := os.ReadFile(tokenFile)
 		if err != nil {
 			fmt.Println(err.Error())
 			os.Exit(1)

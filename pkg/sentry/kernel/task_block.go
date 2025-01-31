@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -41,9 +41,10 @@ func (t *Task) BlockWithTimeout(C chan struct{}, haveTimeout bool, timeout time.
 		return timeout, t.block(C, nil)
 	}
 
-	start := t.Kernel().MonotonicClock().Now()
+	clock := t.Kernel().MonotonicClock()
+	start := clock.Now()
 	deadline := start.Add(timeout)
-	err := t.BlockWithDeadline(C, true, deadline)
+	err := t.blockWithDeadlineFromSampledClock(C, clock, deadline)
 
 	// Timeout, explicitly return a remaining duration of 0.
 	if linuxerr.Equals(linuxerr.ETIMEDOUT, err) {
@@ -54,7 +55,7 @@ func (t *Task) BlockWithTimeout(C chan struct{}, haveTimeout bool, timeout time.
 	// return due to a timeout, we may have used up any of the remaining time
 	// since then. We cap the remaining timeout to 0 to make it easier to
 	// directly use the returned duration.
-	end := t.Kernel().MonotonicClock().Now()
+	end := clock.Now()
 	remainingTimeout := timeout - end.Sub(start)
 	if remainingTimeout < 0 {
 		remainingTimeout = 0
@@ -83,35 +84,65 @@ func (t *Task) BlockWithDeadline(C <-chan struct{}, haveDeadline bool, deadline 
 	if !haveDeadline {
 		return t.block(C, nil)
 	}
+	return t.blockWithDeadlineFromSampledClock(C, t.Kernel().MonotonicClock(), deadline)
+}
+
+// BlockWithDeadlineFrom is similar to BlockWithDeadline, except it uses the
+// passed clock (instead of application monotonic clock).
+//
+// Most clients should use BlockWithDeadline or BlockWithTimeout instead.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) BlockWithDeadlineFrom(C <-chan struct{}, clock ktime.Clock, haveDeadline bool, deadline ktime.Time) error {
+	if !haveDeadline {
+		return t.block(C, nil)
+	}
+
+	if c, ok := clock.(ktime.SampledClock); ok {
+		return t.blockWithDeadlineFromSampledClock(C, c, deadline)
+	}
 
 	// Start the timeout timer.
-	t.blockingTimer.Swap(ktime.Setting{
+	timer := clock.NewTimer(t.blockingTimerListener)
+	defer timer.Destroy()
+	timer.Set(ktime.Setting{
+		Enabled: true,
+		Next:    deadline,
+	}, nil)
+
+	err := t.block(C, t.blockingTimerChan)
+
+	// Stop the timeout timer and drain the channel. If s.Enabled is true, the
+	// timer didn't fire yet, so t.blockingTimerChan must be empty.
+	if _, s := timer.Set(ktime.Setting{}, nil); !s.Enabled {
+		select {
+		case <-t.blockingTimerChan:
+		default:
+		}
+	}
+
+	return err
+}
+
+func (t *Task) blockWithDeadlineFromSampledClock(C <-chan struct{}, clock ktime.SampledClock, deadline ktime.Time) error {
+	// Start the timeout timer.
+	t.blockingTimer.SetClock(clock, ktime.Setting{
 		Enabled: true,
 		Next:    deadline,
 	})
 
 	err := t.block(C, t.blockingTimerChan)
 
-	// Stop the timeout timer and drain the channel.
-	t.blockingTimer.Swap(ktime.Setting{})
-	select {
-	case <-t.blockingTimerChan:
-	default:
+	// Stop the timeout timer and drain the channel. If s.Enabled is true, the
+	// timer didn't fire yet, so t.blockingTimerChan must be empty.
+	if _, s := t.blockingTimer.Set(ktime.Setting{}, nil); !s.Enabled {
+		select {
+		case <-t.blockingTimerChan:
+		default:
+		}
 	}
 
 	return err
-}
-
-// BlockWithTimer blocks t until an event is received from C or tchan, or t is
-// interrupted. It returns nil if an event is received from C, ETIMEDOUT if an
-// event is received from tchan, and linuxerr.ErrInterrupted if t is
-// interrupted.
-//
-// Most clients should use BlockWithDeadline or BlockWithTimeout instead.
-//
-// Preconditions: The caller must be running on the task goroutine.
-func (t *Task) BlockWithTimer(C <-chan struct{}, tchan <-chan struct{}) error {
-	return t.block(C, tchan)
 }
 
 // Block implements context.Context.Block
@@ -145,7 +176,7 @@ func (t *Task) block(C <-chan struct{}, timerChan <-chan struct{}) error {
 	default:
 	}
 
-	// Deactive our address space, we don't need it.
+	// Deactivate our address space, we don't need it.
 	t.prepareSleep()
 	defer t.completeSleep()
 

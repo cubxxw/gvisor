@@ -39,7 +39,9 @@
 #include "test/util/eventfd_util.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/logging.h"
 #include "test/util/posix_error.h"
+#include "test/util/save_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
 
@@ -160,10 +162,15 @@ class GetdentsTest : public ::testing::Test {
 
   // Fill directory with num files, named by number starting at 0.
   void FillDirectory(size_t num) {
-    for (size_t i = 0; i < num; i++) {
-      auto name = JoinPath(dir_.path(), absl::StrCat(i));
-      TEST_CHECK(CreateWithContents(name, "").ok());
+    // Don't save after each file creation since num can be large.
+    {
+      DisableSave ds;
+      for (size_t i = 0; i < num; i++) {
+        auto name = JoinPath(dir_.path(), absl::StrCat(i));
+        TEST_CHECK(CreateWithContents(name, "").ok());
+      }
     }
+    MaybeSave();
   }
 
   // Fill directory with a given list of filenames.
@@ -248,8 +255,8 @@ int GetdentsTest<struct linux_dirent64>::SyscallNum() {
 // Test both legacy getdents and getdents64 on x86_64.
 typedef ::testing::Types<struct linux_dirent, struct linux_dirent64>
     GetdentsTypes;
-#elif __aarch64__
-// Test only getdents64 on arm64.
+#elif defined(__aarch64__) || defined(__riscv)
+// Test only getdents64 on arm64 and RISC-V.
 typedef ::testing::Types<struct linux_dirent64> GetdentsTypes;
 #endif
 TYPED_TEST_SUITE(GetdentsTest, GetdentsTypes);
@@ -493,6 +500,22 @@ TYPED_TEST(GetdentsTest, ZeroLengthOutBuffer) {
   typename TestFixture::DirentBufferType dirents(0);
   ASSERT_THAT(RetryEINTR(syscall)(this->SyscallNum(), fd.get(), dirents.Data(),
                                   dirents.Size()),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+// Tests that getdents() fails when called with too large size.
+TYPED_TEST(GetdentsTest, TooLargeSize) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto fd = ASSERT_NO_ERRNO_AND_VALUE(Open(dir.path(), O_DIRECTORY));
+
+  typename TestFixture::DirentBufferType dirents(100);
+  // Try one over the limit.
+  EXPECT_THAT(RetryEINTR(syscall)(this->SyscallNum(), fd.get(), dirents.Data(),
+                                  static_cast<uint32_t>(INT32_MAX) + 1),
+              SyscallFailsWithErrno(EINVAL));
+  // Try way over the limit.
+  EXPECT_THAT(RetryEINTR(syscall)(this->SyscallNum(), fd.get(), dirents.Data(),
+                                  static_cast<uint32_t>(-1)),
               SyscallFailsWithErrno(EINVAL));
 }
 

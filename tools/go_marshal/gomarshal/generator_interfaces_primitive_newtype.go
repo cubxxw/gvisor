@@ -38,7 +38,7 @@ func (g *interfaceGenerator) marshalPrimitiveScalar(accessor, typ, bufVar string
 		g.recordUsedImport("hostarch")
 		g.emit("hostarch.ByteOrder.PutUint64(%s[:8], uint64(*%s))\n", bufVar, accessor)
 	default:
-		g.emit("// Explicilty cast to the underlying type before dispatching to\n")
+		g.emit("// Explicitly cast to the underlying type before dispatching to\n")
 		g.emit("// MarshalBytes, so we don't recursively call %s.MarshalBytes\n", accessor)
 		g.emit("inner := (*%s)(%s)\n", typ, accessor)
 		g.emit("inner.MarshalBytes(%s[:%s.SizeBytes()])\n", bufVar, accessor)
@@ -62,7 +62,7 @@ func (g *interfaceGenerator) unmarshalPrimitiveScalar(accessor, typ, bufVar, typ
 		g.recordUsedImport("hostarch")
 		g.emit("*%s = %s(%s(hostarch.ByteOrder.Uint64(%s[:8])))\n", accessor, typeCast, typ, bufVar)
 	default:
-		g.emit("// Explicilty cast to the underlying type before dispatching to\n")
+		g.emit("// Explicitly cast to the underlying type before dispatching to\n")
 		g.emit("// UnmarshalBytes, so we don't recursively call %s.UnmarshalBytes\n", accessor)
 		g.emit("inner := (*%s)(%s)\n", typ, accessor)
 		g.emit("inner.UnmarshalBytes(%s[:%s.SizeBytes()])\n", bufVar, accessor)
@@ -86,7 +86,7 @@ func (g *interfaceGenerator) validatePrimitiveNewtype(t *ast.Ident) {
 	case "string":
 		g.abortAt(t.Pos(), "Type 'string' is dynamically-sized and cannot be marshalled, use a fixed size byte array '[...]byte' instead")
 	default:
-		debugfAt(g.f.Position(t.Pos()), fmt.Sprintf("Found derived type '%s', will attempt dispatch via marshal.Marshallable.\n", t.Name))
+		debugfAt(g.f.Position(t.Pos()), "%s", fmt.Sprintf("Found derived type '%s', will attempt dispatch via marshal.Marshallable.\n", t.Name))
 	}
 }
 

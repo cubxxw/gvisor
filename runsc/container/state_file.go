@@ -18,14 +18,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
 	"github.com/gofrs/flock"
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -102,6 +100,7 @@ func Load(rootDir string, id FullID, opts LoadOpts) (*Container, error) {
 		}
 		return nil, fmt.Errorf("reading container metadata file %q: %v", state.statePath(), err)
 	}
+	c.Sandbox.SetRootDir(rootDir)
 
 	if opts.RootContainer && c.ID != c.Sandbox.ID {
 		return nil, fmt.Errorf("ID %q doesn't belong to a sandbox", id)
@@ -113,15 +112,8 @@ func Load(rootDir string, id FullID, opts LoadOpts) (*Container, error) {
 		//
 		// This is inherently racy.
 		switch c.Status {
-		case Created:
-			if !c.IsSandboxRunning() {
-				// Sandbox no longer exists, so this container definitely does not exist.
-				c.changeStatus(Stopped)
-			}
-		case Running:
-			if err := c.SignalContainer(unix.Signal(0), false); err != nil {
-				c.changeStatus(Stopped)
-			}
+		case Created, Running:
+			c.CheckStopped()
 		}
 	}
 
@@ -373,7 +365,7 @@ func (s *StateFile) SaveLocked(v any) error {
 	if err != nil {
 		return err
 	}
-	if err := ioutil.WriteFile(s.statePath(), meta, 0640); err != nil {
+	if err := os.WriteFile(s.statePath(), meta, 0640); err != nil {
 		return fmt.Errorf("writing json file: %v", err)
 	}
 	return nil
@@ -391,7 +383,7 @@ func (s *StateFile) load(v any, opts LoadOpts) error {
 	}
 	defer s.UnlockOrDie()
 
-	metaBytes, err := ioutil.ReadFile(s.statePath())
+	metaBytes, err := os.ReadFile(s.statePath())
 	if err != nil {
 		return err
 	}

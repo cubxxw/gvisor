@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -118,7 +117,7 @@ func sandboxPid(pid int) (int, error) {
 			return 0, err
 		}
 
-		cmdline, err := ioutil.ReadFile(filepath.Join("/proc", line, "cmdline"))
+		cmdline, err := os.ReadFile(filepath.Join("/proc", line, "cmdline"))
 		if err != nil {
 			if os.IsNotExist(err) {
 				// Raced with process exit.
@@ -172,7 +171,7 @@ func TestSandboxProcessEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 0 {
-		t.Errorf("sandbox process's environment is not empty: got %s", string(got))
+	if len(got) != 0 && string(got) != "GLIBC_TUNABLES=glibc.pthread.rseq=0\x00" {
+		t.Errorf("sandbox process's environment is not empty: got %s (%v)", string(got), got)
 	}
 }

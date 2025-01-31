@@ -14,12 +14,20 @@
 
 package segment
 
-func (s *Set) saveRoot() *SegmentDataSlices {
-	return s.ExportSortedSlices()
+import (
+	"context"
+)
+
+func (s *Set) saveRoot() []FlatSegment {
+	fs := s.ExportSlice()
+	// The state package saves data in slice capacity beyond slice length; save
+	// it some time by cutting ours off.
+	fs = fs[:len(fs):len(fs)]
+	return fs
 }
 
-func (s *Set) loadRoot(sds *SegmentDataSlices) {
-	if err := s.ImportSortedSlices(sds); err != nil {
+func (s *Set) loadRoot(_ context.Context, fs []FlatSegment) {
+	if err := s.ImportSlice(fs); err != nil {
 		panic(err)
 	}
 }

@@ -16,110 +16,206 @@ package specutils
 
 import (
 	"fmt"
-	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/runsc/config"
 )
 
-const nvdEnvVar = "NVIDIA_VISIBLE_DEVICES"
+const (
+	// NVIDIA_VISIBLE_DEVICES environment variable controls which GPUs are
+	// visible and accessible to the container.
+	nvidiaVisibleDevsEnv = "NVIDIA_VISIBLE_DEVICES"
+	// NVIDIA_DRIVER_CAPABILITIES environment variable allows to fine-tune which
+	// NVIDIA driver components are mounted and accessible within a container.
+	nvidiaDriverCapsEnv = "NVIDIA_DRIVER_CAPABILITIES"
+	// CUDA_VERSION environment variable indicates the version of the CUDA
+	// toolkit installed on in the container image.
+	cudaVersionEnv = "CUDA_VERSION"
+	// NVIDIA_REQUIRE_CUDA environment variable indicates the CUDA toolkit
+	// version that a container needs.
+	requireCudaEnv = "NVIDIA_REQUIRE_CUDA"
+	// AnnotationNVProxy enables nvproxy.
+	AnnotationNVProxy = "dev.gvisor.internal.nvproxy"
+)
 
-// GPUFunctionalityRequested returns true if the user intends for the sandbox
-// to have access to GPU functionality (e.g. access to /dev/nvidiactl),
-// irrespective of whether or not they want access to any specific GPU.
+// NVProxyEnabled checks both the nvproxy annotation and conf.NVProxy to see if nvproxy is enabled.
+func NVProxyEnabled(spec *specs.Spec, conf *config.Config) bool {
+	if conf.NVProxy {
+		return true
+	}
+	return AnnotationToBool(spec, AnnotationNVProxy)
+}
+
+// GPUFunctionalityRequested returns true if the container should have access
+// to GPU functionality.
 func GPUFunctionalityRequested(spec *specs.Spec, conf *config.Config) bool {
-	if !conf.NVProxy {
+	if !NVProxyEnabled(spec, conf) {
 		// nvproxy disabled.
 		return false
 	}
-	if !conf.NVProxyDocker {
-		// nvproxy enabled in non-Docker mode.
-		return true
+	// In GKE, the nvidia_gpu device plugin injects NVIDIA devices into
+	// spec.Linux.Devices when GPUs are allocated to a container.
+	if spec.Linux != nil {
+		for _, dev := range spec.Linux.Devices {
+			if dev.Path == "/dev/nvidiactl" {
+				return true
+			}
+		}
 	}
-	// nvproxy enabled in Docker mode.
-	// GPU access is only requested if NVIDIA_VISIBLE_DEVICES is non-empty
-	// and set to a value that doesn't mean "no GPU".
+	return gpuFunctionalityRequestedViaHook(spec, conf)
+}
+
+// GPUFunctionalityRequestedViaHook returns true if the container should have
+// access to GPU functionality configured via nvidia-container-runtime-hook.
+// This hook is used by:
+// - Docker when using `--gpus` flag from the CLI.
+// - nvidia-container-runtime when using its legacy mode.
+func GPUFunctionalityRequestedViaHook(spec *specs.Spec, conf *config.Config) bool {
+	if !NVProxyEnabled(spec, conf) {
+		// nvproxy disabled.
+		return false
+	}
+	return gpuFunctionalityRequestedViaHook(spec, conf)
+}
+
+// Precondition: NVProxyEnabled(spec, conf).
+func gpuFunctionalityRequestedViaHook(spec *specs.Spec, conf *config.Config) bool {
+	if !isNvidiaHookPresent(spec, conf) {
+		return false
+	}
+	// In Docker mode, GPU access is only requested if NVIDIA_VISIBLE_DEVICES is
+	// non-empty and set to a value that doesn't mean "no GPU".
 	if spec.Process == nil {
 		return false
 	}
-	nvd, _ := EnvVar(spec.Process.Env, nvdEnvVar)
+	nvd, _ := EnvVar(spec.Process.Env, nvidiaVisibleDevsEnv)
 	// A value of "none" means "no GPU device, but still access to driver
 	// functionality", so it is not a value we check for here.
 	return nvd != "" && nvd != "void"
 }
 
-// CanAccessAtLeastOneGPU returns true if the sandbox and container should
-// be able to access at least one Nvidia GPU. This is a function of the
-// sandbox configuration and the container spec's NVIDIA_VISIBLE_DEVICES
-// environment variable.
-func CanAccessAtLeastOneGPU(spec *specs.Spec, conf *config.Config) bool {
-	gpus, err := NvidiaDeviceNumbers(spec, conf)
-	if err != nil {
-		log.Warningf("Cannot determine if the container should have access to GPUs: %v", err)
-		return false
+func isNvidiaHookPresent(spec *specs.Spec, conf *config.Config) bool {
+	if conf.NVProxyDocker {
+		// This has the effect of injecting the nvidia-container-runtime-hook.
+		return true
 	}
-	return len(gpus) > 0
-}
 
-// nvidiaDeviceRegex matches Nvidia GPU device paths.
-var nvidiaDeviceRegex = regexp.MustCompile(`^/dev/nvidia(\d+)$`)
-
-// findAllGPUDevices returns the Nvidia GPU device minor numbers of all GPUs
-// on the machine.
-func findAllGPUDevices() ([]uint32, error) {
-	paths, err := filepath.Glob("/dev/nvidia*")
-	if err != nil {
-		return nil, fmt.Errorf("enumerating Nvidia device files: %w", err)
-	}
-	var devMinors []uint32
-	for _, path := range paths {
-		if ms := nvidiaDeviceRegex.FindStringSubmatch(path); ms != nil {
-			index, err := strconv.ParseUint(ms[1], 10, 32)
-			if err != nil {
-				return nil, fmt.Errorf("invalid host device file %q: %w", path, err)
+	if spec.Hooks != nil {
+		for _, h := range spec.Hooks.Prestart {
+			if strings.HasSuffix(h.Path, "/nvidia-container-runtime-hook") {
+				return true
 			}
-			devMinors = append(devMinors, uint32(index))
 		}
 	}
-	return devMinors, nil
+	return false
 }
 
-// NvidiaDeviceNumbers returns the Nvidia GPU device minor numbers that
-// should be visible to the specified container.
-// In Docker mode, this is the set of devices specified in
-// NVIDIA_VISIBLE_DEVICES.
-// In non-Docker mode, this is all Nvidia devices, as we cannot know the set
-// of usable GPUs until subcontainer creation.
-func NvidiaDeviceNumbers(spec *specs.Spec, conf *config.Config) ([]uint32, error) {
-	if !GPUFunctionalityRequested(spec, conf) {
-		return nil, nil
-	}
-	if !conf.NVProxyDocker {
-		// nvproxy enabled in non-Docker mode.
-		// Return all GPUs on the machine.
-		return findAllGPUDevices()
-	}
-	// nvproxy is enabled in Docker mode.
-	nvd, _ := EnvVar(spec.Process.Env, nvdEnvVar)
+// ParseNvidiaVisibleDevices parses NVIDIA_VISIBLE_DEVICES env var and returns
+// the devices specified in it. This can be passed to nvidia-container-cli.
+//
+// Precondition: conf.NVProxyDocker && GPUFunctionalityRequested(spec, conf).
+func ParseNvidiaVisibleDevices(spec *specs.Spec) (string, error) {
+	nvd, _ := EnvVar(spec.Process.Env, nvidiaVisibleDevsEnv)
 	if nvd == "none" {
-		return nil, nil
+		return "", nil
 	}
 	if nvd == "all" {
-		return findAllGPUDevices()
+		return "all", nil
 	}
-	var devMinors []uint32
-	// Expect nvd to be a list of indices; UUIDs aren't supported
-	// yet.
-	for _, indexStr := range strings.Split(nvd, ",") {
-		index, err := strconv.ParseUint(indexStr, 10, 32)
-		if err != nil {
-			return nil, fmt.Errorf("invalid %q in NVIDIA_VISIBLE_DEVICES %q: %w", indexStr, nvd, err)
+
+	for _, gpuDev := range strings.Split(nvd, ",") {
+		// Validate gpuDev. We only support the following formats for now:
+		// * GPU indices (e.g. 0,1,2)
+		// * GPU UUIDs (e.g. GPU-fef8089b)
+		//
+		// We do not support MIG devices yet.
+		if strings.HasPrefix(gpuDev, "GPU-") {
+			continue
 		}
-		devMinors = append(devMinors, uint32(index))
+		_, err := strconv.ParseUint(gpuDev, 10, 32)
+		if err != nil {
+			return "", fmt.Errorf("invalid %q in NVIDIA_VISIBLE_DEVICES %q: %w", gpuDev, nvd, err)
+		}
 	}
-	return devMinors, nil
+	return nvd, nil
+}
+
+// NVProxyDriverCapsAllowed returns the driver capabilities allowed by the
+// configuration, irrespective of what a container requests.
+// This should be used to determine the bounding set of driver capabilities
+// that a container can request.
+func NVProxyDriverCapsAllowed(conf *config.Config) (nvconf.DriverCaps, error) {
+	// Construct the set of allowed driver capabilities.
+	allowedDriverCaps, hasAll, err := nvconf.DriverCapsFromString(conf.NVProxyAllowedDriverCapabilities)
+	if err != nil {
+		return 0, fmt.Errorf("invalid set of allowed NVIDIA driver capabilities %q: %w", conf.NVProxyAllowedDriverCapabilities, err)
+	}
+	// Resolve "all" to `nvconf.SupportedDriverCaps`.
+	// allowedDriverCaps is already a subset of `nvconf.SupportedDriverCaps`
+	// as this was checked by `config.Config.validate`.
+	if hasAll {
+		return nvconf.SupportedDriverCaps, nil
+	}
+	return allowedDriverCaps, nil
+}
+
+// NVProxyDriverCapsFromEnv returns the driver capabilities requested by the
+// application via the NVIDIA_DRIVER_CAPABILITIES env var. See
+// nvidia-container-toolkit/cmd/nvidia-container-runtime-hook/container_config.go:getDriverCapabilities().
+func NVProxyDriverCapsFromEnv(spec *specs.Spec, conf *config.Config) (nvconf.DriverCaps, error) {
+	allowedDriverCaps, err := NVProxyDriverCapsAllowed(conf)
+	if err != nil {
+		return 0, err
+	}
+
+	// Extract the set of driver capabilities requested by the application.
+	driverCapsEnvStr, ok := EnvVar(spec.Process.Env, nvidiaDriverCapsEnv)
+	if !ok {
+		// Nothing requested. Fallback to default configurations.
+		if IsLegacyCudaImage(spec) {
+			return allowedDriverCaps, nil
+		}
+		return nvconf.DefaultDriverCaps & allowedDriverCaps, nil
+	}
+	if len(driverCapsEnvStr) == 0 {
+		// Empty. Fallback to nvconf.DefaultDriverCaps.
+		return nvconf.DefaultDriverCaps & allowedDriverCaps, nil
+	}
+	envDriverCaps, enableAll, err := nvconf.DriverCapsFromString(driverCapsEnvStr)
+	if err != nil {
+		return 0, fmt.Errorf("invalid set of requested NVIDIA driver capabilities %q: %w", driverCapsEnvStr, err)
+	}
+	if enableAll {
+		// The "all" keyword here is confusing but we need to match the behavior of
+		// nvidia-container-toolkit:cmd/nvidia-container-runtime-hook/container_config.go:getDriverCapabilities.
+		// If the environment variable contains "all", the intuitive thing to do
+		// would be to expand it to mean "all allowed capabilities". Rather, in
+		// nvidia-container-toolkit, it means "expand to the entire set of
+		// capabilities, then silently drop all disallowed or unsupported
+		// capabilities from this set".
+		// We aim to be drop-in compatible with this behavior so we need to
+		// implement it too, but log a warning when these behaviors result in a
+		// different outcome.
+		if intuitiveCaps := envDriverCaps | allowedDriverCaps; intuitiveCaps != allowedDriverCaps {
+			log.Warningf("Container requested NVIDIA driver capabilities %q; this expands to %v which is a larger set than allowed capabilities (%v). The extra capabilities (%v) will be dropped.", driverCapsEnvStr, intuitiveCaps, allowedDriverCaps, intuitiveCaps&^allowedDriverCaps)
+		}
+		return allowedDriverCaps, nil
+	}
+	// Intersect what's requested with what's allowed.
+	if driverCaps := allowedDriverCaps & envDriverCaps; driverCaps != envDriverCaps {
+		return 0, fmt.Errorf(`disallowed driver capabilities requested: "%v" (allowed "%v"), update --nvproxy-allowed-driver-capabilities to allow them`, envDriverCaps, driverCaps)
+	}
+	return envDriverCaps, nil
+}
+
+// IsLegacyCudaImage returns true if spec represents a legacy CUDA image.
+// See nvidia-container-toolkit/internal/config/image/cuda_image.go:IsLegacy().
+func IsLegacyCudaImage(spec *specs.Spec) bool {
+	cudaVersion, _ := EnvVar(spec.Process.Env, cudaVersionEnv)
+	requireCuda, _ := EnvVar(spec.Process.Env, requireCudaEnv)
+	return len(cudaVersion) > 0 && len(requireCuda) == 0
 }

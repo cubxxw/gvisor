@@ -96,7 +96,7 @@ func (s *State) newTrapLocked(ctx context.Context, mm memoryManager) (hostarch.A
 	// nextTrap is saved on the usertrap vma to handle the third and second
 	// cases.
 	if s.nextTrap == 0 {
-		addr, off, err := mm.FindVMAByName(trapTableAddrRange, tableHint)
+		addr, off, err := mm.FindVMAByName(trapTableAddrRange, tableVMAName)
 		if off != 0 {
 			return 0, fmt.Errorf("the usertrap vma has been overmounted")
 		}
@@ -152,7 +152,7 @@ var trapTableAddrRange = hostarch.AddrRange{Start: 0x60000, End: 0x70000}
 const (
 	trapTableSize = hostarch.Addr(trapNR * trapSize)
 
-	tableHint = "[usertrap]"
+	tableVMAName = "[usertrap]"
 )
 
 // LoadUsertrap maps the usertrap table into the address space.
@@ -166,7 +166,7 @@ func loadUsertrap(ctx context.Context, mm memoryManager, addr hostarch.Addr) err
 		Addr:      addr,
 		Length:    uint64(size),
 		Private:   true,
-		Hint:      tableHint,
+		Name:      tableVMAName,
 		MLockMode: memmap.MLockEager,
 		Perms: hostarch.AccessType{
 			Write:   false,
@@ -187,12 +187,10 @@ func loadUsertrap(ctx context.Context, mm memoryManager, addr hostarch.Addr) err
 }
 
 // PatchSyscall changes the syscall instruction into a function call.
-//
-// Returns true if the thread has to be restarted.
-func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryManager) (bool, error) {
+func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryManager) error {
 	task := kernel.TaskFromContext(ctx)
 	if task == nil {
-		return false, fmt.Errorf("no task found")
+		return fmt.Errorf("no task found")
 	}
 
 	s.mu.Lock()
@@ -203,7 +201,7 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 
 	prevCode := make([]uint8, len(jmpInst))
 	if _, err := primitive.CopyUint8SliceIn(task.OwnCopyContext(usermem.IOOpts{AddressSpaceActive: false}), hostarch.Addr(patchAddr), prevCode); err != nil {
-		return false, err
+		return err
 	}
 
 	// Check that another thread has not patched this syscall yet.
@@ -214,7 +212,7 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 		trapAddr, err := s.addTrapLocked(ctx, ac, mm, uint32(sysno))
 		if trapAddr == 0 || err != nil {
 			ctx.Warningf("Failed to add a new trap: %v", err)
-			return false, nil
+			return nil
 		}
 
 		// Replace "mov sysno, %eax; syscall" with "jmp trapAddr".
@@ -258,24 +256,22 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 		// the invalid instruction and restart a patched code.
 		faultInstB := primitive.ByteSlice(faultInst[:])
 		if _, err := faultInstB.CopyOut(ignorePermContext, hostarch.Addr(patchAddr+faultInstOffset)); err != nil {
-			return false, err
+			return err
 		}
 		// The second step is to replace all bytes except the first one
 		// which is the opcode of the mov instruction, so that the first
 		// five bytes remain "mov XXX, %rax".
 		if _, err := primitive.CopyUint8SliceOut(ignorePermContext, hostarch.Addr(patchAddr+1), newCode[1:]); err != nil {
-			return false, err
+			return err
 		}
 		// The final step is to replace the first byte of the patch.
 		// After this point, all threads will read the valid jmp
 		// instruction.
 		if _, err := primitive.CopyUint8SliceOut(ignorePermContext, hostarch.Addr(patchAddr), newCode[0:1]); err != nil {
-			return false, err
+			return err
 		}
 	}
-	ac.RestartSyscall()
-	ac.SetIP(patchAddr)
-	return true, nil
+	return nil
 }
 
 // HandleFault handles a fault on a patched syscall instruction.

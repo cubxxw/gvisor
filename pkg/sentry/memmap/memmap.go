@@ -356,18 +356,26 @@ type MMapOpts struct {
 	// downward on guard page faults.
 	GrowsDown bool
 
-	// Precommit is true if the platform should eagerly commit resources to the
-	// mapping (see platform.AddressSpace.MapFile).
-	Precommit bool
+	// Stack is equivalent to MAP_STACK, which has no mandatory semantics in
+	// Linux.
+	Stack bool
+
+	// PlatformEffect controls the synchronous effect of this call on the
+	// underlying platform.AddressSpace.
+	PlatformEffect MMapPlatformEffect
 
 	// MLockMode specifies the memory locking behavior of the mapping.
 	MLockMode MLockMode
 
-	// Hint is the name used for the mapping in /proc/[pid]/maps. If Hint is
+	// Name is the name used for the mapping in /proc/[pid]/maps. If Name is
 	// empty, MappingIdentity.MappedName() will be used instead.
 	//
 	// TODO(jamieliu): Replace entirely with MappingIdentity?
-	Hint string
+	Name string
+
+	// NameMut controls the effect of prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME)
+	// on this mapping.
+	NameMut NameMut
 
 	// Force means to skip validation checks of Addr and Length. It can be
 	// used to create special mappings below mm.layout.MinAddr and
@@ -376,11 +384,54 @@ type MMapOpts struct {
 	// If Force is true, Unmap and Fixed must be true.
 	Force bool
 
+	// If RequirePlatformEffect is false, PlatformEffect is best-effort;
+	// failure to create mappings in the platform.AddressSpace are silently
+	// ignored. If RequirePlatformEffect is true, failure to create mappings in
+	// the platform.AddressSpace cause MMap() to fail. (If PlatformEffect is
+	// PlatformEffectDefault, RequirePlatformEffect is ignored.)
+	RequirePlatformEffect bool
+
 	// SentryOwnedContent indicates the sentry exclusively controls the
 	// underlying memory backing the mapping thus the memory content is
 	// guaranteed not to be modified outside the sentry's purview.
 	SentryOwnedContent bool
 }
+
+// NameMut is the type of MMapOpts.NameMut.
+type NameMut uint8
+
+// Possible values for MMapOpts.NameMut:
+const (
+	// NameMutDisallowed indicates that PR_SET_VMA_ANON_NAME should fail.
+	NameMutDisallowed NameMut = iota
+
+	// NameMutAnon indicates that PR_SET_VMA_ANON_NAME should succeed, and
+	// treat the mapping as private anonymous memory.
+	NameMutAnon
+
+	// NameMutAnonShmem indicates that PR_SET_VMA_ANON_NAME should succeed, and
+	// treat the mapping as shared anonymous memory.
+	NameMutAnonShmem
+)
+
+// MMapPlatformEffect is the type of MMapOpts.PlatformEffect.
+type MMapPlatformEffect uint8
+
+// Possible values for MMapOpts.PlatformEffect:
+const (
+	// PlatformEffectDefault indicates that no specific behavior is requested
+	// from the platform.
+	PlatformEffectDefault MMapPlatformEffect = iota
+
+	// PlatformEffectPopulate indicates that platform mappings should be
+	// established for all pages in the mapping.
+	PlatformEffectPopulate
+
+	// PlatformEffectCommit is like PlatformEffectPopulate, but also requests
+	// that the platform eagerly commit resources to the mapping, as in
+	// platform.AddressSpace.MapFile(precommit=true).
+	PlatformEffectCommit
+)
 
 // File represents a host file that may be mapped into an platform.AddressSpace.
 type File interface {
@@ -419,11 +470,72 @@ type File interface {
 	// reference is held on the mapped pages.
 	MapInternal(fr FileRange, at hostarch.AccessType) (safemem.BlockSeq, error)
 
-	// FD returns the file descriptor represented by the File.
+	// DataFD blocks until offsets fr in the file contain valid data, then
+	// returns the file descriptor represented by the File.
 	//
-	// The only permitted operation on the returned file descriptor is to map
-	// pages from it consistent with the requirements of AddressSpace.MapFile.
+	// Note that fr.Start and fr.End need not be page-aligned.
+	//
+	// Preconditions:
+	//	* fr.Length() > 0.
+	//	* At least one reference must be held on all pages in fr.
+	DataFD(fr FileRange) (int, error)
+
+	// BufferReadAt reads len(dst) bytes from the file into dst, starting at
+	// file offset off. It returns the number of bytes read. Like
+	// io.ReaderAt.ReadAt(), it never returns a short read with a nil error.
+	//
+	// Implementations of File for which MapInternal() never returns
+	// BufferedIOFallbackErr can embed NoBufferedIOFallback to obtain an
+	// appropriate implementation of BufferReadAt.
+	//
+	// Preconditions:
+	//	* MapInternal() returned a BufferedIOFallbackErr.
+	//	* At least one reference must be held on all read pages.
+	BufferReadAt(off uint64, dst []byte) (uint64, error)
+
+	// BufferWriteAt writes len(src) bytes src to the file, starting at file
+	// offset off. It returns the number of bytes written. Like
+	// io.WriterAt.WriteAt(), it never returns a short write with a nil error.
+	//
+	// Implementations of File for which MapInternal() never returns
+	// BufferedIOFallbackErr can embed NoBufferedIOFallback to obtain an
+	// appropriate implementation of BufferWriteAt.
+	//
+	// Preconditions:
+	//	* MapInternal() returned a BufferedIOFallbackErr.
+	//	* At least one reference must be held on all written pages.
+	BufferWriteAt(off uint64, src []byte) (uint64, error)
+
+	// FD returns the file descriptor represented by the File. The returned
+	// file descriptor should not be used to implement
+	// platform.AddressSpace.MapFile, since the contents of the File may not be
+	// valid; use DataFD instead.
 	FD() int
+}
+
+// BufferedIOFallbackErr is returned (by value) by implementations of
+// File.MapInternal() that cannot succeed, but can still support memory-mapped
+// I/O by falling back to buffered reads and writes.
+type BufferedIOFallbackErr struct{}
+
+// Error implements error.Error.
+func (BufferedIOFallbackErr) Error() string {
+	return "memmap.File.MapInternal() is unsupported, fall back to buffered R/W for internally-mapped I/O"
+}
+
+// NoBufferedIOFallback implements File.BufferReadAt() and BufferWriteAt() for
+// implementations of File for which MapInternal() never returns
+// BufferedIOFallbackErr.
+type NoBufferedIOFallback struct{}
+
+// BufferReadAt implements File.BufferReadAt.
+func (NoBufferedIOFallback) BufferReadAt(off uint64, dst []byte) (uint64, error) {
+	panic("unimplemented: memmap.File.MapInternal() should not have returned BufferedIOFallbackErr")
+}
+
+// BufferWriteAt implements File.BufferWriteAt.
+func (NoBufferedIOFallback) BufferWriteAt(off uint64, src []byte) (uint64, error) {
+	panic("unimplemented: memmap.File.MapInternal() should not have returned BufferedIOFallbackErr")
 }
 
 // FileRange represents a range of uint64 offsets into a File.

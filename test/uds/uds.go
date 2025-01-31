@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
@@ -44,10 +43,8 @@ func doEcho(s *unet.Socket) error {
 	return nil
 }
 
-// createEchoSocket creates a socket that echoes back anything received.
-//
-// Only works for stream, seqpacket sockets.
-func createEchoSocket(path string, protocol int) (cleanup func(), err error) {
+// createEchoServer creates a socket that echoes back anything received.
+func createEchoServer(path string, protocol int) (cleanup func(), err error) {
 	fd, err := unix.Socket(unix.AF_UNIX, protocol, 0)
 	if err != nil {
 		return nil, fmt.Errorf("error creating echo(%d) socket: %v", protocol, err)
@@ -101,8 +98,8 @@ func createEchoSocket(path string, protocol int) (cleanup func(), err error) {
 	return cleanup, nil
 }
 
-// connectAndBecomeEcho connects to the given socket and turns into an echo server.
-func connectAndBecomeEcho(path string, protocol int) (cleanup func(), err error) {
+// createEchoClient connects to the given socket and turns into an echo client.
+func createEchoClient(path string, protocol int) (cleanup func(), err error) {
 	usePacket := protocol == unix.SOCK_SEQPACKET
 	go func() {
 		for {
@@ -115,7 +112,7 @@ func connectAndBecomeEcho(path string, protocol int) (cleanup func(), err error)
 			}
 			defer sock.Close()
 			for {
-				log.Infof("Connected to UDS at %q, running echo server", path)
+				log.Infof("Connected to UDS at %q, running echo client", path)
 				if err := doEcho(sock); err != nil {
 					return
 				}
@@ -294,7 +291,7 @@ type socketCreatorSpec struct {
 // createSocketTree creates a local tree of unix domain sockets for use in
 // testing as per specs.
 func createSocketTree(baseDir string, specs []socketCreatorSpec) (string, func(), error) {
-	dir, err := ioutil.TempDir(baseDir, "sockets")
+	dir, err := os.MkdirTemp(baseDir, "sockets")
 	if err != nil {
 		return "", nil, fmt.Errorf("error creating temp dir: %v", err)
 	}
@@ -337,7 +334,7 @@ func CreateBoundUDSTree(baseDir string) (string, func(), error) {
 			protocol: unix.SOCK_STREAM,
 			name:     "stream",
 			sockets: map[string]socketCreator{
-				"echo":         createEchoSocket,
+				"echo":         createEchoServer,
 				"nonlistening": createNonListeningSocket,
 			},
 		},
@@ -345,7 +342,7 @@ func CreateBoundUDSTree(baseDir string) (string, func(), error) {
 			protocol: unix.SOCK_SEQPACKET,
 			name:     "seqpacket",
 			sockets: map[string]socketCreator{
-				"echo":         createEchoSocket,
+				"echo":         createEchoServer,
 				"nonlistening": createNonListeningSocket,
 			},
 		},
@@ -360,24 +357,26 @@ func CreateBoundUDSTree(baseDir string) (string, func(), error) {
 }
 
 // CreateSocketConnectors creates goroutines that will attempt to connect to
-// sockets at the following locations, and turn into an echo server once
+// sockets at the following locations, and turn into an echo client once
 // connected:
-//   - /stream/created-in-sandbox
-//   - /seqpacket/created-in-sandbox
+//   - /stream/created-in-sandbox{-epoll}
+//   - /seqpacket/created-in-sandbox{-epoll}
 func CreateSocketConnectors(baseDir string) (string, func(), error) {
 	return createSocketTree(baseDir, []socketCreatorSpec{
 		{
 			protocol: unix.SOCK_STREAM,
 			name:     "stream",
 			sockets: map[string]socketCreator{
-				"created-in-sandbox": connectAndBecomeEcho,
+				"created-in-sandbox":       createEchoClient,
+				"created-in-sandbox-epoll": createEchoClient,
 			},
 		},
 		{
 			protocol: unix.SOCK_SEQPACKET,
 			name:     "seqpacket",
 			sockets: map[string]socketCreator{
-				"created-in-sandbox": connectAndBecomeEcho,
+				"created-in-sandbox":       createEchoClient,
+				"created-in-sandbox-epoll": createEchoClient,
 			},
 		},
 	})
@@ -390,7 +389,7 @@ type pipeCreator func(path string) (cleanup func(), err error)
 //   - /in
 //   - /out
 func CreateFifoTree(baseDir string) (string, func(), error) {
-	dir, err := ioutil.TempDir(baseDir, "pipes")
+	dir, err := os.MkdirTemp(baseDir, "pipes")
 	if err != nil {
 		return "", nil, fmt.Errorf("error creating temp dir: %v", err)
 	}

@@ -15,11 +15,15 @@
 package gofer
 
 import (
+	"fmt"
+
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fsutil"
+	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -147,6 +151,30 @@ func (d *dentry) updateHandles(ctx context.Context, h handle, readable, writable
 	}
 }
 
+// Preconditions:
+//   - d.handleMu must be locked.
+//   - !d.isSynthetic().
+func (d *dentry) closeHostFDs() {
+	// We can use RacyLoad() because d.handleMu is locked.
+	if d.readFD.RacyLoad() >= 0 {
+		_ = unix.Close(int(d.readFD.RacyLoad()))
+	}
+	if d.writeFD.RacyLoad() >= 0 && d.readFD.RacyLoad() != d.writeFD.RacyLoad() {
+		_ = unix.Close(int(d.writeFD.RacyLoad()))
+	}
+	d.readFD = atomicbitops.FromInt32(-1)
+	d.writeFD = atomicbitops.FromInt32(-1)
+	d.mmapFD = atomicbitops.FromInt32(-1)
+
+	switch dt := d.impl.(type) {
+	case *directfsDentry:
+		if dt.controlFD >= 0 {
+			_ = unix.Close(dt.controlFD)
+			dt.controlFD = -1
+		}
+	}
+}
+
 // updateMetadataLocked updates the dentry's metadata fields. The h parameter
 // is optional. If it is not provided, an appropriate FD should be chosen to
 // stat the remote file.
@@ -213,6 +241,7 @@ func (d *dentry) setStatLocked(ctx context.Context, stat *linux.Statx) (uint32, 
 	}
 }
 
+// Precondition: d.handleMu must be locked.
 func (d *dentry) destroyImpl(ctx context.Context) {
 	switch dt := d.impl.(type) {
 	case *lisafsDentry:
@@ -280,8 +309,7 @@ func (d *dentry) getXattrImpl(ctx context.Context, opts *vfs.GetXattrOptions) (s
 	case *lisafsDentry:
 		return dt.controlFD.GetXattr(ctx, opts.Name, opts.Size)
 	case *directfsDentry:
-		// Consistent with runsc/fsgofer.
-		return "", linuxerr.EOPNOTSUPP
+		return dt.getXattr(ctx, opts.Name, opts.Size)
 	default:
 		panic("unknown dentry implementation")
 	}
@@ -327,6 +355,7 @@ func (d *dentry) mknod(ctx context.Context, name string, creds *auth.Credentials
 
 // Preconditions:
 //   - !d.isSynthetic().
+//   - !target.isSynthetic().
 //   - d.fs.renameMu must be locked.
 func (d *dentry) link(ctx context.Context, target *dentry, name string) (*dentry, error) {
 	switch dt := d.impl.(type) {
@@ -423,11 +452,18 @@ func (d *dentry) allocate(ctx context.Context, mode, offset, length uint64) erro
 //   - !d.isSynthetic().
 //   - fs.renameMu is locked.
 func (d *dentry) connect(ctx context.Context, sockType linux.SockType) (int, error) {
+	creds := auth.CredentialsOrNilFromContext(ctx)
+	euid := lisafs.NoUID
+	egid := lisafs.NoGID
+	if creds != nil {
+		euid = lisafs.UID(creds.EffectiveKUID)
+		egid = lisafs.GID(creds.EffectiveKGID)
+	}
 	switch dt := d.impl.(type) {
 	case *lisafsDentry:
-		return dt.controlFD.Connect(ctx, sockType)
+		return dt.controlFD.Connect(ctx, sockType, euid, egid)
 	case *directfsDentry:
-		return dt.connect(ctx, sockType)
+		return dt.connect(ctx, sockType, euid, egid)
 	default:
 		panic("unknown dentry implementation")
 	}
@@ -484,7 +520,7 @@ func (d *dentry) statfs(ctx context.Context) (linux.Statfs, error) {
 func (fs *filesystem) restoreRoot(ctx context.Context, opts *vfs.CompleteRestoreOptions) error {
 	rootInode, rootHostFD, err := fs.initClientAndGetRoot(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to initialize client and get root: %w", err)
 	}
 
 	// The root is always non-synthetic.
@@ -505,19 +541,49 @@ func (fs *filesystem) restoreRoot(ctx context.Context, opts *vfs.CompleteRestore
 func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptions) error {
 	switch dt := d.impl.(type) {
 	case *lisafsDentry:
-		inode, err := d.parent.impl.(*lisafsDentry).controlFD.Walk(ctx, d.name)
+		controlFD := d.parent.Load().impl.(*lisafsDentry).controlFD
+		inode, err := controlFD.Walk(ctx, d.name)
 		if err != nil {
-			return err
+			if !dt.isDir() || !dt.forMountpoint {
+				return fmt.Errorf("failed to walk %q of type %x: %w", genericDebugPathname(d.fs, d), dt.fileType(), err)
+			}
+
+			// Recreate directories that were created during volume mounting, since
+			// during restore we don't attempt to remount them.
+			inode, err = controlFD.MkdirAt(ctx, d.name, linux.FileMode(d.mode.Load()), lisafs.UID(d.uid.Load()), lisafs.GID(d.gid.Load()))
+			if err != nil {
+				return fmt.Errorf("failed to create mountpoint directory at %q: %w", genericDebugPathname(d.fs, d), err)
+			}
 		}
 		return dt.restoreFile(ctx, &inode, opts)
+
 	case *directfsDentry:
+		controlFD := d.parent.Load().impl.(*directfsDentry).controlFD
 		childFD, err := tryOpen(func(flags int) (int, error) {
-			return unix.Openat(d.parent.impl.(*directfsDentry).controlFD, d.name, flags, 0)
+			n, err := unix.Openat(controlFD, d.name, flags, 0)
+			return n, err
 		})
 		if err != nil {
-			return err
+			if !dt.isDir() || !dt.forMountpoint {
+				return fmt.Errorf("failed to walk %q of type %x: %w", genericDebugPathname(d.fs, d), dt.fileType(), err)
+			}
+
+			// Recreate directories that were created during volume mounting, since
+			// during restore we don't attempt to remount them.
+			if err := unix.Mkdirat(controlFD, d.name, d.mode.Load()); err != nil {
+				return fmt.Errorf("failed to create mountpoint directory at %q: %w", genericDebugPathname(d.fs, d), err)
+			}
+
+			// Try again...
+			childFD, err = tryOpen(func(flags int) (int, error) {
+				return unix.Openat(controlFD, d.name, flags, 0)
+			})
+			if err != nil {
+				return fmt.Errorf("failed to open %q: %w", genericDebugPathname(d.fs, d), err)
+			}
 		}
 		return dt.restoreFile(ctx, childFD, opts)
+
 	default:
 		panic("unknown dentry implementation")
 	}

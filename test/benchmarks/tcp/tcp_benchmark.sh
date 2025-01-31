@@ -34,6 +34,7 @@ iperf_version_arg=
 # various changes in the kind of link available.
 client=false
 server=false
+linux_client=false
 verbose=false
 gso=0
 swgso=false
@@ -47,7 +48,7 @@ helper_dir="$(dirname "$0")"
 netstack_opts=
 disable_linux_gso=
 disable_linux_gro=
-gro=0
+gro=false
 num_client_threads=1
 sniff=false
 xdp=false
@@ -70,6 +71,9 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --client)
       client=true
+      ;;
+    --linux-client)
+      linux_client=true
       ;;
     --client_tcp_probe_file)
       shift
@@ -173,9 +177,7 @@ while [[ $# -gt 0 ]]; do
       disable_linux_gro=1
       ;;
     --gro)
-      shift
-      [[ "$#" -le 0 ]] && echo "no GRO timeout provided" && exit 1
-      gro=$1
+      gro=true
       ;;
     --ipv6)
       client_addr=fd::1
@@ -218,6 +220,7 @@ while [[ $# -gt 0 ]]; do
       echo " --help                show this message"
       echo " --verbose             verbose output"
       echo " --client              use netstack as the client"
+      echo " --linux-client        print client stats in linux case"
       echo " --ideal               reset all network emulation"
       echo " --server              use netstack as the server"
       echo " --mtu                 set the mtu (bytes)"
@@ -234,7 +237,7 @@ while [[ $# -gt 0 ]]; do
       echo " --num-client-threads  number of parallel client threads to run"
       echo " --disable-linux-gso   disable segmentation offload (TSO, GSO, GRO) in the Linux network stack"
       echo " --disable-linux-gro   disable GRO in the Linux network stack"
-      echo " --gro                 set gVisor GRO timeout"
+      echo " --gro                 enable gVisor GRO"
       echo " --ipv6                use ipv6 for benchmarks"
       echo " --iperf-binary        name of the iperf binary to call"
       echo " --sniff               sniff and output packet logs"
@@ -486,8 +489,10 @@ fi
 
 if ${client}; then
   echo "BenchmarkTCP/role=client/host-gso=\$hostgso/host-gro=\$hostgro 1 \$mbits Mb/s \$client_cpu_load cpu-time"
-elif ${server}; then
-  echo "BenchmarkTCP/role=server/host-gso=\$hostgso/host-gro=\$hostgro 1 \$mbits Mb/s \$server_cpu_load cpu-time"
+  exit 0
+elif ${linux_client}; then
+  echo "BenchmarkTCP/role=client/host-gso=\$hostgso/host-gro=\$hostgro 1 \$mbits Mb/s \$client_cpu_load cpu-time"
+  exit 0
 fi
-
+echo "BenchmarkTCP/role=server/host-gso=\$hostgso/host-gro=\$hostgro 1 \$mbits Mb/s \$server_cpu_load cpu-time"
 EOF

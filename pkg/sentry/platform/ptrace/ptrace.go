@@ -45,10 +45,9 @@
 package ptrace
 
 import (
-	"os"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -262,21 +261,18 @@ func (p *PTrace) NewAddressSpace(any) (platform.AddressSpace, <-chan struct{}, e
 
 type constructor struct{}
 
-func (*constructor) New(*os.File) (platform.Platform, error) {
+func (*constructor) New(*fd.FD) (platform.Platform, error) {
 	return New()
 }
 
-func (*constructor) OpenDevice(_ string) (*os.File, error) {
+func (*constructor) OpenDevice(_ string) (*fd.FD, error) {
 	return nil, nil
 }
 
 // Flags implements platform.Constructor.Flags().
 func (*constructor) Requirements() platform.Requirements {
-	// TODO(b/75837838): Also set a new PID namespace so that we limit
-	// access to other host processes.
 	return platform.Requirements{
 		RequiresCapSysPtrace: true,
-		RequiresCurrentPIDNS: true,
 	}
 }
 

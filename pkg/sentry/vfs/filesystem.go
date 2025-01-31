@@ -365,6 +365,10 @@ type FilesystemImpl interface {
 	SetStatAt(ctx context.Context, rp *ResolvingPath, opts SetStatOptions) error
 
 	// StatAt returns metadata for the file at rp.
+	//
+	// If rp.Done() (i.e. rp refers to the dentry rp.Start()) and opts.Sync ==
+	// linux.AT_STATX_DONT_SYNC, StatAt cannot take locks preceding
+	// memmap.MappingIdentity locks.
 	StatAt(ctx context.Context, rp *ResolvingPath, opts StatOptions) (linux.Statx, error)
 
 	// StatFSAt returns metadata for the filesystem containing the file at rp.
@@ -496,12 +500,18 @@ type FilesystemImpl interface {
 	// an arbitrary descriptive string to b and then return a
 	// PrependPathSyntheticError.
 	//
-	// Most implementations can acquire the appropriate locks to ensure that
-	// Dentry.Name() and Dentry.Parent() are fixed for vd.Dentry() and all of
-	// its ancestors, then call GenericPrependPath.
+	// Most implementations can use genericfstree.PrependPath.
 	//
 	// Preconditions: vd.Mount().Filesystem().Impl() == this FilesystemImpl.
 	PrependPath(ctx context.Context, vfsroot, vd VirtualDentry, b *fspath.Builder) error
+
+	// IsDescendant returns true if vd is a descendant of vfsroot or if vd and
+	// vfsroot are the same dentry.
+	//
+	// Most implementations can use genericfstree.IsDescendant.
+	//
+	// Preconditions: vd.Mount().Filesystem().Impl() == this FilesystemImpl.
+	IsDescendant(vfsroot, vd VirtualDentry) bool
 
 	// MountOptions returns mount options for the current filesystem. This
 	// should only return options specific to the filesystem (i.e. don't return

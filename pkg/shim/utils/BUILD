@@ -13,10 +13,12 @@ go_library(
         "volumes.go",
     ],
     visibility = [
-        "//pkg/shim:__subpackages__",
-        "//shim:__subpackages__",
+        "//visibility:public",
     ],
-    deps = ["@com_github_opencontainers_runtime_spec//specs-go:go_default_library"],
+    deps = [
+        "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+    ],
 )
 
 go_test(

@@ -20,7 +20,6 @@ import (
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
@@ -46,13 +45,15 @@ var zeroMAC [6]byte
 type Device struct {
 	waiter.Queue
 
-	mu           sync.RWMutex `state:"nosave"`
+	mu           deviceRWMutex `state:"nosave"`
 	endpoint     *tunEndpoint
 	notifyHandle *channel.NotificationHandle
 	flags        Flags
 }
 
 // Flags set properties of a Device
+//
+// +stateify savable
 type Flags struct {
 	TUN          bool
 	TAP          bool
@@ -138,7 +139,7 @@ func attachOrCreateNIC(s *stack.Stack, name, prefix string, linkCaps stack.LinkE
 		}
 
 		// 2. Creating a new NIC.
-		id := tcpip.NICID(s.UniqueID())
+		id := s.NextNICID()
 		endpoint := &tunEndpoint{
 			Endpoint: channel.New(defaultDevOutQueueLen, defaultDevMtu, ""),
 			stack:    s,
@@ -166,7 +167,7 @@ func attachOrCreateNIC(s *stack.Stack, name, prefix string, linkCaps stack.LinkE
 	}
 }
 
-// MTU returns the tun enpoint MTU (maximum transmission unit).
+// MTU returns the tun endpoint MTU (maximum transmission unit).
 func (d *Device) MTU() (uint32, error) {
 	d.mu.RLock()
 	endpoint := d.endpoint
@@ -260,7 +261,7 @@ func (d *Device) Read() (*buffer.View, error) {
 	}
 
 	pkt := endpoint.Read()
-	if pkt.IsNil() {
+	if pkt == nil {
 		return nil, linuxerr.ErrWouldBlock
 	}
 	v := d.encodePkt(pkt)
@@ -269,7 +270,7 @@ func (d *Device) Read() (*buffer.View, error) {
 }
 
 // encodePkt encodes packet for fd side.
-func (d *Device) encodePkt(pkt stack.PacketBufferPtr) *buffer.View {
+func (d *Device) encodePkt(pkt *stack.PacketBuffer) *buffer.View {
 	var view *buffer.View
 
 	// Packet information.
@@ -330,6 +331,8 @@ func (d *Device) WriteNotify() {
 //
 // It is ref-counted as multiple opening files can attach to the same NIC.
 // The last owner is responsible for deleting the NIC.
+//
+// +stateify savable
 type tunEndpoint struct {
 	tunEndpointRefs
 	*channel.Endpoint
@@ -357,7 +360,7 @@ func (e *tunEndpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (e *tunEndpoint) AddHeader(pkt stack.PacketBufferPtr) {
+func (e *tunEndpoint) AddHeader(pkt *stack.PacketBuffer) {
 	if !e.isTap {
 		return
 	}

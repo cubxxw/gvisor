@@ -74,21 +74,37 @@ var (
 	// WeirdnessMetric is a metric with fields created to track the number
 	// of weird occurrences such as time fallback, partial_result, vsyscall
 	// count, watchdog startup timeouts and stuck tasks.
-	WeirdnessMetric = MustCreateNewUint64Metric("/weirdness", true /* sync */, "Increment for weird occurrences of problems such as time fallback, partial result, vsyscalls invoked in the sandbox, watchdog startup timeouts and stuck tasks.",
-		NewField("weirdness_type",
-			&WeirdnessTypeTimeFallback,
-			&WeirdnessTypePartialResult,
-			&WeirdnessTypeVsyscallCount,
-			&WeirdnessTypeWatchdogStuckStartup,
-			&WeirdnessTypeWatchdogStuckTasks,
-		))
+	WeirdnessMetric = MustCreateNewUint64Metric(
+		"/weirdness",
+		Uint64Metadata{
+			Cumulative:  true,
+			Sync:        true,
+			Description: "Increment for weird occurrences of problems such as time fallback, partial result, vsyscalls invoked in the sandbox, watchdog startup timeouts and stuck tasks.",
+			Fields: []Field{
+				NewField("weirdness_type",
+					&WeirdnessTypeTimeFallback,
+					&WeirdnessTypePartialResult,
+					&WeirdnessTypeVsyscallCount,
+					&WeirdnessTypeWatchdogStuckStartup,
+					&WeirdnessTypeWatchdogStuckTasks,
+				),
+			},
+		})
 
 	// SuspiciousOperationsMetric is a metric with fields created to detect
 	// operations such as opening an executable file to write from a gofer.
-	SuspiciousOperationsMetric = MustCreateNewUint64Metric("/suspicious_operations", true /* sync */, "Increment for suspicious operations such as opening an executable file to write from a gofer.",
-		NewField("operation_type",
-			&SuspiciousOperationsTypeOpenedWriteExecuteFile,
-		))
+	SuspiciousOperationsMetric = MustCreateNewUint64Metric(
+		"/suspicious_operations",
+		Uint64Metadata{
+			Cumulative:  true,
+			Sync:        true,
+			Description: "Increment for suspicious operations such as opening an executable file to write from a gofer.",
+			Fields: []Field{
+				NewField("operation_type",
+					&SuspiciousOperationsTypeOpenedWriteExecuteFile,
+				),
+			},
+		})
 )
 
 // InitStage is the name of a Sentry initialization stage.
@@ -206,6 +222,15 @@ func Disable() error {
 	return nil
 }
 
+// Uint64Metadata is the metadata for a uint64 metric.
+type Uint64Metadata struct {
+	Cumulative  bool
+	Sync        bool
+	Unit        pb.MetricMetadata_Units
+	Description string
+	Fields      []Field
+}
+
 type customUint64Metric struct {
 	// metadata describes the metric. It is immutable.
 	metadata *pb.MetricMetadata
@@ -215,6 +240,10 @@ type customUint64Metric struct {
 
 	// fields is the set of fields of the metric.
 	fields []Field
+
+	// fieldMapper is used to generate index keys for the fields array (above)
+	// based on field value combinations, and vice-versa.
+	fieldMapper fieldMapper
 
 	// value returns the current value of the metric for the given set of
 	// fields. It takes a variadic number of field values as argument.
@@ -373,8 +402,6 @@ func (m fieldMapper) lookupSingle(fieldIndex int, fieldValue *FieldValue, idx, r
 		panic("invalid field value or did not reuse the same FieldValue pointer as passed in NewField")
 	}
 
-	// Use map lookup instead.
-
 	// Match using FieldValue pointer.
 	// This avoids the string hashing step that string maps otherwise do.
 	valIdx, found := field.valuesPtrMap[fieldValue]
@@ -510,7 +537,7 @@ func verifyName(name string) error {
 //   - name must be globally unique.
 //   - Initialize/Disable have not been called.
 //   - value is expected to accept exactly len(fields) arguments.
-func RegisterCustomUint64Metric(name string, cumulative, sync bool, units pb.MetricMetadata_Units, description string, value func(...*FieldValue) uint64, fields ...Field) error {
+func RegisterCustomUint64Metric(name string, metadata Uint64Metadata, value func(...*FieldValue) uint64) error {
 	if initialized.Load() {
 		return ErrInitializationDone
 	}
@@ -523,35 +550,35 @@ func RegisterCustomUint64Metric(name string, cumulative, sync bool, units pb.Met
 	}
 
 	promType := prometheus.TypeGauge
-	if cumulative {
+	if metadata.Cumulative {
 		promType = prometheus.TypeCounter
+	}
+
+	fm, err := newFieldMapper(metadata.Fields...)
+	if err != nil {
+		return fmt.Errorf("invalid fields: %w", err)
 	}
 
 	allMetrics.uint64Metrics[name] = customUint64Metric{
 		metadata: &pb.MetricMetadata{
 			Name:           name,
 			PrometheusName: nameToPrometheusName(name),
-			Description:    description,
-			Cumulative:     cumulative,
-			Sync:           sync,
+			Description:    metadata.Description,
+			Cumulative:     metadata.Cumulative,
+			Sync:           metadata.Sync,
 			Type:           pb.MetricMetadata_TYPE_UINT64,
-			Units:          units,
+			Units:          metadata.Unit,
 		},
 		prometheusMetric: &prometheus.Metric{
 			Name: nameToPrometheusName(name),
-			Help: description,
+			Help: metadata.Description,
 			Type: promType,
 		},
-		fields: fields,
-		value:  value,
+		fields:      metadata.Fields,
+		fieldMapper: fm,
+		value:       value,
 	}
-
-	// Metrics can exist without fields.
-	if l := len(fields); l > 1 {
-		return fmt.Errorf("%d fields provided, must be <= 1", l)
-	}
-
-	for _, field := range fields {
+	for _, field := range metadata.Fields {
 		allMetrics.uint64Metrics[name].metadata.Fields = append(allMetrics.uint64Metrics[name].metadata.Fields, field.toProto())
 	}
 	return nil
@@ -559,8 +586,8 @@ func RegisterCustomUint64Metric(name string, cumulative, sync bool, units pb.Met
 
 // MustRegisterCustomUint64Metric calls RegisterCustomUint64Metric for metrics
 // without fields and panics if it returns an error.
-func MustRegisterCustomUint64Metric(name string, cumulative, sync bool, description string, value func(...*FieldValue) uint64, fields ...Field) {
-	if err := RegisterCustomUint64Metric(name, cumulative, sync, pb.MetricMetadata_UNITS_NONE, description, value, fields...); err != nil {
+func MustRegisterCustomUint64Metric(name string, metadata Uint64Metadata, value func(...*FieldValue) uint64) {
+	if err := RegisterCustomUint64Metric(name, metadata, value); err != nil {
 		panic(fmt.Sprintf("Unable to register metric %q: %s", name, err))
 	}
 }
@@ -569,42 +596,26 @@ func MustRegisterCustomUint64Metric(name string, cumulative, sync bool, descript
 // name.
 //
 // Metrics must be statically defined (i.e., at init).
-func NewUint64Metric(name string, sync bool, units pb.MetricMetadata_Units, description string, fields ...Field) (*Uint64Metric, error) {
+func NewUint64Metric(name string, metadata Uint64Metadata) (*Uint64Metric, error) {
 	if err := verifyName(name); err != nil {
 		return nil, err
 	}
-	f, err := newFieldMapper(fields...)
-	if err != nil {
-		return nil, err
-	}
-	m := Uint64Metric{
-		name:        name,
-		fieldMapper: f,
-		fields:      make([]atomicbitops.Uint64, f.numKeys()),
-	}
-	if err := RegisterCustomUint64Metric(name, true /* cumulative */, sync, units, description, m.Value, fields...); err != nil {
+	m := Uint64Metric{name: name}
+	if err := RegisterCustomUint64Metric(name, metadata, m.Value); err != nil {
 		return nil, err
 	}
 	cm := allMetrics.uint64Metrics[name]
 	cm.forEachNonZero = m.forEachNonZero
+	m.fieldMapper = cm.fieldMapper
+	m.fields = make([]atomicbitops.Uint64, cm.fieldMapper.numKeys())
 	allMetrics.uint64Metrics[name] = cm
 	return &m, nil
 }
 
 // MustCreateNewUint64Metric calls NewUint64Metric and panics if it returns
 // an error.
-func MustCreateNewUint64Metric(name string, sync bool, description string, fields ...Field) *Uint64Metric {
-	m, err := NewUint64Metric(name, sync, pb.MetricMetadata_UNITS_NONE, description, fields...)
-	if err != nil {
-		panic(fmt.Sprintf("Unable to create metric %q: %s", name, err))
-	}
-	return m
-}
-
-// MustCreateNewUint64NanosecondsMetric calls NewUint64Metric and panics if it
-// returns an error.
-func MustCreateNewUint64NanosecondsMetric(name string, sync bool, description string) *Uint64Metric {
-	m, err := NewUint64Metric(name, sync, pb.MetricMetadata_UNITS_NANOSECONDS, description)
+func MustCreateNewUint64Metric(name string, metadata Uint64Metadata) *Uint64Metric {
+	m, err := NewUint64Metric(name, metadata)
 	if err != nil {
 		panic(fmt.Sprintf("Unable to create metric %q: %s", name, err))
 	}
@@ -646,22 +657,40 @@ func (m *Uint64Metric) forEachNonZero(f func(fieldValues []*FieldValue, value ui
 	}
 }
 
-// Increment increments the metric field by 1.
+// Increment increments the metric by 1.
 // This must be called with the correct number of field values or it will panic.
 //
 //go:nosplit
 func (m *Uint64Metric) Increment(fieldValues ...*FieldValue) {
-	key := m.fieldMapper.lookupConcat(fieldValues, nil)
-	m.fields[key].Add(1)
+	m.IncrementBy(1, fieldValues...)
+}
+
+// Decrement decrements the metric by 1.
+// This must be called with the correct number of field values or it will panic.
+//
+//go:nosplit
+func (m *Uint64Metric) Decrement(fieldValues ...*FieldValue) {
+	m.IncrementBy(0xFFFFFFFFFFFFFFFF, fieldValues...)
 }
 
 // IncrementBy increments the metric by v.
+// It is also possible to use this function to decrement the metric by using
+// a two's-complement int64 representation of the negative number to add.
 // This must be called with the correct number of field values or it will panic.
 //
 //go:nosplit
 func (m *Uint64Metric) IncrementBy(v uint64, fieldValues ...*FieldValue) {
 	key := m.fieldMapper.lookupConcat(fieldValues, nil)
 	m.fields[key].Add(v)
+}
+
+// Set sets the metric to v.
+// This must be called with the correct number of field values or it will panic.
+//
+//go:nosplit
+func (m *Uint64Metric) Set(v uint64, fieldValues ...*FieldValue) {
+	key := m.fieldMapper.lookupConcat(fieldValues, nil)
+	m.fields[key].Store(v)
 }
 
 // Bucketer is an interface to bucket values into finite, distinct buckets.
@@ -1217,25 +1246,30 @@ func (m *metricSet) Values() metricValues {
 		distributionStatistics:   make(map[string][]distributionStatisticsSnapshot, len(m.distributionMetrics)),
 		stages:                   stages,
 	}
+	var tmpFieldValues []*FieldValue
 	for k, v := range m.uint64Metrics {
 		fields := v.fields
 		switch len(fields) {
 		case 0:
 			vals.uint64Metrics[k] = v.value()
-		case 1:
-			fieldsMap := make(map[*FieldValue]uint64)
+		default:
+			numFieldCombinations := v.fieldMapper.numKeys()
+			perFieldKeyVals := make([]uint64, numFieldCombinations)
 			if v.forEachNonZero != nil {
 				v.forEachNonZero(func(fieldValues []*FieldValue, val uint64) {
-					fieldsMap[fieldValues[0]] = val
+					perFieldKeyVals[v.fieldMapper.lookup(fieldValues...)] = val
 				})
 			} else {
-				for _, fieldValue := range fields[0].values {
-					fieldsMap[fieldValue] = v.value(fieldValue)
+				if len(tmpFieldValues) < len(v.fields) {
+					tmpFieldValues = make([]*FieldValue, len(v.fields))
+				}
+				fieldValues := tmpFieldValues[:len(v.fields)]
+				for fieldKey := 0; fieldKey < numFieldCombinations; fieldKey++ {
+					v.fieldMapper.keyToMultiFieldInPlace(fieldKey, fieldValues)
+					perFieldKeyVals[fieldKey] = v.value(fieldValues...)
 				}
 			}
-			vals.uint64Metrics[k] = fieldsMap
-		default:
-			panic(fmt.Sprintf("Unsupported number of metric fields: %d", len(fields)))
+			vals.uint64Metrics[k] = perFieldKeyVals
 		}
 	}
 	for name, metric := range m.distributionMetrics {
@@ -1271,8 +1305,9 @@ func (m *metricSet) Values() metricValues {
 // metricValues contains a copy of the values of all metrics.
 type metricValues struct {
 	// uint64Metrics is a map of uint64 metrics,
-	// with key as metric name. Value can be either uint64, or map[*FieldValue]uint64
-	// to support metrics with one field.
+	// with key as metric name. Value can be either uint64, or []uint64
+	// to support metrics with fields. The index corresponds to the field
+	// value combination key as managed by `fieldMapper`.
 	uint64Metrics map[string]any
 
 	// distributionMetrics is a map of distribution metrics.
@@ -1342,19 +1377,19 @@ func EmitMetricUpdate() {
 				Name:  k,
 				Value: &pb.MetricValue_Uint64Value{Uint64Value: t},
 			})
-		case map[*FieldValue]uint64:
-			for fieldValue, metricValue := range t {
+		case []uint64:
+			for fieldKey, metricValue := range t {
 				// Emit data on the first call only if the field
 				// value has been incremented. For all other
 				// calls, emit data if the field value has been
 				// changed from the previous emit.
-				if (!ok && metricValue == 0) || (ok && prev.(map[*FieldValue]uint64)[fieldValue] == metricValue) {
+				if (!ok && metricValue == 0) || (ok && prev.([]uint64)[fieldKey] == metricValue) {
 					continue
 				}
 
 				m.Metrics = append(m.Metrics, &pb.MetricValue{
 					Name:        k,
-					FieldValues: []string{fieldValue.Value},
+					FieldValues: allMetrics.uint64Metrics[k].fieldMapper.keyToMultiField(fieldKey),
 					Value:       &pb.MetricValue_Uint64Value{Uint64Value: metricValue},
 				})
 			}
@@ -1500,16 +1535,18 @@ func GetSnapshot(options SnapshotOptions) (*prometheus.Snapshot, error) {
 				continue
 			}
 			snapshot.Add(prometheus.NewIntData(m.prometheusMetric, int64(t)))
-		case map[*FieldValue]uint64:
-			for fieldValue, metricValue := range t {
+		case []uint64:
+			for fieldKey, metricValue := range t {
 				if m.metadata.GetCumulative() && metricValue == 0 {
 					// Zero-valued counter, ignore.
 					continue
 				}
-				snapshot.Add(prometheus.LabeledIntData(m.prometheusMetric, map[string]string{
-					// uint64 metrics currently only support at most one field name.
-					m.metadata.Fields[0].GetFieldName(): fieldValue.Value,
-				}, int64(metricValue)))
+				fieldValues := m.fieldMapper.keyToMultiField(fieldKey)
+				fieldKeysAndValues := make(map[string]string, len(fieldValues))
+				for i, field := range m.fields {
+					fieldKeysAndValues[field.name] = fieldValues[i]
+				}
+				snapshot.Add(prometheus.LabeledIntData(m.prometheusMetric, fieldKeysAndValues, int64(metricValue)))
 			}
 		default:
 			panic(fmt.Sprintf("unsupported type in uint64Metrics: %T (%v)", v, v))

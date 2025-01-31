@@ -328,6 +328,7 @@ const (
 
 // getKey returns a Key representing address addr in c.
 func getKey(t Target, addr hostarch.Addr, private bool) (Key, error) {
+	addr = hostarch.UntaggedUserAddr(addr)
 	// Ensure the address is aligned.
 	// It must be a DWORD boundary.
 	if addr&0x3 != 0 {
@@ -453,7 +454,8 @@ func (m *Manager) lockBuckets(k1, k2 *Key) (b1, b2, lockedFirst, lockedSecond *b
 		b1.mu.NestedLock(futexBucketLockB)
 		return b1, b2, b2, b1
 	}
-	return b1, b2, nil, nil // +checklocksforce
+	b1.mu.Lock()
+	return b1, b2, b1, nil // +checklocksforce
 }
 
 // unlockBuckets unlocks two buckets.
@@ -463,10 +465,7 @@ func (m *Manager) unlockBuckets(lockedFirst, lockedSecond *bucket) {
 	if lockedSecond != nil {
 		lockedSecond.mu.NestedUnlock(futexBucketLockB)
 	}
-	if lockedFirst != nil && lockedFirst != lockedSecond {
-		lockedFirst.mu.Unlock()
-	}
-	return
+	lockedFirst.mu.Unlock()
 }
 
 // Wake wakes up to n waiters matching the bitmask on the given addr.

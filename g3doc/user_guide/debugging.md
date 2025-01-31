@@ -65,7 +65,7 @@ Install a runsc with debug symbols (you can also use the
 [nightly release](../install/#nightly)):
 
 ```bash
-make dev BAZEL_OPTIONS="-c dbg"
+make dev BAZEL_OPTIONS="-c dbg --define gotags=debug"
 ```
 
 Start the container you want to debug using the runsc runtime with debug
@@ -84,7 +84,7 @@ sudo dlv attach $(docker inspect test | grep Pid | head -n 1 | grep -oe "[0-9]*"
 Set a breakpoint for accept:
 
 ```bash
-break gvisor.dev/gvisor/pkg/sentry/socket/netstack.(*SocketOperations).Accept
+break gvisor.dev/gvisor/pkg/sentry/socket/netstack.(*sock).Accept
 continue
 ```
 
@@ -92,6 +92,32 @@ In a different window connect to nginx to trigger the breakpoint:
 
 ```bash
 curl http://localhost:8080/
+```
+
+It's also easy to attach a debugger to one of the predefined syscall tests when
+you're working on specific gVisor features. With the `delay-for-debugger` flag
+you can pause the test runner before execution so that you can attach the
+sandbox process to a debugger. Here is an example:
+
+```bash
+ make test BAZEL_OPTIONS="-c dbg --define gotags=debug" \
+ OPTIONS="--test_arg=--delay-for-debugger=5m --test_output=streamed" \
+ TARGETS=//test/syscalls:mount_test_runsc_systrap
+```
+
+The `delay-for-debugger=5m` flag means the test runner will pause for 5 minutes
+before running the test. To attach to the sandbox process, you can run the
+following in a separate window.
+
+```bash
+dlv attach $(ps aux | grep -m 1 -e 'runsc-sandbox' | awk '{print $2}')
+```
+
+Once you've attached to the process and set a breakpoint, you can signal the
+test to start by running the following in another separate window.
+
+```bash
+kill -SIGUSR1 $(ps aux | grep -m 1 -e 'bash.*test/syscalls' | awk '{print $2}')
 ```
 
 ## Profiling
@@ -118,11 +144,10 @@ line options before starting the container:
 
 Then restart docker to refresh the runtime options. While the container is
 running, execute `runsc debug` to collect profile information and save to a
-file. Here are the options available:
+file. These are a couple of the options available:
 
-*   **--profile-heap:** Generates heap profile to the speficied file.
-*   **--profile-cpu:** Enables CPU profiler, waits for `--duration` seconds and
-    generates CPU profile to the speficied file.
+*   **--profile-heap:** Writes heap profile to the given file.
+*   **--profile-cpu:** Writes CPU profile to the given file.
 
 For example:
 

@@ -12,14 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <errno.h>
 #include <fcntl.h>
 #include <linux/capability.h>
 #include <linux/major.h>
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/poll.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
@@ -27,20 +31,28 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include <csignal>
 #include <iostream>
+#include <string>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/base/macros.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "test/util/capability_util.h"
 #include "test/util/cleanup.h"
 #include "test/util/file_descriptor.h"
+#include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
+#include "test/util/logging.h"
+#include "test/util/mount_util.h"
+#include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/pty_util.h"
 #include "test/util/signal_util.h"
+#include "test/util/temp_path.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
 
@@ -70,6 +82,10 @@ constexpr int kPtmxMinor = 2;
 // have to wait.
 constexpr absl::Duration kTimeout = absl::Seconds(20);
 
+// Similar to kTimeout, but shorter: This timeout is used for tests where
+// the expected behavior is to observe a timeout, which helps speed up tests.
+constexpr absl::Duration kTimeoutShort = absl::Seconds(2);
+
 // The maximum line size in bytes returned per read from a pty file.
 constexpr int kMaxLineSize = 4096;
 
@@ -87,8 +103,8 @@ struct kernel_termios {
   cc_t c_cc[KERNEL_NCCS];
 };
 
-bool operator==(struct kernel_termios const& a,
-                struct kernel_termios const& b) {
+bool operator==(struct kernel_termios const &a,
+                struct kernel_termios const &b) {
   return memcmp(&a, &b, sizeof(a)) == 0;
 }
 
@@ -111,14 +127,14 @@ constexpr char FromControlCharacter(char c) { return c + 'A' - 1; }
 constexpr bool IsControlCharacter(char c) { return c <= 31; }
 
 struct Field {
-  const char* name;
+  const char *name;
   uint64_t mask;
   uint64_t value;
 };
 
 // ParseFields returns a string representation of value, using the names in
 // fields.
-std::string ParseFields(const Field* fields, size_t len, uint64_t value) {
+std::string ParseFields(const Field *fields, size_t len, uint64_t value) {
   bool first = true;
   std::string s;
   for (size_t i = 0; i < len; i++) {
@@ -282,7 +298,7 @@ std::string FormatCC(char c) {
   return absl::StrCat("\\x", absl::Hex(c));
 }
 
-std::ostream& operator<<(std::ostream& os, struct kernel_termios const& a) {
+std::ostream &operator<<(std::ostream &os, struct kernel_termios const &a) {
   os << "{ c_iflag = "
      << ParseFields(kIflagFields, ABSL_ARRAYSIZE(kIflagFields), a.c_iflag);
   os << ", c_oflag = "
@@ -346,7 +362,7 @@ struct kernel_termios DefaultTermios() {
 // Returns a partial read if some bytes were read.
 //
 // fd must be non-blocking.
-PosixErrorOr<size_t> PollAndReadFd(int fd, void* buf, size_t count,
+PosixErrorOr<size_t> PollAndReadFd(int fd, void *buf, size_t count,
                                    absl::Duration timeout) {
   absl::Time end = absl::Now() + timeout;
 
@@ -365,7 +381,7 @@ PosixErrorOr<size_t> PollAndReadFd(int fd, void* buf, size_t count,
     }
 
     ssize_t n =
-        ReadFd(fd, static_cast<char*>(buf) + completed, count - completed);
+        ReadFd(fd, static_cast<char *>(buf) + completed, count - completed);
     if (n < 0) {
       if (errno == EAGAIN) {
         // Linux sometimes returns EAGAIN from this read, despite the fact that
@@ -460,14 +476,14 @@ PosixErrorOr<int> WaitUntilReceived(int fd, int count) {
 }
 
 // Verifies that there is nothing left to read from fd.
-void ExpectFinished(const FileDescriptor& fd) {
+void ExpectFinished(const FileDescriptor &fd) {
   // Nothing more to read.
   char c;
   EXPECT_THAT(ReadFd(fd.get(), &c, 1), SyscallFailsWithErrno(EAGAIN));
 }
 
 // Verifies that we can read expected bytes from fd into buf.
-void ExpectReadable(const FileDescriptor& fd, int expected, char* buf) {
+void ExpectReadable(const FileDescriptor &fd, int expected, char *buf) {
   size_t n = ASSERT_NO_ERRNO_AND_VALUE(
       PollAndReadFd(fd.get(), buf, expected, kTimeout));
   EXPECT_EQ(expected, n);
@@ -585,6 +601,93 @@ TEST(BasicPtyTest, Getdents) {
   // their usage of the two modes.
 }
 
+TEST(BasicPtyTest, NewInstance) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("devpts_test", dir.path(), "devpts", 0, "newinstance", 0));
+  auto const dir2 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mount2 = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("devpts_test2", dir.path(), "devpts", 0, "newinstance", 0));
+
+  // Opening PTYs with O_TRUNC shouldn't cause an error, but calls to
+  // (f)truncate should.
+  FileDescriptor master = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(JoinPath(dir.path(), "ptmx"), O_RDWR | O_TRUNC));
+  int n = ASSERT_NO_ERRNO_AND_VALUE(ReplicaID(master));
+  std::string spath2 = absl::StrCat(dir2.path(), "/", n);
+  ASSERT_THAT(open(spath2.c_str(), O_RDWR), SyscallFailsWithErrno(ENOENT));
+  std::string spath = absl::StrCat(dir.path(), "/", n);
+  FileDescriptor replica =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(spath.c_str(), O_RDWR | O_NOCTTY));
+}
+
+TEST(BasicPtyTest, SetMode) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("devpts_test", dir.path(), "devpts", 0,
+            "newinstance,mode=0600,ptmxmode=0620", 0));
+  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(JoinPath(dir.path()), O_RDONLY | O_DIRECTORY));
+  mount.Release();
+
+  struct stat st;
+  ASSERT_THAT(fstat(fd.get(), &st), SyscallSucceeds());
+  EXPECT_EQ(st.st_mode, 0600 | S_IFDIR);
+  ASSERT_THAT(fstatat(fd.get(), "ptmx", &st, 0), SyscallSucceeds());
+  EXPECT_EQ(st.st_mode, 0620 | S_IFCHR);
+}
+
+TEST(BasicPtyTest, OpenDevTTY) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  // Run in forked process so we don't pollute the controlling terminal of the
+  // main test process, which other tests expect to be unset.
+  const auto rest = [&] {
+    // We must be session leader to set controlling terminal,
+    // which will be opened by /dev/tty.
+    setsid();
+
+    FileDescriptor master =
+        TEST_CHECK_NO_ERRNO_AND_VALUE(Open("/dev/ptmx", O_RDWR));
+
+    // Opening the replica without O_NOCTTY will set controlling terminal.
+    FileDescriptor replica =
+        TEST_CHECK_NO_ERRNO_AND_VALUE(OpenReplica(master, O_RDWR | O_NONBLOCK));
+
+    // Terminal now available at /dev/tty.
+    FileDescriptor devtty =
+        TEST_CHECK_NO_ERRNO_AND_VALUE(Open("/dev/tty", O_RDWR | O_NONBLOCK));
+  };
+
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
+}
+
+TEST(BasicPtyTest, OpenDevTTYNoCTTY) {
+  // Become session leader, otherwise we will never have hope of setting a
+  // controlling terminal. This test verifies that we fail to open /dev/tty for
+  // other (expected) reasons.
+  setsid();
+
+  // No controlling terminal, so can't open /dev/tty.
+  EXPECT_THAT(open("/dev/tty", O_RDWR | O_NONBLOCK),
+              SyscallFailsWithErrno(ENXIO));
+
+  // Open a master, but still no terminal available.
+  FileDescriptor master = ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/ptmx", O_RDWR));
+  EXPECT_THAT(open("/dev/tty", O_RDWR | O_NONBLOCK),
+              SyscallFailsWithErrno(ENXIO));
+
+  // Open terminal with NOCTTY. Still can't open /dev/tty.
+  FileDescriptor replica_noctty = ASSERT_NO_ERRNO_AND_VALUE(
+      OpenReplica(master, O_RDWR | O_NONBLOCK | O_NOCTTY));
+  EXPECT_THAT(open("/dev/tty", O_RDWR | O_NONBLOCK),
+              SyscallFailsWithErrno(ENXIO));
+}
+
 class PtyTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -606,10 +709,75 @@ class PtyTest : public ::testing::Test {
     EXPECT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
   }
 
+  // Writes master_input to the master file descriptor and verifies that
+  // the replica and the echo output match what is expected.
+  void TestCanonicalIO(const char *master_input,
+                       const char *expected_replica_output,
+                       const char *expected_echo_output) {
+    ASSERT_THAT(WriteFd(master_.get(), master_input, strlen(master_input)),
+                SyscallSucceedsWithValue(strlen(master_input)));
+
+    std::string buf(strlen(expected_replica_output), '\0');
+    ASSERT_NO_ERRNO(
+        WaitUntilReceived(replica_.get(), strlen(expected_replica_output)));
+    ExpectReadable(replica_, strlen(expected_replica_output), &buf[0]);
+    EXPECT_STREQ(buf.c_str(), expected_replica_output);
+
+    std::string echo_buf(strlen(expected_echo_output), '\0');
+    ExpectReadable(master_, strlen(expected_echo_output), &echo_buf[0]);
+    EXPECT_STREQ(echo_buf.c_str(), expected_echo_output);
+
+    ExpectFinished(master_);
+    ExpectFinished(replica_);
+  }
+
   // Master and replica ends of the PTY. Non-blocking.
   FileDescriptor master_;
   FileDescriptor replica_;
 };
+
+// NOTE(gvisor.dev/issue/9951): Regression test.
+TEST_F(PtyTest, ReplicaCloseNotify) {
+  // Open a second replica.
+  FileDescriptor replica2_ = ASSERT_NO_ERRNO_AND_VALUE(OpenReplica(master_));
+  fd_set read_set;
+  FD_ZERO(&read_set);
+  FD_SET(master_.get(), &read_set);
+  int max_fd = master_.get() + 1;
+
+  // Set timeout to 0.2 seconds.
+  struct timeval tv;
+  tv.tv_sec = 0;
+  tv.tv_usec = 200000;
+
+  // Ensure that there are no readable events.
+  FD_ZERO(&read_set);
+  FD_SET(master_.get(), &read_set);
+  EXPECT_THAT(select(max_fd, &read_set, NULL, NULL, &tv),
+              SyscallSucceedsWithValue(0));
+
+  // Close the second replica and no readable event should occur.
+  replica2_.reset();
+  FD_ZERO(&read_set);
+  FD_SET(master_.get(), &read_set);
+  EXPECT_THAT(select(max_fd, &read_set, NULL, NULL, &tv),
+              SyscallSucceedsWithValue(0));
+
+  // Close the last remaining replica and a readable event should occur.
+  replica_.reset();
+  FD_ZERO(&read_set);
+  FD_SET(master_.get(), &read_set);
+  EXPECT_THAT(select(max_fd, &read_set, NULL, NULL, &tv),
+              SyscallSucceedsWithValue(1));
+  EXPECT_TRUE(FD_ISSET(master_.get(), &read_set));
+
+  // Check that the right events are occurring.
+  struct pollfd pfd;
+  pfd.fd = master_.get();
+  pfd.events = POLLIN | POLLOUT | POLLRDHUP | POLLRDNORM | POLLWRNORM;
+  EXPECT_THAT(poll(&pfd, 1, 1), SyscallSucceedsWithValue(1));
+  EXPECT_EQ(POLLHUP | POLLOUT | POLLWRNORM, pfd.revents);
+}
 
 // Master to replica sanity test.
 TEST_F(PtyTest, WriteMasterToReplica) {
@@ -821,7 +989,7 @@ TEST_F(PtyTest, TermiosIGNCR) {
   ASSERT_THAT(WriteFd(master_.get(), &c, 1), SyscallSucceedsWithValue(1));
 
   // Nothing to read.
-  ASSERT_THAT(PollAndReadFd(replica_.get(), &c, 1, kTimeout),
+  ASSERT_THAT(PollAndReadFd(replica_.get(), &c, 1, kTimeoutShort),
               PosixErrorIs(ETIMEDOUT, ::testing::StrEq("Poll timed out")));
 }
 
@@ -911,7 +1079,7 @@ TEST_F(PtyTest, TermiosONOCR) {
   ASSERT_THAT(WriteFd(replica_.get(), &c, 1), SyscallSucceedsWithValue(1));
 
   // Nothing to read.
-  ASSERT_THAT(PollAndReadFd(master_.get(), &c, 1, kTimeout),
+  ASSERT_THAT(PollAndReadFd(master_.get(), &c, 1, kTimeoutShort),
               PosixErrorIs(ETIMEDOUT, ::testing::StrEq("Poll timed out")));
 
   // This time the column is greater than 0, so we should be able to read the CR
@@ -932,7 +1100,7 @@ TEST_F(PtyTest, TermiosONOCR) {
   ASSERT_THAT(WriteFd(replica_.get(), &c, 1), SyscallSucceedsWithValue(1));
 
   // Nothing to read.
-  ASSERT_THAT(PollAndReadFd(master_.get(), &c, 1, kTimeout),
+  ASSERT_THAT(PollAndReadFd(master_.get(), &c, 1, kTimeoutShort),
               PosixErrorIs(ETIMEDOUT, ::testing::StrEq("Poll timed out")));
 }
 
@@ -960,7 +1128,7 @@ TEST_F(PtyTest, VEOLTermination) {
   ASSERT_THAT(WriteFd(master_.get(), kInput, sizeof(kInput)),
               SyscallSucceedsWithValue(sizeof(kInput)));
   char buf[sizeof(kInput)] = {};
-  ASSERT_THAT(PollAndReadFd(replica_.get(), buf, sizeof(kInput), kTimeout),
+  ASSERT_THAT(PollAndReadFd(replica_.get(), buf, sizeof(kInput), kTimeoutShort),
               PosixErrorIs(ETIMEDOUT, ::testing::StrEq("Poll timed out")));
 
   // Set the EOL character to '=' and write it.
@@ -978,6 +1146,70 @@ TEST_F(PtyTest, VEOLTermination) {
   EXPECT_EQ(buf[0], '=');
 
   ExpectFinished(replica_);
+}
+
+// Tests that sending "backspace" to the master fd will be handled properly
+// in canonical mode
+TEST_F(PtyTest, CanonInputBackspace) {
+  constexpr char kInput[] = "gvisor\x7f\n";
+  constexpr char kExpectedOutput[] = "gviso\n";
+  constexpr char kEchoExpectedOutput[] = "gvisor\b \b\r\n";
+
+  TestCanonicalIO(kInput, kExpectedOutput, kEchoExpectedOutput);
+}
+
+// one backspace should delete the entire multibyte character when IUTF8 is set
+TEST_F(PtyTest, CanonInputBackspaceMultibyteCharacterWithIUTF8) {
+  struct kernel_termios t = DefaultTermios();
+  t.c_iflag |= IUTF8;
+  ASSERT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
+
+  constexpr char kInput[] = "gviso\xc6\xa9\x7f\n";
+  constexpr char kExpectedOutput[] = "gviso\n";
+  constexpr char kEchoExpectedOutput[] = "gviso\xc6\xa9\b \b\r\n";
+
+  TestCanonicalIO(kInput, kExpectedOutput, kEchoExpectedOutput);
+}
+
+// one backspace should only delete one byte in a multibyte character
+// if IUTF8 is not set
+TEST_F(PtyTest, CanonInputBackspaceMultibyteCharacterWithoutIUTF8) {
+  constexpr char kInput[] = "gviso\xc6\xa9\x7f\n";
+  constexpr char kExpectedOutput[] = "gviso\xc6\n";
+  constexpr char kEchoExpectedOutput[] = "gviso\xc6\xa9\b \b\r\n";
+
+  TestCanonicalIO(kInput, kExpectedOutput, kEchoExpectedOutput);
+}
+
+// backspace should not partially delete a multibyte character when IUTF8 is set
+TEST_F(PtyTest, CanonInputBackspaceMultibyteCharacterPartialWithIUTF8) {
+  struct kernel_termios t = DefaultTermios();
+  t.c_iflag |= IUTF8;
+  ASSERT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
+
+  constexpr char kInput[] = "\x80\x7f\n";
+  constexpr char kExpectedOutput[] = "\x80\n";
+  constexpr char kEchoExpectedOutput[] = "\x80\r\n";
+
+  TestCanonicalIO(kInput, kExpectedOutput, kEchoExpectedOutput);
+}
+
+// backspace can partially delete a multibyte character when IUTF8 is not set
+TEST_F(PtyTest, CanonInputBackspaceMultibyteCharacterPartialWithoutIUTF8) {
+  constexpr char kInput[] = "\x80\x7f\n";
+  constexpr char kExpectedOutput[] = "\n";
+  constexpr char kEchoExpectedOutput[] = "\x80\b \b\r\n";
+
+  TestCanonicalIO(kInput, kExpectedOutput, kEchoExpectedOutput);
+}
+
+// ^W, \x17, should erase a word
+TEST_F(PtyTest, CanonInputWordErase) {
+  constexpr char kInput[] = "hello hi\x17\n";
+  constexpr char kExpectedOutput[] = "hello \n";
+  constexpr char kEchoExpectedOutput[] = "hello hi\b \b\b \b\r\n";
+
+  TestCanonicalIO(kInput, kExpectedOutput, kEchoExpectedOutput);
 }
 
 // Tests that we can write more than the 4096 character limit, then a
@@ -1009,7 +1241,7 @@ TEST_F(PtyTest, SwitchCanonToNoncanon) {
 
   // Nothing available yet.
   char buf[sizeof(kInput)] = {};
-  ASSERT_THAT(PollAndReadFd(replica_.get(), buf, sizeof(kInput), kTimeout),
+  ASSERT_THAT(PollAndReadFd(replica_.get(), buf, sizeof(kInput), kTimeoutShort),
               PosixErrorIs(ETIMEDOUT, ::testing::StrEq("Poll timed out")));
 
   DisableCanonical();
@@ -1103,6 +1335,23 @@ TEST_F(PtyTest, SwitchNoncanonToCanonNoNewlineBig) {
   ExpectFinished(replica_);
 }
 
+// If the canonical input buffer is empty, and we switch to non-canonical
+// mode, the input buffer should not be readable.
+TEST_F(PtyTest, SwitchCanonToNoncanonEmptyInput) {
+  constexpr char kInput[] = "";
+  ASSERT_THAT(WriteFd(master_.get(), kInput, sizeof(kInput)),
+              SyscallSucceedsWithValue(sizeof(kInput)));
+
+  DisableCanonical();
+
+  // Nothing available yet.
+  char buf[2] = {};
+  ASSERT_THAT(PollAndReadFd(replica_.get(), buf, 2, kTimeoutShort),
+              PosixErrorIs(ETIMEDOUT, ::testing::StrEq("Poll timed out")));
+
+  ExpectFinished(replica_);
+}
+
 // Tests that we can write over the 4095 noncanonical limit, then read out
 // everything.
 TEST_F(PtyTest, NoncanonBigWrite) {
@@ -1144,7 +1393,7 @@ TEST_F(PtyTest, TermiosICANONNewline) {
   char buf[5] = {};
 
   // Nothing available yet.
-  ASSERT_THAT(PollAndReadFd(replica_.get(), buf, sizeof(input), kTimeout),
+  ASSERT_THAT(PollAndReadFd(replica_.get(), buf, sizeof(input), kTimeoutShort),
               PosixErrorIs(ETIMEDOUT, ::testing::StrEq("Poll timed out")));
 
   char delim = '\n';
@@ -1170,7 +1419,7 @@ TEST_F(PtyTest, TermiosICANONEOF) {
   char buf[4] = {};
 
   // Nothing available yet.
-  ASSERT_THAT(PollAndReadFd(replica_.get(), buf, sizeof(input), kTimeout),
+  ASSERT_THAT(PollAndReadFd(replica_.get(), buf, sizeof(input), kTimeoutShort),
               PosixErrorIs(ETIMEDOUT, ::testing::StrEq("Poll timed out")));
   char delim = ControlCharacter('D');
   ASSERT_THAT(WriteFd(master_.get(), &delim, 1), SyscallSucceedsWithValue(1));
@@ -1269,7 +1518,7 @@ TEST_F(PtyTest, SwitchTwiceMultiline) {
   std::string kExpected = "GO\nBLUE\n!";
 
   // Write each line.
-  for (const std::string& input : kInputs) {
+  for (const std::string &input : kInputs) {
     ASSERT_THAT(WriteFd(master_.get(), input.c_str(), input.size()),
                 SyscallSucceedsWithValue(input.size()));
   }
@@ -1309,18 +1558,18 @@ TEST_F(PtyTest, QueueSize) {
 
 TEST_F(PtyTest, PartialBadBuffer) {
   // Allocate 2 pages.
-  void* addr = mmap(nullptr, 2 * kPageSize, PROT_READ | PROT_WRITE,
+  void *addr = mmap(nullptr, 2 * kPageSize, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   ASSERT_NE(addr, MAP_FAILED);
-  char* buf = reinterpret_cast<char*>(addr);
+  char *buf = reinterpret_cast<char *>(addr);
 
   // Guard the 2nd page for our read to run into.
   ASSERT_THAT(
-      mprotect(reinterpret_cast<void*>(buf + kPageSize), kPageSize, PROT_NONE),
+      mprotect(reinterpret_cast<void *>(buf + kPageSize), kPageSize, PROT_NONE),
       SyscallSucceeds());
 
   // Leave only one free byte in the buffer.
-  char* bad_buffer = buf + kPageSize - 1;
+  char *bad_buffer = buf + kPageSize - 1;
 
   // Write to the master.
   constexpr char kBuf[] = "hello\n";
@@ -1337,6 +1586,26 @@ TEST_F(PtyTest, PartialBadBuffer) {
       AnyOf(SyscallFailsWithErrno(EFAULT), SyscallFailsWithErrno(EAGAIN)));
 
   EXPECT_THAT(munmap(addr, 2 * kPageSize), SyscallSucceeds()) << addr;
+}
+
+// Test that writing nothing to the PTY replica's output queue does not return
+// an error.
+TEST_F(PtyTest, ReplicaWriteNothingCanonical) {
+  constexpr char kInput[] = "";
+  EXPECT_THAT(WriteFd(replica_.get(), kInput, strlen(kInput)),
+              SyscallSucceedsWithValue(strlen(kInput)));
+
+  ExpectFinished(master_);
+}
+
+TEST_F(PtyTest, ReplicaWriteNothingNonCanonical) {
+  DisableCanonical();
+
+  constexpr char kInput[] = "";
+  EXPECT_THAT(WriteFd(replica_.get(), kInput, strlen(kInput)),
+              SyscallSucceedsWithValue(strlen(kInput)));
+
+  ExpectFinished(master_);
 }
 
 TEST_F(PtyTest, SimpleEcho) {
@@ -1431,7 +1700,9 @@ TEST_F(JobControlTest, SetTTYMaster) {
 TEST_F(JobControlTest, SetTTY) {
   auto res = RunInChild([=]() {
     TEST_PCHECK(setsid() >= 0);
-    TEST_PCHECK(ioctl(!replica_.get(), TIOCSCTTY, 0));
+    TEST_PCHECK(ioctl(replica_.get(), TIOCSCTTY, 0) >= 0);
+    // The second attempt setting the same terminal has to be no-op.
+    TEST_PCHECK(ioctl(replica_.get(), TIOCSCTTY, 0) >= 0);
   });
   ASSERT_NO_ERRNO(res);
 }
@@ -1625,6 +1896,59 @@ TEST_F(JobControlTest, ReleaseTTYSignals) {
   EXPECT_THAT(waitpid(diff_pgrp_child, &wstatus, WNOHANG),
               SyscallSucceedsWithValue(0));
   EXPECT_THAT(kill(diff_pgrp_child, SIGKILL), SyscallSucceeds());
+}
+
+// Used by the child process spawned in
+// ControllingProcessPersistsAfterChildExists to track received signals.
+static int received2;
+
+void sig_handler2(int signum) { received2 |= signum; }
+
+// NOTE(gvisor.dev/issue/9898): Regression test. Tests that a TTY's controlling
+// process is not cleared when a non-controlling process exits.
+TEST_F(JobControlTest, ControllingProcessPersistsAfterChildExists) {
+  // Set the controlling process for the PTY.
+  ASSERT_THAT(ioctl(replica_.get(), TIOCSCTTY, 0), SyscallSucceeds());
+
+  // Fork a child, which does nothing and exits. We expect that this process
+  // is still the controlling process, so is capable of receiving signals.
+  ASSERT_NO_ERRNO(RunInChild([=]() {}));
+
+  // Install handler for SIGINT.
+  received2 = 0;
+  struct sigaction sa = {};
+  sa.sa_handler = sig_handler2;
+  sa.sa_flags = 0;
+  sigemptyset(&sa.sa_mask);
+  sigaddset(&sa.sa_mask, SIGINT);
+  ASSERT_THAT(sigaction(SIGINT, &sa, NULL), SyscallSucceeds());
+
+  // Send ^C.
+  constexpr char kInput = ControlCharacter('C');
+  ASSERT_THAT(WriteFd(master_.get(), &kInput, 1), SyscallSucceedsWithValue(1));
+
+  // Ensure we got the signal. Wait at most for kTimeout.
+  absl::Time end = absl::Now() + kTimeout;
+  while (received2 != SIGINT) {
+    absl::SleepFor(absl::Seconds(1));
+    if (end < absl::Now()) {
+      FAIL() << "Timed out waiting for SIGINT signal.";
+      break;
+    }
+  }
+
+  // Make sure we're ignoring SIGHUP, which will be sent to this process once we
+  // disconnect the TTY.
+  struct sigaction sighup_sa = {};
+  sighup_sa.sa_handler = SIG_IGN;
+  sighup_sa.sa_flags = 0;
+  sigemptyset(&sighup_sa.sa_mask);
+  struct sigaction old_sa;
+  EXPECT_THAT(sigaction(SIGHUP, &sighup_sa, &old_sa), SyscallSucceeds());
+
+  // Release the controlling terminal and restore the old SIGHUP handler.
+  EXPECT_THAT(ioctl(replica_.get(), TIOCNOTTY), SyscallSucceeds());
+  EXPECT_THAT(sigaction(SIGHUP, &old_sa, NULL), SyscallSucceeds());
 }
 
 TEST_F(JobControlTest, GetForegroundProcessGroup) {
@@ -1869,6 +2193,16 @@ TEST_F(JobControlTest, SetForegroundProcessGroupDifferentSession) {
   ASSERT_NO_ERRNO(ret);
 }
 
+TEST_F(JobControlTest, SetGetSession) {
+  auto res = RunInChild([=]() {
+    pid_t sid = setsid();
+    TEST_PCHECK(sid >= 0);
+    TEST_PCHECK(getsid(0) == sid);
+    TEST_PCHECK(getpid() == sid);
+  });
+  ASSERT_NO_ERRNO(res);
+}
+
 // Verify that we don't hang when creating a new session from an orphaned
 // process group (b/139968068). Calling setsid() creates an orphaned process
 // group, as process groups that contain the session's leading process are
@@ -1901,6 +2235,24 @@ TEST_F(JobControlTest, OrphanRegression) {
   ASSERT_THAT(waitpid(session_2_leader, &wstatus, 0),
               SyscallSucceedsWithValue(session_2_leader));
   ASSERT_EQ(wstatus, 0);
+}
+
+// Test setting a controlling tty, then exiting, then re-using the same tty in a
+// different process.
+//
+// Regression test for https://github.com/google/gvisor/issues/9642.
+TEST_F(JobControlTest, ReuseControllingTTYAfterExit) {
+  auto res = RunInChild([=]() {
+    TEST_PCHECK(setsid() >= 0);
+    TEST_PCHECK(ioctl(replica_.get(), TIOCSCTTY, 0) >= 0);
+  });
+  ASSERT_NO_ERRNO(res);
+
+  auto res2 = RunInChild([=]() {
+    TEST_PCHECK(setsid() >= 0);
+    TEST_PCHECK(ioctl(replica_.get(), TIOCSCTTY, 0) >= 0);
+  });
+  ASSERT_NO_ERRNO(res2);
 }
 
 }  // namespace

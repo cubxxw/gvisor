@@ -1,5 +1,7 @@
 set -x
 
+source .buildkite/hooks/libhook
+
 # Clear any downloaded credentials.
 rm -f repo.key
 
@@ -56,8 +58,7 @@ if test "${BUILDKITE_COMMAND_EXIT_STATUS}" -ne "0"; then
   set -x
   dmesg -kT | tail -n 50
   # LINT.IfChange
-  runtime="buildkite_runtime_${BUILDKITE_BRANCH}-${BUILDKITE_BUILD_ID}"
-  runtime="$(echo "$runtime" | sed -r 's~[^-_a-z0-9]+~_~g')"
+  runtime="buildkite_runtime"
   # LINT.ThenChange(pre-command)
   if [ -d "/tmp/${runtime}/" ]; then
       tar -czf "/tmp/${BUILDKITE_JOB_ID}.tar.gz" -C /tmp/ "${runtime}"
@@ -71,14 +72,7 @@ if test "${BUILDKITE_COMMAND_EXIT_STATUS}" -ne "0"; then
   sudo rm -rf "${HOME}/go"
 fi
 
-# Kill any running containers (clear state), except for "bootstrap".
-for id_and_name in $(docker ps --format='{{.ID}}/{{.Names}}'); do
-  if [[ "$(echo "$id_and_name" | cut -d'/' -f2-)" == 'bootstrap' ]]; then
-    continue
-  fi
-  timeout --kill-after=10s --preserve-status 8s \
-      docker container kill "$(echo "$id_and_name" | cut -d'/' -f1)"
-done
+clear_docker_containers
 
 set -euo pipefail
 

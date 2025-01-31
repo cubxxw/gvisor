@@ -82,6 +82,12 @@ type HostConnectedEndpoint struct {
 
 	// stype is the type of Unix socket.
 	stype linux.SockType
+
+	// rdShutdown is true if receptions have been shutdown with SHUT_RD.
+	rdShutdown atomicbitops.Bool
+
+	// wrShutdown is true if transmissions have been shutdown with SHUT_WR.
+	wrShutdown atomicbitops.Bool
 }
 
 // init performs initialization required for creating new
@@ -92,6 +98,11 @@ func (c *HostConnectedEndpoint) init() *syserr.Error {
 }
 
 func (c *HostConnectedEndpoint) initFromOptions() *syserr.Error {
+	if c.fd < 0 {
+		// There is no underlying FD to restore; nothing to do
+		return nil
+	}
+
 	family, err := unix.GetsockoptInt(c.fd, unix.SOL_SOCKET, unix.SO_DOMAIN)
 	if err != nil {
 		return syserr.FromError(err)
@@ -157,6 +168,10 @@ func (c *HostConnectedEndpoint) Send(ctx context.Context, data [][]byte, control
 		return 0, false, syserr.ErrInvalidEndpointState
 	}
 
+	if c.IsSendClosed() {
+		return 0, false, syserr.ErrClosedForSend
+	}
+
 	// Since stream sockets don't preserve message boundaries, we can write
 	// only as much of the message as fits in the send buffer.
 	truncate := c.stype == linux.SOCK_STREAM
@@ -186,16 +201,30 @@ func (c *HostConnectedEndpoint) SendNotify() {}
 func (c *HostConnectedEndpoint) CloseSend() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.closeSendLocked()
+}
+
+// Preconditions: c.mu must be held.
+func (c *HostConnectedEndpoint) closeSendLocked() {
+	if c.IsSendClosed() {
+		return
+	}
 
 	if err := unix.Shutdown(c.fd, unix.SHUT_WR); err != nil {
 		// A well-formed UDS shutdown can't fail. See
 		// net/unix/af_unix.c:unix_shutdown.
 		panic(fmt.Sprintf("failed write shutdown on host socket %+v: %v", c, err))
 	}
+	c.wrShutdown.Store(true)
 }
 
 // CloseNotify implements ConnectedEndpoint.CloseNotify.
 func (c *HostConnectedEndpoint) CloseNotify() {}
+
+// IsSendClosed implements ConnectedEndpoint.IsSendClosed.
+func (c *HostConnectedEndpoint) IsSendClosed() bool {
+	return c.wrShutdown.Load()
+}
 
 // Writable implements ConnectedEndpoint.Writable.
 func (c *HostConnectedEndpoint) Writable() bool {
@@ -229,50 +258,56 @@ func (c *HostConnectedEndpoint) EventUpdate() error {
 }
 
 // Recv implements Receiver.Recv.
-func (c *HostConnectedEndpoint) Recv(ctx context.Context, data [][]byte, creds bool, numRights int, peek bool) (int64, int64, ControlMessages, bool, Address, bool, *syserr.Error) {
+func (c *HostConnectedEndpoint) Recv(ctx context.Context, data [][]byte, args RecvArgs) (RecvOutput, bool, *syserr.Error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	var cm unet.ControlMessage
-	if numRights > 0 {
-		cm.EnableFDs(int(numRights))
+	if args.NumRights > 0 {
+		cm.EnableFDs(int(args.NumRights))
 	}
 
 	// N.B. Unix sockets don't have a receive buffer, the send buffer
 	// serves both purposes.
-	rl, ml, cl, cTrunc, err := fdReadVec(c.fd, data, []byte(cm), peek, c.RecvMaxQueueSize())
-	if rl > 0 && err != nil {
+	out := RecvOutput{Source: Address{Addr: c.addr}}
+	var err error
+	var controlLen uint64
+	out.RecvLen, out.MsgLen, controlLen, out.ControlTrunc, err = fdReadVec(c.fd, data, []byte(cm), args.Peek, c.RecvMaxQueueSize())
+	if out.RecvLen > 0 && err != nil {
 		// We got some data, so all we need to do on error is return
 		// the data that we got. Short reads are fine, no need to
 		// block.
 		err = nil
 	}
 	if err != nil {
-		return 0, 0, ControlMessages{}, false, Address{}, false, syserr.FromError(err)
+		return RecvOutput{}, false, syserr.FromError(err)
 	}
 
 	// There is no need for the callee to call RecvNotify because fdReadVec uses
 	// the host's recvmsg(2) and the host kernel's queue.
 
 	// Trim the control data if we received less than the full amount.
-	if cl < uint64(len(cm)) {
-		cm = cm[:cl]
+	if controlLen < uint64(len(cm)) {
+		cm = cm[:controlLen]
 	}
 
 	// Avoid extra allocations in the case where there isn't any control data.
 	if len(cm) == 0 {
-		return rl, ml, ControlMessages{}, cTrunc, Address{Addr: c.addr}, false, nil
+		return out, false, nil
 	}
 
 	fds, err := cm.ExtractFDs()
 	if err != nil {
-		return 0, 0, ControlMessages{}, false, Address{}, false, syserr.FromError(err)
+		return RecvOutput{}, false, syserr.FromError(err)
 	}
 
 	if len(fds) == 0 {
-		return rl, ml, ControlMessages{}, cTrunc, Address{Addr: c.addr}, false, nil
+		return out, false, nil
 	}
-	return rl, ml, ControlMessages{Rights: &SCMRights{fds}}, cTrunc, Address{Addr: c.addr}, false, nil
+	out.Control = ControlMessages{
+		Rights: &SCMRights{fds},
+	}
+	return out, false, nil
 }
 
 // RecvNotify implements Receiver.RecvNotify.
@@ -282,12 +317,26 @@ func (c *HostConnectedEndpoint) RecvNotify() {}
 func (c *HostConnectedEndpoint) CloseRecv() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.closeRecvLocked()
+}
+
+// Preconditions: c.mu must be held.
+func (c *HostConnectedEndpoint) closeRecvLocked() {
+	if c.IsRecvClosed() {
+		return
+	}
 
 	if err := unix.Shutdown(c.fd, unix.SHUT_RD); err != nil {
 		// A well-formed UDS shutdown can't fail. See
 		// net/unix/af_unix.c:unix_shutdown.
 		panic(fmt.Sprintf("failed read shutdown on host socket %+v: %v", c, err))
 	}
+	c.rdShutdown.Store(true)
+}
+
+// IsRecvClosed implements Receiver.IsRecvClosed.
+func (c *HostConnectedEndpoint) IsRecvClosed() bool {
+	return c.rdShutdown.Load()
 }
 
 // Readable implements Receiver.Readable.
@@ -358,13 +407,34 @@ func (c *HostConnectedEndpoint) SetReceiveBufferSize(v int64) (newSz int64) {
 // SCMConnectedEndpoint represents an endpoint backed by a host fd that was
 // passed through a gofer Unix socket. It resembles HostConnectedEndpoint, with the
 // following differences:
-//   - SCMConnectedEndpoint is not saveable, because the host cannot guarantee
-//     the same descriptor number across S/R.
+//   - SCMConnectedEndpoint is not saveable by default, because the host
+//     cannot guarantee the same descriptor number across S/R.
+//     However, it can optionally be placed in a closed state before save.
 //   - SCMConnectedEndpoint holds ownership of its fd and notification queue.
+//
+// +stateify savable
 type SCMConnectedEndpoint struct {
 	HostConnectedEndpoint
 
 	queue *waiter.Queue
+	opts  UnixSocketOpts
+}
+
+// beforeSave is invoked by stateify.
+func (e *SCMConnectedEndpoint) beforeSave() {
+	if !e.opts.DisconnectOnSave {
+		panic("socket cannot be saved in a connected state")
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	fdnotifier.RemoveFD(int32(e.fd))
+	e.closeRecvLocked()
+	e.closeSendLocked()
+	if err := unix.Close(e.fd); err != nil {
+		log.Warningf("Failed to close host fd %d: %v", err)
+	}
+	e.destroyLocked()
 }
 
 // Init will do the initialization required without holding other locks.
@@ -376,28 +446,34 @@ func (e *SCMConnectedEndpoint) Init() error {
 func (e *SCMConnectedEndpoint) Release(ctx context.Context) {
 	e.DecRef(func() {
 		e.mu.Lock()
+		defer e.mu.Unlock()
+
+		if e.fd < 0 {
+			return
+		}
+
 		fdnotifier.RemoveFD(int32(e.fd))
 		if err := unix.Close(e.fd); err != nil {
 			log.Warningf("Failed to close host fd %d: %v", err)
 		}
 		e.destroyLocked()
-		e.mu.Unlock()
 	})
 }
 
 // NewSCMEndpoint creates a new SCMConnectedEndpoint backed by a host fd that
 // was passed through a Unix socket.
 //
-// The caller is responsible for calling Init(). Additionaly, Release needs to
+// The caller is responsible for calling Init(). Additionally, Release needs to
 // be called twice because ConnectedEndpoint is both a Receiver and
 // ConnectedEndpoint.
-func NewSCMEndpoint(hostFD int, queue *waiter.Queue, addr string) (*SCMConnectedEndpoint, *syserr.Error) {
+func NewSCMEndpoint(hostFD int, queue *waiter.Queue, addr string, opts UnixSocketOpts) (*SCMConnectedEndpoint, *syserr.Error) {
 	e := SCMConnectedEndpoint{
 		HostConnectedEndpoint: HostConnectedEndpoint{
 			fd:   hostFD,
 			addr: addr,
 		},
 		queue: queue,
+		opts:  opts,
 	}
 
 	if err := e.init(); err != nil {

@@ -14,22 +14,31 @@
 
 #include <fcntl.h>
 #include <linux/capability.h>
+#include <linux/fuse.h>
 #include <stdio.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdint>
-#include <cstring>
+#include <cstdlib>
 #include <string>
+#include <vector>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/strings/str_format.h"
-#include "test/util/capability_util.h"
+#include "absl/strings/string_view.h"
 #include "test/util/file_descriptor.h"
+#include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
 #include "test/util/mount_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
+
+using ::testing::Ge;
 
 namespace gvisor {
 namespace testing {
@@ -44,24 +53,40 @@ TEST(FuseTest, RejectBadInit) {
   auto mount_point = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
   auto mount_opts =
       absl::StrFormat("fd=%d,user_id=0,group_id=0,rootmode=40000", fd.get());
+  auto mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("fuse", mount_point.path(), "fuse", MS_NODEV | MS_NOSUID,
+            mount_opts, 0 /* umountflags */));
 
-  EXPECT_THAT(mount("fuse", mount_point.path().c_str(), "fuse",
-                    MS_NODEV | MS_NOSUID, mount_opts.c_str()),
-              SyscallSucceeds());
-  mount_point.release();
+  // Read the init request so that we have the correct unique ID.
+  alignas(fuse_in_header) char req_buf[FUSE_MIN_READ_BUFFER];
+  ASSERT_THAT(read(fd.get(), req_buf, sizeof(req_buf)),
+              SyscallSucceedsWithValue(Ge(sizeof(fuse_in_header))));
 
-  struct response {
-    uint32_t len;
-    int32_t err;
-    uint64_t uid;
-  } resp;
-  // min value for length is 24 + sizeof(response)
-  resp.len = 24 + sizeof(resp) - 1;
-  resp.err = 0;
-  resp.uid = 2;
+  fuse_out_header resp;
+  resp.len = sizeof(resp) - 1;
+  resp.error = 0;
+  resp.unique = reinterpret_cast<fuse_in_header*>(req_buf)->unique;
 
   ASSERT_THAT(write(fd.get(), reinterpret_cast<char*>(&resp), sizeof(resp)),
               SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(FuseTest, LookupUpdatesInode) {
+  SKIP_IF(absl::NullSafeStringView(getenv("GVISOR_FUSE_TEST")) != "TRUE");
+  const std::string kFileData = "May thy knife chip and shatter.\n";
+  TempPath path = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), kFileData, TempPath::kDefaultFileMode));
+
+  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(path.path(), O_RDONLY));
+  std::vector<char> buf(kFileData.size());
+  ASSERT_THAT(ReadFd(fd.get(), buf.data(), kFileData.size()),
+              SyscallSucceedsWithValue(kFileData.size()));
+
+  ASSERT_THAT(unlink(JoinPath("/fuse", Basename(path.path())).c_str()),
+              SyscallSucceeds());
+
+  EXPECT_THAT(access(path.path().c_str(), O_RDONLY),
+              SyscallFailsWithErrno(ENOENT));
 }
 
 }  // namespace

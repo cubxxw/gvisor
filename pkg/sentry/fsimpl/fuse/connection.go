@@ -15,13 +15,16 @@
 package fuse
 
 import (
+	goContext "context"
 	"sync"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -184,6 +187,20 @@ type connection struct {
 	noOpen bool
 }
 
+func connError(err error) error {
+	// The error may contain arbitrary errno values that can't be converted.
+	switch e := err.(type) {
+	case unix.Errno:
+		if syserr.IsValid(e) {
+			return err
+		}
+	default:
+		return err
+	}
+	log.Warningf("fusefs: failed with invalid error: %v", err)
+	return unix.EINVAL
+}
+
 func (conn *connection) saveInitializedChan() bool {
 	select {
 	case <-conn.initializedChan:
@@ -193,7 +210,7 @@ func (conn *connection) saveInitializedChan() bool {
 	}
 }
 
-func (conn *connection) loadInitializedChan(closed bool) {
+func (conn *connection) loadInitializedChan(_ goContext.Context, closed bool) {
 	conn.initializedChan = make(chan struct{}, 1)
 	if closed {
 		close(conn.initializedChan)
@@ -251,11 +268,10 @@ func (conn *connection) CallAsync(ctx context.Context, r *Request) error {
 // The forget request does not have a reply,
 // as documented in include/uapi/linux/fuse.h:FUSE_FORGET.
 func (conn *connection) Call(ctx context.Context, r *Request) (*Response, error) {
-	b := blockerFromContext(ctx)
 	// Block requests sent before connection is initialized.
 	if !conn.Initialized() && r.hdr.Opcode != linux.FUSE_INIT {
-		if err := b.Block(conn.initializedChan); err != nil {
-			return nil, err
+		if err := ctx.Block(conn.initializedChan); err != nil {
+			return nil, connError(err)
 		}
 	}
 
@@ -275,13 +291,17 @@ func (conn *connection) Call(ctx context.Context, r *Request) (*Response, error)
 		return nil, linuxerr.ECONNREFUSED
 	}
 
-	fut, err := conn.callFuture(b, r)
+	fut, err := conn.callFuture(ctx, r)
 	conn.fd.mu.Unlock()
 	if err != nil {
-		return nil, err
+		return nil, connError(err)
 	}
 
-	return fut.resolve(b)
+	res, err := fut.resolve(ctx)
+	if err != nil {
+		return res, connError(err)
+	}
+	return res, nil
 }
 
 // callFuture makes a request to the server and returns a future response.

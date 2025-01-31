@@ -23,6 +23,8 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform/systrap/sysmsg"
@@ -110,7 +112,6 @@ func (t *thread) adjustInitRegsRip() {
 
 // Pass the expected PPID to the child via X7 when creating stub process
 func initChildProcessPPID(initregs *arch.Registers, ppid int32) {
-	initregs.Regs[7] = uint64(ppid)
 	// R9 has to be set to 1 when creating stub process.
 	initregs.Regs[9] = _NEW_STUB
 }
@@ -152,10 +153,10 @@ func (s *subprocess) arm64SyscallWorkaround(t *thread, regs *arch.Registers) {
 	// signal, resume a stub thread and catch it on a signal handling.
 	t.NotifyInterrupt()
 	for {
-		if _, _, errno := unix.RawSyscall6(
+		if errno := hostsyscall.RawSyscallErrno(
 			unix.SYS_PTRACE,
 			unix.PTRACE_SYSEMU,
-			uintptr(t.tid), 0, 0, 0, 0); errno != 0 {
+			uintptr(t.tid), 0); errno != 0 {
 			panic(fmt.Sprintf("ptrace sysemu failed: %v", errno))
 		}
 
@@ -191,7 +192,11 @@ func retrieveArchSpecificState(ctx *sysmsg.ThreadContext, ac *arch.Context64) {
 
 func archSpecificSysmsgThreadInit(sysThread *sysmsgThread) {
 	// Send a fake event to stop the BPF process so that it enters the sighandler.
-	if _, _, e := unix.RawSyscall(unix.SYS_TGKILL, uintptr(sysThread.thread.tgid), uintptr(sysThread.thread.tid), uintptr(unix.SIGSEGV)); e != 0 {
+	if e := hostsyscall.RawSyscallErrno(unix.SYS_TGKILL, uintptr(sysThread.thread.tgid), uintptr(sysThread.thread.tid), uintptr(unix.SIGSEGV)); e != 0 {
 		panic(fmt.Sprintf("tkill failed: %v", e))
 	}
+}
+
+func sigErrorToAccessType(sigError uint64) hostarch.AccessType {
+	return hostarch.ESRAccessType(sigError)
 }

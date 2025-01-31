@@ -15,11 +15,10 @@
 package lib
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
-	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -38,7 +37,7 @@ func touch(t *testing.T, name string) {
 }
 
 func TestSearchEmptyDir(t *testing.T) {
-	td, err := ioutil.TempDir(testutil.TmpDir(), "searchtest")
+	td, err := os.MkdirTemp(testutil.TmpDir(), "searchtest")
 	if err != nil {
 		t.Fatalf("error creating searchtest: %v", err)
 	}
@@ -52,13 +51,13 @@ func TestSearchEmptyDir(t *testing.T) {
 		t.Errorf("search error: %v", err)
 	}
 
-	if !reflect.DeepEqual(got, want) {
+	if !slices.Equal(got, want) {
 		t.Errorf("Found %#v; want %#v", got, want)
 	}
 }
 
 func TestSearch(t *testing.T) {
-	td, err := ioutil.TempDir(testutil.TmpDir(), "searchtest")
+	td, err := os.MkdirTemp(testutil.TmpDir(), "searchtest")
 	if err != nil {
 		t.Fatalf("error creating searchtest: %v", err)
 	}
@@ -121,7 +120,7 @@ func TestSearch(t *testing.T) {
 		t.Errorf("search error: %v", err)
 	}
 
-	if !reflect.DeepEqual(got, want) {
+	if !slices.Equal(got, want) {
 		t.Errorf("Found %#v; want %#v", got, want)
 	}
 }

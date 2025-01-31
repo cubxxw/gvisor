@@ -12,7 +12,7 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/context",
         "//pkg/errors/linuxerr",
-        "//pkg/sentry/fsimpl/devtmpfs",
+        "//pkg/sentry/kernel",
         "//pkg/sentry/vfs",
     ],
 )

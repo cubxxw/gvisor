@@ -21,7 +21,6 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
-	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/metric"
@@ -29,12 +28,23 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/sched"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
+)
+
+// TaskOrigin indicates how the task was initially created.
+type TaskOrigin int
+
+const (
+	// OriginUnknown indicates that task creation source is not known (or not important).
+	OriginUnknown TaskOrigin = iota
+
+	// OriginExec indicates that task was created due to an exec request inside a container.
+	OriginExec
 )
 
 // Task represents a thread of execution in the untrusted app.  It
@@ -96,12 +106,30 @@ type Task struct {
 	// interruptChan is always notified after restore (see Task.run).
 	interruptChan chan struct{} `state:"nosave"`
 
-	// gosched contains the current scheduling state of the task goroutine.
+	// gostateSeq allows Task.TaskGoroutineStateTime() to read gostate and
+	// gostateTime atomically.
 	//
-	// gosched is protected by goschedSeq. gosched is owned by the task
-	// goroutine.
-	goschedSeq sync.SeqCount `state:"nosave"`
-	gosched    TaskGoroutineSchedInfo
+	// gostateSeq is owned by the task goroutine.
+	gostateSeq sync.SeqCount `state:"nosave"`
+
+	// gostate is the current scheduling state of the task goroutine.
+	//
+	// gostate is owned by the task goroutine.
+	gostate atomicbitops.Uint32
+
+	// gostateTime was the value of Kernel.cpuClock when gostate was last
+	// updated or refreshed.
+	//
+	// gostateTime is owned by the task goroutine.
+	gostateTime atomicbitops.Int64
+
+	// appCPUClock approximates the amount of time the task goroutine has spent
+	// in TaskGoroutineRunningApp.
+	appCPUClock ktime.SyntheticClock
+
+	// appSysCPUClock approximates the amount of time the task goroutine has
+	// spent in TaskGoroutineRunningApp or TaskGoroutineRunningSys.
+	appSysCPUClock ktime.SyntheticClock
 
 	// yieldCount is the number of times the task goroutine has called
 	// Task.InterruptibleSleepStart, Task.UninterruptibleSleepStart, or
@@ -276,13 +304,13 @@ type Task struct {
 	// this TaskImage is released.
 	//
 	// vforkParent is protected by the TaskSet mutex.
-	vforkParent *Task
+	vforkParent atomic.Pointer[Task] `state:".(*Task)"`
 
 	// exitState is the task's progress through the exit path.
 	//
 	// exitState is protected by the TaskSet mutex. exitState is owned by the
 	// task goroutine.
-	exitState TaskExitState
+	exitState atomicbitops.Uint32
 
 	// exitTracerNotified is true if the exit path has either signaled the
 	// task's tracer to indicate the exit, or determined that no such signal is
@@ -320,15 +348,13 @@ type Task struct {
 	goroutineStopped sync.WaitGroup `state:"nosave"`
 
 	// ptraceTracer is the task that is ptrace-attached to this one. If
-	// ptraceTracer is nil, this task is not being traced. Note that due to
-	// atomic.Value limitations (atomic.Value.Store(nil) panics), a nil
-	// ptraceTracer is always represented as a typed nil (i.e. (*Task)(nil)).
+	// ptraceTracer is nil, this task is not being traced.
 	//
 	// ptraceTracer is protected by the TaskSet mutex, and accessed with atomic
 	// operations. This allows paths that wouldn't otherwise lock the TaskSet
 	// mutex, notably the syscall path, to check if ptraceTracer is nil without
 	// additional synchronization.
-	ptraceTracer atomic.Value `state:".(*Task)"`
+	ptraceTracer atomic.Pointer[Task] `state:".(*Task)"`
 
 	// ptraceTracees is the set of tasks that this task is ptrace-attached to.
 	//
@@ -414,7 +440,7 @@ type Task struct {
 
 	// logPrefix is a string containing the task's thread ID in the root PID
 	// namespace, and is prepended to log messages emitted by Task.Infof etc.
-	logPrefix atomic.Value `state:"nosave"`
+	logPrefix atomic.Pointer[string] `state:"nosave"`
 
 	// traceContext and traceTask are both used for tracing, and are
 	// updated along with the logPrefix in updateInfoLocked.
@@ -441,11 +467,6 @@ type Task struct {
 	// ipcns is protected by mu. ipcns is owned by the task goroutine.
 	ipcns *IPCNamespace
 
-	// abstractSockets tracks abstract sockets that are in use.
-	//
-	// abstractSockets is protected by mu.
-	abstractSockets *AbstractSocketNamespace
-
 	// mountNamespace is the task's mount namespace.
 	//
 	// It is protected by mu. It is owned by the task goroutine.
@@ -456,12 +477,12 @@ type Task struct {
 	// parentDeathSignal is protected by mu.
 	parentDeathSignal linux.Signal
 
-	// syscallFilters is all seccomp-bpf syscall filters applicable to the
-	// task, in the order in which they were installed. The type of the atomic
-	// is []bpf.Program. Writing needs to be protected by the signal mutex.
+	// seccomp contains all seccomp-bpf syscall filters applicable to the task.
+	// The type of the atomic is *taskSeccomp.
+	// Writing needs to be protected by the signal mutex.
 	//
-	// syscallFilters is owned by the task goroutine.
-	syscallFilters atomic.Value `state:".([]bpf.Program)"`
+	// seccomp is owned by the task goroutine.
+	seccomp atomic.Pointer[taskSeccomp] `state:".(*taskSeccomp)"`
 
 	// If cleartid is non-zero, treat it as a pointer to a ThreadID in the
 	// task's virtual address space; when the task exits, set the pointed-to
@@ -557,12 +578,14 @@ type Task struct {
 	// copyScratchBuffer is exclusive to the task goroutine.
 	copyScratchBuffer [copyScratchBufferLen]byte `state:"nosave"`
 
-	// blockingTimer is used for blocking timeouts. blockingTimerChan is the
-	// channel that is sent to when blockingTimer fires.
+	// blockingTimer is used for blocking timeouts from ktime.SampledClocks.
+	// blockingTimerListener sends to blockingTimerChan when blockingTimer
+	// expires.
 	//
 	// blockingTimer is exclusive to the task goroutine.
-	blockingTimer     *ktime.Timer    `state:"nosave"`
-	blockingTimerChan <-chan struct{} `state:"nosave"`
+	blockingTimer         *ktime.SampledTimer `state:"nosave"`
+	blockingTimerListener ktime.Listener      `state:"nosave"`
+	blockingTimerChan     <-chan struct{}     `state:"nosave"`
 
 	// futexWaiter is used for futex(FUTEX_WAIT) syscalls.
 	//
@@ -597,46 +620,49 @@ type Task struct {
 	//
 	// The userCounters pointer is exclusive to the task goroutine, but the
 	// userCounters instance must be atomically accessed.
-	userCounters *userCounters
+	userCounters *UserCounters
+
+	// sessionKeyring is a pointer to the task's session keyring, if set.
+	// It is guaranteed to be of type "keyring".
+	//
+	// +checklocks:mu
+	sessionKeyring *auth.Key
+
+	// Origin is the origin of the task.
+	Origin TaskOrigin
+
+	// onDestroyAction is a set of callbacks that are executed when the
+	// task is destroyed.
+	onDestroyAction map[TaskDestroyAction]struct{}
 }
 
 // Task related metrics
 var (
 	// syscallCounter is a metric that tracks how many syscalls the sentry has
 	// executed.
-	syscallCounter = metric.MustCreateNewProfilingUint64Metric(
-		"/task/syscalls", false, "The number of syscalls the sentry has executed for the user.")
+	syscallCounter = metric.SentryProfiling.MustCreateNewUint64Metric(
+		"/task/syscalls", metric.Uint64Metadata{
+			Cumulative:  true,
+			Description: "The number of syscalls the sentry has executed for the user.",
+		})
 
 	// faultCounter is a metric that tracks how many faults the sentry has had to
 	// handle.
-	faultCounter = metric.MustCreateNewProfilingUint64Metric(
-		"/task/faults", false, "The number of faults the sentry has handled.")
+	faultCounter = metric.SentryProfiling.MustCreateNewUint64Metric(
+		"/task/faults", metric.Uint64Metadata{
+			Cumulative:  true,
+			Description: "The number of faults the sentry has handled.",
+		})
 )
 
-func (t *Task) savePtraceTracer() *Task {
-	return t.ptraceTracer.Load().(*Task)
-}
-
-func (t *Task) loadPtraceTracer(tracer *Task) {
-	t.ptraceTracer.Store(tracer)
-}
-
-func (t *Task) saveSyscallFilters() []bpf.Program {
-	if f := t.syscallFilters.Load(); f != nil {
-		return f.([]bpf.Program)
-	}
-	return nil
-}
-
-func (t *Task) loadSyscallFilters(filters []bpf.Program) {
-	t.syscallFilters.Store(filters)
-}
-
 // afterLoad is invoked by stateify.
-func (t *Task) afterLoad() {
+func (t *Task) afterLoad(gocontext.Context) {
 	t.updateInfoLocked()
+	if ts := t.seccomp.Load(); ts != nil {
+		ts.populateCache(t)
+	}
 	t.interruptChan = make(chan struct{}, 1)
-	t.gosched.State = TaskGoroutineNonexistent
+	t.gostate.Store(uint32(TaskGoroutineNonexistent))
 	if t.stop != nil {
 		t.stopCount = atomicbitops.FromInt32(1)
 	}
@@ -773,7 +799,7 @@ func (t *Task) NewFDFrom(minFD int32, file *vfs.FileDescription, flags FDFlags) 
 // This automatically passes the task as the context.
 //
 // Precondition: same as FDTable.
-func (t *Task) NewFDAt(fd int32, file *vfs.FileDescription, flags FDFlags) error {
+func (t *Task) NewFDAt(fd int32, file *vfs.FileDescription, flags FDFlags) (*vfs.FileDescription, error) {
 	return t.fdTable.NewFDAt(t, fd, file, flags)
 }
 
@@ -803,14 +829,15 @@ func (t *Task) GetMountNamespace() *vfs.MountNamespace {
 	return mntns
 }
 
-// AbstractSockets returns t's AbstractSocketNamespace.
-func (t *Task) AbstractSockets() *AbstractSocketNamespace {
-	return t.abstractSockets
-}
-
 // ContainerID returns t's container ID.
 func (t *Task) ContainerID() string {
 	return t.containerID
+}
+
+// RestoreContainerID sets t's container ID in case the restored container ID
+// is different from when it was saved.
+func (t *Task) RestoreContainerID(cid string) {
+	t.containerID = cid
 }
 
 // OOMScoreAdj gets the task's thread group's OOM score adjustment.

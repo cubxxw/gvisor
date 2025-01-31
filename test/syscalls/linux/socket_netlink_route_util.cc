@@ -118,11 +118,9 @@ PosixError PopulateRuleNlmsghdr(NetlinkModification modification,
 }
 
 // Adds or removes the specified address from the specified interface.
-PosixError LinkModifyLocalAddr(int index, int family, int prefixlen,
-                               const void* addr, int addrlen,
+PosixError LinkModifyLocalAddr(FileDescriptor& fd, int index, int family,
+                               int prefixlen, const void* addr, int addrlen,
                                NetlinkModification modification) {
-  ASSIGN_OR_RETURN_ERRNO(FileDescriptor fd, NetlinkBoundSocket(NETLINK_ROUTE));
-
   struct request {
     struct nlmsghdr hdr;
     struct ifaddrmsg ifaddr;
@@ -272,8 +270,8 @@ PosixErrorOr<std::vector<Link>> DumpLinks() {
     }
     const struct ifinfomsg* msg =
         reinterpret_cast<const struct ifinfomsg*>(NLMSG_DATA(hdr));
-    const auto* rta = FindRtAttr(hdr, msg, IFLA_IFNAME);
-    if (rta == nullptr) {
+    const auto* rta_name = FindRtAttr(hdr, msg, IFLA_IFNAME);
+    if (rta_name == nullptr) {
       // Ignore links that do not have a name.
       return;
     }
@@ -282,7 +280,16 @@ PosixErrorOr<std::vector<Link>> DumpLinks() {
     links.back().index = msg->ifi_index;
     links.back().type = msg->ifi_type;
     links.back().name =
-        std::string(reinterpret_cast<const char*>(RTA_DATA(rta)));
+        std::string(reinterpret_cast<const char*>(RTA_DATA(rta_name)));
+    const auto* rta_mtu = FindRtAttr(hdr, msg, IFLA_MTU);
+    links.back().mtu = rta_mtu == nullptr
+                           ? 0
+                           : *reinterpret_cast<uint32_t*>(RTA_DATA(rta_mtu));
+    const auto* rta_address = FindRtAttr(hdr, msg, IFLA_ADDRESS);
+    links.back().address =
+        rta_address == nullptr
+            ? ""
+            : std::string(reinterpret_cast<const char*>(RTA_DATA(rta_address)));
   }));
   return links;
 }
@@ -297,27 +304,28 @@ PosixErrorOr<Link> LoopbackLink() {
   return PosixError(ENOENT, "loopback link not found");
 }
 
-PosixError LinkAddLocalAddr(int index, int family, int prefixlen,
-                            const void* addr, int addrlen) {
-  return LinkModifyLocalAddr(index, family, prefixlen, addr, addrlen,
+PosixError LinkAddLocalAddr(FileDescriptor& fd, int index, int family,
+                            int prefixlen, const void* addr, int addrlen) {
+  return LinkModifyLocalAddr(fd, index, family, prefixlen, addr, addrlen,
                              NetlinkModification::kAdd);
 }
 
-PosixError LinkAddExclusiveLocalAddr(int index, int family, int prefixlen,
-                                     const void* addr, int addrlen) {
-  return LinkModifyLocalAddr(index, family, prefixlen, addr, addrlen,
+PosixError LinkAddExclusiveLocalAddr(FileDescriptor& fd, int index, int family,
+                                     int prefixlen, const void* addr,
+                                     int addrlen) {
+  return LinkModifyLocalAddr(fd, index, family, prefixlen, addr, addrlen,
                              NetlinkModification::kAddExclusive);
 }
 
-PosixError LinkReplaceLocalAddr(int index, int family, int prefixlen,
-                                const void* addr, int addrlen) {
-  return LinkModifyLocalAddr(index, family, prefixlen, addr, addrlen,
+PosixError LinkReplaceLocalAddr(FileDescriptor& fd, int index, int family,
+                                int prefixlen, const void* addr, int addrlen) {
+  return LinkModifyLocalAddr(fd, index, family, prefixlen, addr, addrlen,
                              NetlinkModification::kReplace);
 }
 
-PosixError LinkDelLocalAddr(int index, int family, int prefixlen,
-                            const void* addr, int addrlen) {
-  return LinkModifyLocalAddr(index, family, prefixlen, addr, addrlen,
+PosixError LinkDelLocalAddr(FileDescriptor& fd, int index, int family,
+                            int prefixlen, const void* addr, int addrlen) {
+  return LinkModifyLocalAddr(fd, index, family, prefixlen, addr, addrlen,
                              NetlinkModification::kDelete);
 }
 

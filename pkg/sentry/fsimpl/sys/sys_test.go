@@ -1,4 +1,4 @@
-// Copyright 2019 The gVisor Authors.
+// Copyright 2024 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,90 +12,65 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sys_test
+package sys
 
 import (
-	"fmt"
 	"testing"
-
-	"github.com/google/go-cmp/cmp"
-	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
-	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
-func newTestSystem(t *testing.T) *testutil.System {
-	k, err := testutil.Boot()
-	if err != nil {
-		t.Fatalf("Failed to create test kernel: %v", err)
-	}
-	ctx := k.SupervisorContext()
-	creds := auth.CredentialsFromContext(ctx)
-	k.VFS().MustRegisterFilesystemType(sys.Name, sys.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
-		AllowUserMount: true,
-	})
-
-	mns, err := k.VFS().NewMountNamespace(ctx, creds, "", sys.Name, &vfs.MountOptions{}, nil)
-	if err != nil {
-		t.Fatalf("Failed to create new mount namespace: %v", err)
-	}
-	return testutil.NewSystem(ctx, t, k.VFS(), mns)
-}
-
-func TestReadCPUFile(t *testing.T) {
-	s := newTestSystem(t)
-	defer s.Destroy()
-	k := kernel.KernelFromContext(s.Ctx)
-	maxCPUCores := k.ApplicationCores()
-
-	expected := fmt.Sprintf("0-%d\n", maxCPUCores-1)
-
-	for _, fname := range []string{"online", "possible", "present"} {
-		pop := s.PathOpAtRoot(fmt.Sprintf("devices/system/cpu/%s", fname))
-		fd, err := s.VFS.OpenAt(s.Ctx, s.Creds, pop, &vfs.OpenOptions{})
-		if err != nil {
-			t.Fatalf("OpenAt(pop:%+v) = %+v failed: %v", pop, fd, err)
-		}
-		defer fd.DecRef(s.Ctx)
-		content, err := s.ReadToEnd(fd)
-		if err != nil {
-			t.Fatalf("Read failed: %v", err)
-		}
-		if diff := cmp.Diff(expected, content); diff != "" {
-			t.Fatalf("Read returned unexpected data:\n--- want\n+++ got\n%v", diff)
+func TestFullCPUMask(t *testing.T) {
+	for _, test := range []struct {
+		cores uint
+		want  string
+	}{
+		{1, "1"},
+		{2, "3"},
+		{3, "7"},
+		{4, "f"},
+		{5, "1f"},
+		{32, "ffffffff"},
+		{33, "1,ffffffff"},
+		{36, "f,ffffffff"},
+		{37, "1f,ffffffff"},
+		{64, "ffffffff,ffffffff"},
+		{65, "1,ffffffff,ffffffff"},
+	} {
+		if got := fullCPUMask(test.cores); got != test.want {
+			t.Errorf("fullCPUMask(%d): got %s, want %s", test.cores, got, test.want)
 		}
 	}
 }
 
-func TestSysRootContainsExpectedEntries(t *testing.T) {
-	s := newTestSystem(t)
-	defer s.Destroy()
-	pop := s.PathOpAtRoot("/")
-	s.AssertAllDirentTypes(s.ListDirents(pop), map[string]testutil.DirentType{
-		"block":    linux.DT_DIR,
-		"bus":      linux.DT_DIR,
-		"class":    linux.DT_DIR,
-		"dev":      linux.DT_DIR,
-		"devices":  linux.DT_DIR,
-		"firmware": linux.DT_DIR,
-		"fs":       linux.DT_DIR,
-		"kernel":   linux.DT_DIR,
-		"module":   linux.DT_DIR,
-		"power":    linux.DT_DIR,
-	})
-}
-
-func TestCgroupMountpointExists(t *testing.T) {
-	// Note: The mountpoint is only created if cgroups are available.
-	s := newTestSystem(t)
-	defer s.Destroy()
-	pop := s.PathOpAtRoot("/fs")
-	s.AssertAllDirentTypes(s.ListDirents(pop), map[string]testutil.DirentType{
-		"cgroup": linux.DT_DIR,
-	})
-	pop = s.PathOpAtRoot("/fs/cgroup")
-	s.AssertAllDirentTypes(s.ListDirents(pop), map[string]testutil.DirentType{ /*empty*/ })
+func TestOneCPUMask(t *testing.T) {
+	for _, test := range []struct {
+		i     uint
+		cores uint
+		want  string
+	}{
+		{0, 1, "1"},
+		{0, 4, "1"},
+		{1, 4, "2"},
+		{2, 4, "4"},
+		{3, 4, "8"},
+		{0, 5, "01"},
+		{4, 5, "10"},
+		{0, 32, "00000001"},
+		{26, 32, "04000000"},
+		{0, 33, "0,00000001"},
+		{31, 33, "0,80000000"},
+		{32, 33, "1,00000000"},
+		{0, 64, "00000000,00000001"},
+		{31, 64, "00000000,80000000"},
+		{32, 64, "00000001,00000000"},
+		{63, 64, "80000000,00000000"},
+		{0, 65, "0,00000000,00000001"},
+		{31, 65, "0,00000000,80000000"},
+		{32, 65, "0,00000001,00000000"},
+		{63, 65, "0,80000000,00000000"},
+		{64, 65, "1,00000000,00000000"},
+	} {
+		if got := oneCPUMask(test.i, test.cores); got != test.want {
+			t.Errorf("oneCPUMask(%d, %d): got %s, want %s", test.i, test.cores, got, test.want)
+		}
+	}
 }

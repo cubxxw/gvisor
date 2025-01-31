@@ -21,4 +21,13 @@ package linux
 // paging.
 //
 // The array has to be sorted in decreasing order.
-var feasibleTaskSizes = []uintptr{0xffffffffff000, 0x7ffffffff000}
+var feasibleTaskSizes = []uintptr{0xfffffffffff000, 0x7ffffffff000}
+
+// Page fault error codes
+const (
+	X86_PF_PROT = 1 << iota
+	X86_PF_WRITE
+	X86_PF_USER
+	X86_PF_RSVD
+	X86_PF_INSTR
+)

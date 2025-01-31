@@ -21,7 +21,7 @@ go_template_instance(
     name = "view_list",
     out = "view_list.go",
     package = "buffer",
-    prefix = "view",
+    prefix = "View",
     template = "//pkg/ilist:generic_list",
     types = {
         "Element": "*View",
@@ -62,6 +62,7 @@ go_test(
     ],
     library = ":buffer",
     deps = [
+        "//pkg/rand",
         "//pkg/state",
         "//pkg/tcpip/checksum",
         "@com_github_google_go_cmp//cmp:go_default_library",

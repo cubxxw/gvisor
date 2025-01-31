@@ -22,7 +22,6 @@ import (
 	"math/rand"
 	"runtime"
 	"testing"
-	"time"
 
 	"gvisor.dev/gvisor/pkg/compressio"
 )
@@ -44,8 +43,6 @@ type testCase struct {
 }
 
 func TestStatefile(t *testing.T) {
-	rand.Seed(time.Now().Unix())
-
 	compression := map[string]CompressionLevel{
 		"none":       CompressionLevelNone,
 		"compressed": CompressionLevelFlateBestSpeed,
@@ -69,8 +66,8 @@ func TestStatefile(t *testing.T) {
 		{"longer than hash", []byte("012356asdjflkasjlk3jlk23j4lkjaso0d789f0aujw3lkjlkxsdf78asdful2kj3ljka78"), nil},
 
 		// Make sure we have one longer than the chunk size.
-		{"chunks", make([]byte, 3*compressionChunkSize), nil},
-		{"large", make([]byte, 30*compressionChunkSize), nil},
+		{"chunks", make([]byte, 3*stateFileChunkSize), nil},
+		{"large", make([]byte, 30*stateFileChunkSize), nil},
 
 		// Different metadata.
 		{"one metadata", []byte("data"), map[string]string{"foo": "bar"}},
@@ -92,7 +89,7 @@ func TestStatefile(t *testing.T) {
 					c.metadata = map[string]string{}
 				}
 
-				c.metadata[compressionKey] = string(compress)
+				c.metadata[CompressionKey] = string(compress)
 
 				t.Run(c.name, func(t *testing.T) {
 					for _, key := range [][]byte{nil, integrityKey} {
@@ -139,7 +136,7 @@ func TestStatefile(t *testing.T) {
 									t.Fatalf("missing metadata: %s", k)
 								}
 								if v != nv {
-									t.Fatalf("mismatched metdata for %s: got %s, expected %s", k, nv, v)
+									t.Fatalf("mismatched metadata for %s: got %s, expected %s", k, nv, v)
 								}
 							}
 

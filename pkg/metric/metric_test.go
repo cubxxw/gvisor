@@ -18,16 +18,19 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"hash/adler32"
 	"math"
 	"os"
-	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/common/expfmt"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/testing/protocmp"
 	pb "gvisor.dev/gvisor/pkg/metric/metric_go_proto"
 	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -60,7 +63,7 @@ func verifyPrometheusParsing(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	if _, err := prometheus.Write(&buf, prometheus.ExportOptions{}, map[*prometheus.Snapshot]prometheus.SnapshotExportOptions{
-		snapshot: prometheus.SnapshotExportOptions{},
+		snapshot: {},
 	}); err != nil {
 		t.Errorf("failed to get Prometheus snapshot: %v", err)
 		return
@@ -98,20 +101,29 @@ func TestVerifyName(t *testing.T) {
 
 func TestInitialize(t *testing.T) {
 	defer resetTest()
+	field1 := NewField("field1", &fieldValFoo, &fieldValBar)
+	field2 := NewField("field2", &fieldValBaz, &fieldValQuux)
 
-	_, err := NewUint64Metric("/foo", false, pb.MetricMetadata_UNITS_NONE, fooDescription)
+	_, err := NewUint64Metric("/foo", Uint64Metadata{
+		Cumulative:  true,
+		Description: fooDescription,
+	})
 	if err != nil {
 		t.Fatalf("NewUint64Metric got err %v want nil", err)
 	}
 
-	_, err = NewUint64Metric("/bar", true, pb.MetricMetadata_UNITS_NANOSECONDS, barDescription)
+	_, err = NewUint64Metric("/bar", Uint64Metadata{
+		Cumulative:  true,
+		Sync:        true,
+		Description: barDescription,
+		Fields:      []Field{field1, field2},
+		Unit:        pb.MetricMetadata_UNITS_NANOSECONDS,
+	})
 	if err != nil {
 		t.Fatalf("NewUint64Metric got err %v want nil", err)
 	}
 
 	bucketer := NewExponentialBucketer(3, 2, 0, 1)
-	field1 := NewField("field1", &fieldValFoo, &fieldValBar)
-	field2 := NewField("field2", &fieldValBaz, &fieldValQuux)
 	_, err = NewDistributionMetric("/distrib", true, bucketer, pb.MetricMetadata_UNITS_NANOSECONDS, distribDescription, field1, field2)
 	if err != nil {
 		t.Fatalf("NewDistributionMetric got err %v want nil", err)
@@ -169,7 +181,14 @@ func TestInitialize(t *testing.T) {
 				t.Errorf("/bar %+v Description got %q want %q", m, m.Description, barDescription)
 			}
 			if !m.Sync {
-				t.Errorf("/bar %+v Sync got true want false", m)
+				t.Errorf("/bar %+v Sync got false want true", m)
+			}
+			wantFields := []*pb.MetricMetadata_Field{
+				{FieldName: "field1", AllowedValues: []string{"foo", "bar"}},
+				{FieldName: "field2", AllowedValues: []string{"baz", "quux"}},
+			}
+			if diff := cmp.Diff(m.Fields, wantFields, protocmp.Transform()); diff != "" {
+				t.Errorf("/bar %+v fields: got %v want %v\ndiff:\n%s", m, m.Fields, wantFields, diff)
 			}
 			if m.Units != pb.MetricMetadata_UNITS_NANOSECONDS {
 				t.Errorf("/bar %+v Units got %v want %v", m, m.Units, pb.MetricMetadata_UNITS_NANOSECONDS)
@@ -210,12 +229,18 @@ func TestInitialize(t *testing.T) {
 func TestDisable(t *testing.T) {
 	defer resetTest()
 
-	_, err := NewUint64Metric("/foo", false, pb.MetricMetadata_UNITS_NONE, fooDescription)
+	_, err := NewUint64Metric("/foo", Uint64Metadata{
+		Cumulative:  true,
+		Description: fooDescription,
+	})
 	if err != nil {
 		t.Fatalf("NewUint64Metric got err %v want nil", err)
 	}
 
-	_, err = NewUint64Metric("/bar", true, pb.MetricMetadata_UNITS_NONE, barDescription)
+	_, err = NewUint64Metric("/bar", Uint64Metadata{
+		Cumulative:  true,
+		Description: barDescription,
+	})
 	if err != nil {
 		t.Fatalf("NewUint64Metric got err %v want nil", err)
 	}
@@ -245,20 +270,27 @@ func TestDisable(t *testing.T) {
 
 func TestEmitMetricUpdate(t *testing.T) {
 	defer resetTest()
+	field1 := NewField("field1", &fieldValFoo, &fieldValBar)
+	field2 := NewField("field2", &fieldValBaz, &fieldValQuux)
 
-	foo, err := NewUint64Metric("/foo", false, pb.MetricMetadata_UNITS_NONE, fooDescription)
+	foo, err := NewUint64Metric("/foo", Uint64Metadata{
+		Cumulative:  true,
+		Description: fooDescription,
+	})
 	if err != nil {
 		t.Fatalf("NewUint64Metric got err %v want nil", err)
 	}
 
-	_, err = NewUint64Metric("/bar", true, pb.MetricMetadata_UNITS_NONE, barDescription)
+	bar, err := NewUint64Metric("/bar", Uint64Metadata{
+		Cumulative:  true,
+		Description: barDescription,
+		Fields:      []Field{field1, field2},
+	})
 	if err != nil {
 		t.Fatalf("NewUint64Metric got err %v want nil", err)
 	}
 
 	bucketer := NewExponentialBucketer(2, 2, 0, 1)
-	field1 := NewField("field1", &fieldValFoo, &fieldValBar)
-	field2 := NewField("field2", &fieldValBaz, &fieldValQuux)
 	distrib, err := NewDistributionMetric("/distrib", false, bucketer, pb.MetricMetadata_UNITS_NONE, distribDescription, field1, field2)
 	if err != nil {
 		t.Fatalf("NewDistributionMetric: %v", err)
@@ -281,11 +313,11 @@ func TestEmitMetricUpdate(t *testing.T) {
 		t.Fatalf("emitter %v got %T want pb.MetricUpdate", emitter[0], emitter[0])
 	}
 
-	if len(update.Metrics) != 2 {
-		t.Errorf("MetricUpdate got %d metrics want %d", len(update.Metrics), 2)
+	// We only expect /foo, as /bar is initially omitted due to being all-zero.
+	if len(update.Metrics) != 1 {
+		t.Errorf("MetricUpdate got %d metrics want %d", len(update.Metrics), 1)
 	}
 
-	// Both are included for their initial values.
 	foundFoo := false
 	foundBar := false
 	foundDistrib := false
@@ -313,8 +345,8 @@ func TestEmitMetricUpdate(t *testing.T) {
 	if !foundFoo {
 		t.Errorf("/foo not found: %+v", emitter)
 	}
-	if !foundBar {
-		t.Errorf("/bar not found: %+v", emitter)
+	if foundBar {
+		t.Errorf("/bar unexpectedly found: %+v", emitter)
 	}
 	if foundDistrib {
 		t.Errorf("/distrib unexpectedly found: %+v", emitter)
@@ -354,13 +386,16 @@ func TestEmitMetricUpdate(t *testing.T) {
 	}
 	verifyPrometheusParsing(t)
 
-	// Add a few samples to the distribution metric.
+	// Add a few samples to the distribution metric and increment two of the
+	// /bar field combinations.
 	distrib.AddSample(1, &fieldValFoo, &fieldValBaz)
 	distrib.AddSample(1, &fieldValFoo, &fieldValBaz)
 	distrib.AddSample(3, &fieldValFoo, &fieldValBaz)
 	distrib.AddSample(-1, &fieldValFoo, &fieldValQuux)
 	distrib.AddSample(1, &fieldValFoo, &fieldValQuux)
 	distrib.AddSample(100, &fieldValFoo, &fieldValQuux)
+	bar.Increment(&fieldValFoo, &fieldValBaz)
+	bar.IncrementBy(1337, &fieldValFoo, &fieldValQuux)
 	emitter.Reset()
 	EmitMetricUpdate()
 	if len(emitter) != 1 {
@@ -370,40 +405,61 @@ func TestEmitMetricUpdate(t *testing.T) {
 	if !ok {
 		t.Fatalf("emitter %v got %T want pb.MetricUpdate", emitter[0], emitter[0])
 	}
-	if len(update.Metrics) != 2 {
-		t.Fatalf("MetricUpdate got %d metrics want %d", len(update.Metrics), 1)
+	if len(update.Metrics) != 4 {
+		t.Fatalf("MetricUpdate got %d metrics want %d", len(update.Metrics), 4)
 	}
 	for _, m := range update.Metrics {
-		if m.Name != "/distrib" {
-			t.Fatalf("Metric %+v name got %q want '/distrib'", m, m.Name)
-		}
-		if len(m.FieldValues) != 2 {
-			t.Fatalf("Metric %+v fields: got %v want %d fields", m, m.FieldValues, 2)
-		}
-		if m.FieldValues[0] != "foo" {
-			t.Fatalf("Metric %+v field 0: got %v want %v", m, m.FieldValues[0], "foo")
-		}
-		dv, ok := m.Value.(*pb.MetricValue_DistributionValue)
-		if !ok {
-			t.Fatalf("%+v: value %v got %T want pb.MetricValue_DistributionValue", m, m.Value, m.Value)
-		}
-		samples := dv.DistributionValue.GetNewSamples()
-		if len(samples) != 4 {
-			t.Fatalf("%+v: got %d buckets, want %d", dv.DistributionValue, len(samples), 4)
-		}
-		var wantSamples []uint64
-		switch m.FieldValues[1] {
-		case "baz":
-			wantSamples = []uint64{0, 2, 1, 0}
-		case "quux":
-			wantSamples = []uint64{1, 1, 0, 1}
-		default:
-			t.Fatalf("%+v: got unexpected field[1]: %q", m, m.FieldValues[1])
-		}
-		for i, s := range samples {
-			if s != wantSamples[i] {
-				t.Errorf("%+v [fields %v]: sample %d: got %d want %d", dv.DistributionValue, m.FieldValues, i, s, wantSamples[i])
+		switch m.Name {
+		case "/distrib":
+			if len(m.FieldValues) != 2 {
+				t.Fatalf("Metric %+v fields: got %v want %d fields", m, m.FieldValues, 2)
 			}
+			if m.FieldValues[0] != "foo" {
+				t.Fatalf("Metric %+v field 0: got %v want %v", m, m.FieldValues[0], "foo")
+			}
+			dv, ok := m.Value.(*pb.MetricValue_DistributionValue)
+			if !ok {
+				t.Fatalf("%+v: value %v got %T want pb.MetricValue_DistributionValue", m, m.Value, m.Value)
+			}
+			samples := dv.DistributionValue.GetNewSamples()
+			if len(samples) != 4 {
+				t.Fatalf("%+v: got %d buckets, want %d", dv.DistributionValue, len(samples), 4)
+			}
+			var wantSamples []uint64
+			switch m.FieldValues[1] {
+			case "baz":
+				wantSamples = []uint64{0, 2, 1, 0}
+			case "quux":
+				wantSamples = []uint64{1, 1, 0, 1}
+			default:
+				t.Fatalf("%+v: got unexpected field[1]: %q", m, m.FieldValues[1])
+			}
+			for i, s := range samples {
+				if s != wantSamples[i] {
+					t.Errorf("%+v [fields %v]: sample %d: got %d want %d", dv.DistributionValue, m.FieldValues, i, s, wantSamples[i])
+				}
+			}
+		case "/bar":
+			if len(m.FieldValues) != 2 {
+				t.Fatalf("Metric %+v fields: got %v want %d fields", m, m.FieldValues, 2)
+			}
+			if m.FieldValues[0] != "foo" {
+				t.Fatalf("Metric %+v field 0: got %v want %v", m, m.FieldValues[0], "foo")
+			}
+			var wantValue uint64
+			switch m.FieldValues[1] {
+			case "baz":
+				wantValue = 1
+			case "quux":
+				wantValue = 1337
+			default:
+				t.Fatalf("%+v: got unexpected field[1]: %q", m, m.FieldValues[1])
+			}
+			if uv, ok := m.Value.(*pb.MetricValue_Uint64Value); !ok || uv.Uint64Value != wantValue {
+				t.Errorf("%+v: value for fields %v: got %T value %v want uint64 value %d", m, m.FieldValues, m.Value, m.Value, wantValue)
+			}
+		default:
+			t.Fatalf("Metric update %+v: Unexpected metric name got %q", m, m.Name)
 		}
 	}
 	verifyPrometheusParsing(t)
@@ -440,99 +496,6 @@ func TestEmitMetricUpdate(t *testing.T) {
 	if len(emitter) != 0 {
 		t.Fatalf("EmitMetricUpdate emitted %d events want %d", len(emitter), 0)
 	}
-	verifyPrometheusParsing(t)
-}
-
-func TestEmitMetricUpdateWithFields(t *testing.T) {
-	defer resetTest()
-
-	var (
-		weird1 = FieldValue{"weird1"}
-		weird2 = FieldValue{"weird2"}
-	)
-	field := NewField("weirdness_type", &weird1, &weird2)
-
-	counter, err := NewUint64Metric("/weirdness", false, pb.MetricMetadata_UNITS_NONE, counterDescription, field)
-	if err != nil {
-		t.Fatalf("NewUint64Metric got err %v want nil", err)
-	}
-
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize(): %s", err)
-	}
-	verifyPrometheusParsing(t)
-
-	// Don't care about the registration metrics.
-	emitter.Reset()
-	EmitMetricUpdate()
-
-	// For metrics with fields, we do not emit data unless the value is
-	// incremented.
-	if len(emitter) != 0 {
-		t.Fatalf("EmitMetricUpdate emitted %d events want 0", len(emitter))
-	}
-	verifyPrometheusParsing(t)
-
-	counter.IncrementBy(4, &weird1)
-	counter.Increment(&weird2)
-
-	emitter.Reset()
-	EmitMetricUpdate()
-
-	if len(emitter) != 1 {
-		t.Fatalf("EmitMetricUpdate emitted %d events want 1", len(emitter))
-	}
-
-	update, ok := emitter[0].(*pb.MetricUpdate)
-	if !ok {
-		t.Fatalf("emitter %v got %T want pb.MetricUpdate", emitter[0], emitter[0])
-	}
-
-	if len(update.Metrics) != 2 {
-		t.Errorf("MetricUpdate got %d metrics want 2", len(update.Metrics))
-	}
-
-	foundWeird1 := false
-	foundWeird2 := false
-	for i := 0; i < len(update.Metrics); i++ {
-		m := update.Metrics[i]
-
-		if m.Name != "/weirdness" {
-			t.Errorf("Metric %+v name got %q want '/weirdness'", m, m.Name)
-		}
-		if len(m.FieldValues) != 1 {
-			t.Errorf("MetricUpdate got %d fields want 1", len(m.FieldValues))
-		}
-
-		switch m.FieldValues[0] {
-		case weird1.Value:
-			uv, ok := m.Value.(*pb.MetricValue_Uint64Value)
-			if !ok {
-				t.Errorf("%+v: value %v got %T want pb.MetricValue_Uint64Value", m, m.Value, m.Value)
-			}
-			if uv.Uint64Value != 4 {
-				t.Errorf("%v: Value got %v want 4", m, uv.Uint64Value)
-			}
-			foundWeird1 = true
-		case weird2.Value:
-			uv, ok := m.Value.(*pb.MetricValue_Uint64Value)
-			if !ok {
-				t.Errorf("%+v: value %v got %T want pb.MetricValue_Uint64Value", m, m.Value, m.Value)
-			}
-			if uv.Uint64Value != 1 {
-				t.Errorf("%v: Value got %v want 1", m, uv.Uint64Value)
-			}
-			foundWeird2 = true
-		}
-	}
-
-	if !foundWeird1 {
-		t.Errorf("Field value weird1 not found: %+v", emitter)
-	}
-	if !foundWeird2 {
-		t.Errorf("Field value weird2 not found: %+v", emitter)
-	}
-
 	verifyPrometheusParsing(t)
 }
 
@@ -580,7 +543,10 @@ func TestMetricUpdateStageTiming(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	})
 
-	fooMetric, err := NewUint64Metric("/foo", false, pb.MetricMetadata_UNITS_NONE, fooDescription)
+	fooMetric, err := NewUint64Metric("/foo", Uint64Metadata{
+		Cumulative:  true,
+		Description: fooDescription,
+	})
 	if err != nil {
 		t.Fatalf("Cannot register /foo: %v", err)
 	}
@@ -728,7 +694,7 @@ func TestTimerMetric(t *testing.T) {
 	}
 	m := emitter[0].(*pb.MetricUpdate).Metrics[0]
 	wantFields := []string{"foo", "quux"}
-	if !reflect.DeepEqual(m.GetFieldValues(), wantFields) {
+	if !slices.Equal(m.GetFieldValues(), wantFields) {
 		t.Errorf("%+v: got fields %v want %v", m, m.GetFieldValues(), wantFields)
 	}
 	dv, ok := m.Value.(*pb.MetricValue_DistributionValue)
@@ -1034,10 +1000,23 @@ func TestFieldMapperMustUseSameValuePointer(t *testing.T) {
 }
 
 func TestMetricProfiling(t *testing.T) {
+	fieldVal1 := &FieldValue{"val1"}
+	fieldVal2 := &FieldValue{"val2"}
+	fieldVal3 := &FieldValue{"val3"}
+	fieldVal4 := &FieldValue{"val4"}
+	fieldVal5 := &FieldValue{"val5"}
+	fieldVal6 := &FieldValue{"val6"}
+	fieldVal7 := &FieldValue{"val7"}
+	fieldVal8 := &FieldValue{"val8"}
+	fieldVal9 := &FieldValue{"val9"}
+
 	for _, test := range []struct {
 		name                 string
 		profilingMetricsFlag string
 		metricNames          []string
+		firstMetricFields    []Field
+		expectedHeader       string // If unspecified, computed automatically for non-field metrics.
+		lossy                bool
 		incrementMetricBy    []uint64
 		numIterations        uint64
 		errOnStartProfiling  bool
@@ -1046,6 +1025,15 @@ func TestMetricProfiling(t *testing.T) {
 			name:                 "simple single metric",
 			profilingMetricsFlag: "/foo",
 			metricNames:          []string{"/foo"},
+			incrementMetricBy:    []uint64{50},
+			numIterations:        100,
+			errOnStartProfiling:  false,
+		},
+		{
+			name:                 "simple single metric, lossy writer",
+			profilingMetricsFlag: "/foo",
+			metricNames:          []string{"/foo"},
+			lossy:                true,
 			incrementMetricBy:    []uint64{50},
 			numIterations:        100,
 			errOnStartProfiling:  false,
@@ -1067,6 +1055,72 @@ func TestMetricProfiling(t *testing.T) {
 			errOnStartProfiling:  false,
 		},
 		{
+			name:                 "single metric with 1 field",
+			profilingMetricsFlag: "/foo",
+			metricNames:          []string{"/foo"},
+			firstMetricFields: []Field{
+				NewField("field1", fieldVal1, fieldVal2, fieldVal3),
+			},
+			expectedHeader:      TimeColumn + "\t/foo[val1]\t/foo[val2]\t/foo[val3]",
+			incrementMetricBy:   []uint64{1337},
+			numIterations:       100,
+			errOnStartProfiling: false,
+		},
+		{
+			name:                 "single metric with multiple fields",
+			profilingMetricsFlag: "/foo",
+			metricNames:          []string{"/foo"},
+			firstMetricFields: []Field{
+				NewField("field1", fieldVal1, fieldVal2, fieldVal3),
+				NewField("field2", fieldVal4, fieldVal5, fieldVal6),
+				NewField("field3", fieldVal7, fieldVal8, fieldVal9),
+			},
+			expectedHeader: TimeColumn + "\t" + strings.Join([]string{
+				"/foo[val1,val4,val7]",
+				"/foo[val1,val4,val8]",
+				"/foo[val1,val4,val9]",
+				"/foo[val1,val5,val7]",
+				"/foo[val1,val5,val8]",
+				"/foo[val1,val5,val9]",
+				"/foo[val1,val6,val7]",
+				"/foo[val1,val6,val8]",
+				"/foo[val1,val6,val9]",
+				"/foo[val2,val4,val7]",
+				"/foo[val2,val4,val8]",
+				"/foo[val2,val4,val9]",
+				"/foo[val2,val5,val7]",
+				"/foo[val2,val5,val8]",
+				"/foo[val2,val5,val9]",
+				"/foo[val2,val6,val7]",
+				"/foo[val2,val6,val8]",
+				"/foo[val2,val6,val9]",
+				"/foo[val3,val4,val7]",
+				"/foo[val3,val4,val8]",
+				"/foo[val3,val4,val9]",
+				"/foo[val3,val5,val7]",
+				"/foo[val3,val5,val8]",
+				"/foo[val3,val5,val9]",
+				"/foo[val3,val6,val7]",
+				"/foo[val3,val6,val8]",
+				"/foo[val3,val6,val9]",
+			}, "\t"),
+			incrementMetricBy:   []uint64{1337},
+			numIterations:       100,
+			errOnStartProfiling: false,
+		},
+		{
+			name:                 "multiple metrics and one has fields",
+			profilingMetricsFlag: "/foo,/bar",
+			metricNames:          []string{"/foo", "/bar"},
+			firstMetricFields: []Field{
+				NewField("field1", fieldVal1, fieldVal2, fieldVal3),
+			},
+			expectedHeader:      TimeColumn + "\t/foo[val1]\t/foo[val2]\t/foo[val3]\t/bar",
+			incrementMetricBy:   []uint64{42, 27},
+			numIterations:       100,
+			errOnStartProfiling: false,
+		},
+		{
 			name:                 "mismatched names",
 			profilingMetricsFlag: "/foo,/fighter,/big/test/baz,/metric",
 			metricNames:          []string{"/foo", "/bar", "/big/test/baz", "/metric"},
@@ -1078,15 +1132,41 @@ func TestMetricProfiling(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			defer resetTest()
 			const profilingRate = 1000 * time.Microsecond
-			numMetrics := len(test.metricNames)
+			numEntries := 0
+			for i := range test.metricNames {
+				if i == 0 {
+					fm, err := newFieldMapper(test.firstMetricFields...)
+					if err != nil {
+						t.Fatalf("newFieldMapper err: got %v wanted nil", err)
+					}
+					numEntries += fm.numKeys()
+				} else {
+					numEntries++
+				}
+			}
 
-			metrics := make([]*Uint64Metric, numMetrics)
+			metrics := make([]*Uint64Metric, len(test.metricNames))
 			for i, m := range test.metricNames {
-				newMetric, err := NewUint64Metric(m, true, pb.MetricMetadata_UNITS_NANOSECONDS, fooDescription)
+				var fields []Field
+				if i == 0 {
+					for _, f := range test.firstMetricFields {
+						fields = append(fields, f)
+					}
+				}
+				newMetric, err := NewUint64Metric(m, Uint64Metadata{
+					Cumulative:  true,
+					Sync:        true,
+					Description: fooDescription,
+					Fields:      fields,
+				})
 				metrics[i] = newMetric
 				if err != nil {
 					t.Fatalf("NewUint64Metric got err '%v' want nil", err)
 				}
+			}
+			firstMetricFieldMapper, err := newFieldMapper(test.firstMetricFields...)
+			if err != nil {
+				t.Fatalf("newFieldMapper err: got %v wanted nil", err)
 			}
 
 			f, err := os.CreateTemp(t.TempDir(), "profiling-metrics")
@@ -1094,12 +1174,16 @@ func TestMetricProfiling(t *testing.T) {
 				t.Fatalf("failed to create file: '%v'", err)
 			}
 			fName := f.Name()
-			ProfilingMetricWriter = f
 
 			if err := Initialize(); err != nil {
 				t.Fatalf("Initialize error: got '%v' want nil", err)
 			}
-			if err := StartProfilingMetrics(test.profilingMetricsFlag, profilingRate); err != nil {
+			if err := StartProfilingMetrics(ProfilingMetricsOptions[*os.File]{
+				Sink:    f,
+				Lossy:   test.lossy,
+				Metrics: test.profilingMetricsFlag,
+				Rate:    profilingRate,
+			}); err != nil {
 				if test.errOnStartProfiling {
 					return
 				}
@@ -1112,7 +1196,15 @@ func TestMetricProfiling(t *testing.T) {
 			// Generate some test data
 			for i := 0; i < int(test.numIterations); i++ {
 				for metricIdx, m := range metrics {
-					m.IncrementBy(test.incrementMetricBy[metricIdx])
+					if metricIdx == 0 {
+						for fieldKey := 0; fieldKey < firstMetricFieldMapper.numKeys(); fieldKey++ {
+							fieldValues := make([]*FieldValue, len(test.firstMetricFields))
+							firstMetricFieldMapper.keyToMultiFieldInPlace(fieldKey, fieldValues)
+							m.IncrementBy(test.incrementMetricBy[metricIdx], fieldValues...)
+						}
+					} else {
+						m.IncrementBy(test.incrementMetricBy[metricIdx])
+					}
 				}
 				// Give time to the collector to record it.
 				time.Sleep(profilingRate)
@@ -1125,27 +1217,104 @@ func TestMetricProfiling(t *testing.T) {
 				t.Fatalf("failed to open file a second time: %v", err)
 			}
 
-			// Check the header
-			lines := bufio.NewScanner(f)
-			expectedHeader := "Time (ns)\t" + strings.Join(test.metricNames, "\t")
-			lines.Scan()
-			header := lines.Text()
-			if header != expectedHeader {
-				t.Fatalf("header mismatch: got '%s' want '%s'", header, expectedHeader)
-			}
-
-			// Check that data looks sane:
+			// Check that the log looks sane:
+			// - Header should match what we expect.
+			// - We should have one metadata line per metric.
+			// - We should have one start time line.
+			// - If in lossy mode, we should have a hash line.
+			// - If we have a hash, it should match the one computed by this test.
 			// - Each timestamp should always be bigger.
 			// - Each metric value should be at least as big as the previous.
+			h := adler32.New()
+			lines := bufio.NewScanner(f)
+			expectedHeader := test.expectedHeader
+			if expectedHeader == "" {
+				expectedHeader = TimeColumn + "\t" + strings.Join(test.metricNames, "\t")
+			}
+			if test.lossy {
+				expectedHeader += "\tChecksum"
+			}
 			prevTS := uint64(0)
-			prevValues := make([]uint64, numMetrics)
+			prevValues := make([]uint64, numEntries)
 			numDatapoints := 0
+			var hashLine string
+			gotMetadataFor := make(map[string]struct{}, len(test.metricNames))
+			gotHeader := false
+			gotStartTime := false
+			gotStats := false
 			for lines.Scan() {
 				line := lines.Text()
+				if line == "" {
+					continue
+				}
+				if test.lossy {
+					if !strings.HasPrefix(line, MetricsPrefix) {
+						t.Fatalf("lossy writer output does not have expected prefix: got %q want %q", line, MetricsPrefix)
+					}
+					line = strings.TrimPrefix(line, MetricsPrefix)
+				}
+				if strings.HasPrefix(line, MetricsHashIndicator) {
+					if hashLine != "" {
+						t.Fatalf("got multiple hash lines")
+					}
+					hashLine = line
+					continue
+				}
+				h.Write([]byte(line + "\n"))
+				// Check line checksum
+				if test.lossy {
+					tabSplit := strings.Split(line, "\t")
+					gotLineChecksum := tabSplit[len(tabSplit)-1]
+					wantLineChecksum := fmt.Sprintf("0x%x", adler32.Checksum([]byte(strings.Join(tabSplit[:len(tabSplit)-1], "\t"))))
+					if gotLineChecksum != wantLineChecksum {
+						t.Errorf("got line checksum %q, want %q", gotLineChecksum, wantLineChecksum)
+						continue
+					}
+					line = strings.TrimSuffix(line, "\t"+gotLineChecksum)
+				}
+				if strings.HasPrefix(line, MetricsMetaIndicator) {
+					line = strings.TrimPrefix(line, MetricsMetaIndicator)
+					components := strings.Split(line, "\t")
+					if len(components) != 2 {
+						t.Fatalf("got %d components in metadata line %q, want 2", len(components), line)
+					}
+					// We only verify that the metadata is present, not its contents.
+					if components[0] == "" || components[1] == "" {
+						t.Fatalf("got empty metadata line: %q", line)
+					}
+					gotMetadataFor[components[0]] = struct{}{}
+					continue
+				}
+				if strings.HasPrefix(line, MetricsStartTimeIndicator) {
+					if gotStartTime {
+						t.Fatalf("got multiple start time lines")
+					}
+					gotStartTime = true
+					continue
+				}
+				if strings.HasPrefix(line, MetricsStatsIndicator) {
+					if gotStats {
+						t.Fatalf("got multiple stats lines")
+					}
+					gotStats = true
+					_, err := ParseCollectionStats(line)
+					if err != nil {
+						t.Fatalf("failed to parse collection stats: %v", err)
+					}
+					continue
+				}
+				if !gotHeader {
+					// This line must be the header.
+					if line != expectedHeader {
+						t.Fatalf("got header %q, want %q", line, expectedHeader)
+					}
+					gotHeader = true
+					continue
+				}
 				numDatapoints++
 				items := strings.Split(line, "\t")
-				if len(items) != (numMetrics + 1) {
-					t.Fatalf("incorrect number of items on line '%s': got %d, want %d", line, len(items), numMetrics+1)
+				if len(items) != (numEntries + 1) {
+					t.Fatalf("incorrect number of items on line '%s': got %d, want %d", line, len(items), numEntries+1)
 				}
 				// Check timestamp
 				ts, err := strconv.ParseUint(items[0], 10, 64)
@@ -1158,7 +1327,7 @@ func TestMetricProfiling(t *testing.T) {
 				prevTS = ts
 
 				// Check metric values
-				for i := 1; i <= numMetrics; i++ {
+				for i := 1; i <= numEntries; i++ {
 					m, err := strconv.ParseUint(items[i], 10, 64)
 					if err != nil {
 						t.Errorf("m ParseUint error on line '%s': got '%v' want nil", line, err)
@@ -1174,10 +1343,49 @@ func TestMetricProfiling(t *testing.T) {
 				t.Errorf("numDatapoints: got %d, want at least %d", numDatapoints, expectedMinNumDatapoints)
 			}
 			// Check that the final total for each metric is correct
-			for i := 0; i < numMetrics; i++ {
-				expected := test.numIterations * test.incrementMetricBy[i]
-				if prevValues[i] != expected {
-					t.Errorf("incorrect final metric value: got %d, want %d", prevValues[i], expected)
+			for metricIdx := range metrics {
+				expected := test.numIterations * test.incrementMetricBy[metricIdx]
+				if metricIdx == 0 {
+					for fieldKey := 0; fieldKey < firstMetricFieldMapper.numKeys(); fieldKey++ {
+						if prevValues[fieldKey] != expected {
+							t.Errorf("incorrect final metric value: got %d, want %d", prevValues[fieldKey], expected)
+						}
+					}
+				} else {
+					if itemIdx := firstMetricFieldMapper.numKeys() + metricIdx - 1; prevValues[itemIdx] != expected {
+						t.Errorf("incorrect final metric value: got %d, want %d", prevValues[itemIdx], expected)
+					}
+				}
+			}
+			if len(gotMetadataFor) != len(test.metricNames) {
+				t.Errorf("got metadata for %d metrics, want %d", len(gotMetadataFor), len(test.metricNames))
+			}
+			for _, metricName := range test.metricNames {
+				if _, ok := gotMetadataFor[metricName]; !ok {
+					t.Errorf("did not get metadata for metric %q", metricName)
+				}
+			}
+			if !gotStartTime {
+				t.Error("did not get start time metadata")
+			}
+			if !gotStats {
+				t.Error("did not get collection stats")
+			}
+			if !gotHeader {
+				t.Error("did not get header")
+			}
+			if test.lossy {
+				if hashLine == "" {
+					t.Fatal("lossy writer output does not have expected hash line")
+				}
+				wantHash := fmt.Sprintf("0x%x", h.Sum32())
+				gotHash := strings.TrimPrefix(hashLine, MetricsHashIndicator)
+				if gotHash != wantHash {
+					t.Fatalf("lossy writer output does not have expected hash line: got %q want %q", gotHash, wantHash)
+				}
+			} else {
+				if hashLine != "" {
+					t.Fatalf("unexpectedly found hash line in non-lossy output: %q", hashLine)
 				}
 			}
 			f.Close()

@@ -25,7 +25,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -33,6 +33,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/docker/api/types/mount"
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 )
@@ -63,6 +64,25 @@ func TestHelloWorld(t *testing.T) {
 	}
 }
 
+func TestRust(t *testing.T) {
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+
+	// Run the basic container.
+	out, err := d.Run(ctx, dockerutil.RunOpts{
+		Image: "basic/rust",
+	})
+	if err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+
+	// Check the output.
+	if !strings.Contains(out, "Hello, World!") {
+		t.Fatalf("Container didn't say Hello, World!: got %s", out)
+	}
+}
+
 func runHTTPRequest(ip string, port int) error {
 	url := fmt.Sprintf("http://%s:%d/not-found", ip, port)
 	resp, err := http.Get(url)
@@ -82,7 +102,7 @@ func runHTTPRequest(ip string, port int) error {
 		return fmt.Errorf("Wrong response code, got: %d, want: %d", resp.StatusCode, want)
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("Error reading http response: %v", err)
 	}
@@ -289,7 +309,7 @@ func TestRuby(t *testing.T) {
 	if want := http.StatusOK; resp.StatusCode != want {
 		t.Errorf("wrong response code, got: %d, want: %d", resp.StatusCode, want)
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("error reading body: %v", err)
 	}
@@ -316,6 +336,124 @@ func TestStdio(t *testing.T) {
 		if _, err := d.WaitForOutput(ctx, want, defaultWait); err != nil {
 			t.Fatalf("docker didn't get output %q : %v", want, err)
 		}
+	}
+}
+
+func dockerInGvisorCapabilities() []string {
+	return []string{
+		"audit_write",
+		"chown",
+		"dac_override",
+		"fowner",
+		"fsetid",
+		"kill",
+		"mknod",
+		"net_admin",
+		"net_bind_service",
+		"net_raw",
+		"setfcap",
+		"setgid",
+		"setpcap",
+		"setuid",
+		"sys_admin",
+		"sys_chroot",
+		"sys_ptrace",
+	}
+}
+
+func TestDockerOverlayWithHostNetwork(t *testing.T) {
+	testDocker(t, true, true, false)
+}
+
+func TestPrivilegedDockerOverlayWithHostNetwork(t *testing.T) {
+	testDocker(t, true, true, true)
+}
+
+func TestDockerOverlay(t *testing.T) {
+	testDocker(t, true, false, false)
+}
+
+func TestPrivilegedDockerOverlay(t *testing.T) {
+	testDocker(t, true, false, true)
+}
+
+func TestDockerWithHostNetwork(t *testing.T) {
+	testDocker(t, false, true, false)
+}
+
+func TestPrivilegedDockerWithHostNetwork(t *testing.T) {
+	testDocker(t, false, true, true)
+}
+
+func TestDocker(t *testing.T) {
+	// Overlayfs can't be built on top of another overlayfs, so docket has
+	// to fall back to the vfs driver.
+	testDocker(t, false, false, false)
+}
+
+func TestPrivilegedDocker(t *testing.T) {
+	// Overlayfs can't be built on top of another overlayfs, so docket has
+	// to fall back to the vfs driver.
+	testDocker(t, false, false, true)
+}
+
+func testDocker(t *testing.T, overlay, hostNetwork, startPrivilegedContainer bool) {
+	if testutil.IsRunningWithHostNet() {
+		t.Skip("docker doesn't work with hostinet")
+	}
+	ctx := context.Background()
+	d := dockerutil.MakeContainerWithRuntime(ctx, t, "-docker")
+	defer d.CleanUp(ctx)
+
+	// Start the container.
+	opts := dockerutil.RunOpts{
+		Image:  "basic/docker",
+		CapAdd: dockerInGvisorCapabilities(),
+	}
+	if overlay {
+		opts.Mounts = []mount.Mount{
+			{
+				Target: "/var/lib/docker",
+				Type:   mount.TypeTmpfs,
+			},
+		}
+	}
+	if err := d.Spawn(ctx, opts); err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+
+	if overlay {
+		// Docker creates tmpfs mounts with the noexec flag.
+		output, err := d.Exec(ctx,
+			dockerutil.ExecOpts{Privileged: true},
+			"mount", "-o", "remount,exec", "/var/lib/docker",
+		)
+		if err != nil {
+			t.Fatalf("docker exec failed: %v\n%s", err, output)
+		}
+	}
+	// Wait for the docker daemon.
+	for i := 0; i < 10; i++ {
+		output, err := d.Exec(ctx, dockerutil.ExecOpts{}, "docker", "info")
+		t.Logf("== docker info ==\n%s", output)
+		if err != nil {
+			t.Logf("docker exec failed: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		break
+	}
+	cmd := []string{"docker", "run", "--rm"}
+	if hostNetwork {
+		cmd = append(cmd, "--network", "host")
+	}
+	if startPrivilegedContainer {
+		cmd = append(cmd, "--privileged")
+	}
+	cmd = append(cmd, "alpine", "sh", "-c", "apk add curl && curl -h")
+	_, err := d.ExecProcess(ctx, dockerutil.ExecOpts{}, cmd...)
+	if err != nil {
+		t.Fatalf("docker exec failed: %v", err)
 	}
 }
 

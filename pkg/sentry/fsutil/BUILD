@@ -1,6 +1,6 @@
+load("//pkg/sync/locking:locking.bzl", "declare_mutex")
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
-load("//pkg/sync/locking:locking.bzl", "declare_mutex")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -72,6 +72,42 @@ go_template_instance(
     },
 )
 
+go_template_instance(
+    name = "mapping_set",
+    out = "mapping_set.go",
+    imports = {
+        "mm": "gvisor.dev/gvisor/pkg/sentry/mm",
+        "memmap": "gvisor.dev/gvisor/pkg/sentry/memmap",
+    },
+    package = "fsutil",
+    prefix = "mapping",
+    template = "//pkg/segment:generic_set",
+    types = {
+        "Key": "uint64",
+        "Range": "memmap.FileRange",
+        "Value": "mapping",
+        "Functions": "mappingSetFuncs",
+    },
+)
+
+go_template_instance(
+    name = "refs_set",
+    out = "refs_set.go",
+    imports = {
+        "mm": "gvisor.dev/gvisor/pkg/sentry/mm",
+        "memmap": "gvisor.dev/gvisor/pkg/sentry/memmap",
+    },
+    package = "fsutil",
+    prefix = "refs",
+    template = "//pkg/segment:generic_set",
+    types = {
+        "Key": "uint64",
+        "Range": "memmap.FileRange",
+        "Value": "uint64",
+        "Functions": "refsSetFuncs",
+    },
+)
+
 go_library(
     name = "fsutil",
     srcs = [
@@ -85,8 +121,11 @@ go_library(
         "host_file_mapper.go",
         "host_file_mapper_state.go",
         "host_file_mapper_unsafe.go",
+        "mapping_set.go",
         "maps_mutex.go",
+        "precise_host_file_mapper.go",
         "refs_mutex.go",
+        "refs_set.go",
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [
@@ -97,8 +136,9 @@ go_library(
         "//pkg/log",
         "//pkg/safemem",
         "//pkg/sentry/arch",
-        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/memmap",
+        "//pkg/sentry/mm",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/usage",
         "//pkg/state",

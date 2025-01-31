@@ -21,8 +21,11 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sigframe"
 )
 
 // dieArchSetup initializes the state for dieTrampoline.
@@ -63,16 +66,16 @@ func getHypercallID(addr uintptr) int {
 	return _KVM_HYPERCALL_MAX
 }
 
-// bluepillStopGuest is reponsible for injecting interrupt.
+// bluepillStopGuest is responsible for injecting interrupt.
 //
 //go:nosplit
 func bluepillStopGuest(c *vCPU) {
 	// Interrupt: we must have requested an interrupt
 	// window; set the interrupt line.
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_INTERRUPT,
+		KVM_INTERRUPT,
 		uintptr(unsafe.Pointer(&bounce))); errno != 0 {
 		throw("interrupt injection failed")
 	}
@@ -80,19 +83,19 @@ func bluepillStopGuest(c *vCPU) {
 	c.runData.requestInterruptWindow = 0
 }
 
-// bluepillSigBus is reponsible for injecting NMI to trigger sigbus.
+// bluepillSigBus is responsible for injecting NMI to trigger sigbus.
 //
 //go:nosplit
 func bluepillSigBus(c *vCPU) {
-	if _, _, errno := unix.RawSyscall( // escapes: no.
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_NMI, 0); errno != 0 {
+		KVM_NMI, 0); errno != 0 {
 		throw("NMI injection failed")
 	}
 }
 
-// bluepillHandleEnosys is reponsible for handling enosys error.
+// bluepillHandleEnosys is responsible for handling enosys error.
 //
 //go:nosplit
 func bluepillHandleEnosys(c *vCPU) {
@@ -140,4 +143,41 @@ func bluepillReadyStopGuest(c *vCPU) bool {
 //go:nosplit
 func bluepillArchHandleExit(c *vCPU, context unsafe.Pointer) {
 	c.die(bluepillArchContext(context), "unknown")
+}
+
+func addrOfBluepillUserHandler() uintptr
+
+func getcs() uint16
+
+func currentCPU() *vCPU
+
+// bluepill enters guest mode.
+//
+//go:nosplit
+func bluepill(c *vCPU) {
+	// The sentry is running in the VM ring 0.
+	if getcs()&3 == 0 {
+		if currentCPU() == c {
+			// Already in the vm.
+			return
+		}
+		// Wrong vCPU, switch to the right one.
+		redpill()
+	}
+
+	// Block all signals.
+	sigmask := linux.SignalSet(^uint64(0))
+	if err := sigframe.CallWithSignalFrame(
+		&c.signalStack, addrOfBluepillUserHandler(),
+		&sigmask, uint64(uintptr(unsafe.Pointer(c)))); err != nil {
+		throw("failed to swallow the bluepill")
+	}
+}
+
+// +checkescape:all
+//
+//go:nosplit
+func bluepillUserHandler(frame uintptr) {
+	bluepillHandler(unsafe.Pointer(frame))
+	sigframe.Sigreturn((*arch.UContext64)(unsafe.Pointer(frame)))
 }

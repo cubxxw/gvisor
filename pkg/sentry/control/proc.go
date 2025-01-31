@@ -26,12 +26,13 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/user"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -39,8 +40,6 @@ import (
 )
 
 // Proc includes task-related functions.
-//
-// At the moment, this is limited to exec support.
 type Proc struct {
 	Kernel *kernel.Kernel
 }
@@ -198,21 +197,21 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		limitSet = limits.NewLimitSet()
 	}
 	initArgs := kernel.CreateProcessArgs{
-		Filename:                args.Filename,
-		Argv:                    args.Argv,
-		Envv:                    args.Envv,
-		WorkingDirectory:        args.WorkingDirectory,
-		MountNamespace:          args.MountNamespace,
-		Credentials:             creds,
-		FDTable:                 fdTable,
-		Umask:                   0022,
-		Limits:                  limitSet,
-		MaxSymlinkTraversals:    linux.MaxSymlinkTraversals,
-		UTSNamespace:            proc.Kernel.RootUTSNamespace(),
-		IPCNamespace:            proc.Kernel.RootIPCNamespace(),
-		AbstractSocketNamespace: proc.Kernel.RootAbstractSocketNamespace(),
-		ContainerID:             args.ContainerID,
-		PIDNamespace:            pidns,
+		Filename:             args.Filename,
+		Argv:                 args.Argv,
+		Envv:                 args.Envv,
+		WorkingDirectory:     args.WorkingDirectory,
+		MountNamespace:       args.MountNamespace,
+		Credentials:          creds,
+		FDTable:              fdTable,
+		Umask:                0022,
+		Limits:               limitSet,
+		MaxSymlinkTraversals: linux.MaxSymlinkTraversals,
+		UTSNamespace:         proc.Kernel.RootUTSNamespace(),
+		IPCNamespace:         proc.Kernel.RootIPCNamespace(),
+		ContainerID:          args.ContainerID,
+		PIDNamespace:         pidns,
+		Origin:               kernel.OriginExec,
 	}
 	if initArgs.MountNamespace != nil {
 		// initArgs must hold a reference on MountNamespace, which will
@@ -266,19 +265,35 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		initArgs.Filename = resolved
 	}
 
-	ttyFile, err := fdimport.Import(ctx, fdTable, args.StdioIsPty, args.KUID, args.KGID, fdMap)
+	// TODO(gvisor.dev/issue/1956): Container name is not really needed because
+	// exec processes are not restored, but add it for completeness.
+	ttyFile, err := fdimport.Import(ctx, fdTable, args.StdioIsPty, args.KUID, args.KGID, fdMap, "")
 	if err != nil {
 		return nil, 0, nil, err
+	}
+
+	if ttyFile != nil {
+		initArgs.TTY = ttyFile.TTY()
+	}
+
+	// Set cgroups to the new exec task if cgroups are mounted.
+	cgroupRegistry := proc.Kernel.CgroupRegistry()
+	initialCgrps := map[kernel.Cgroup]struct{}{}
+	for _, ctrl := range kernel.CgroupCtrls {
+		cg, err := cgroupRegistry.FindCgroup(ctx, ctrl, "/"+args.ContainerID)
+		if err != nil {
+			log.Warningf("cgroup mount for controller %v not found", ctrl)
+			continue
+		}
+		initialCgrps[cg] = struct{}{}
+	}
+	if len(initialCgrps) > 0 {
+		initArgs.InitialCgroups = initialCgrps
 	}
 
 	tg, tid, err := proc.Kernel.CreateProcess(initArgs)
 	if err != nil {
 		return nil, 0, nil, err
-	}
-
-	// Set the foreground process group on the TTY before starting the process.
-	if ttyFile != nil {
-		ttyFile.InitForegroundProcessGroup(tg.ProcessGroup())
 	}
 
 	// Start the newly created process.
@@ -453,7 +468,7 @@ func ttyName(tty *kernel.TTY) string {
 	if tty == nil {
 		return "?"
 	}
-	return fmt.Sprintf("pts/%d", tty.Index)
+	return fmt.Sprintf("pts/%d", tty.Index())
 }
 
 // ContainerUsage retrieves per-container CPU usage.
@@ -500,4 +515,22 @@ func (args *ExecArgs) unpackFiles() (map[int]*fd.FD, *fd.FD, error) {
 		fdMap[appFD] = hostFD
 	}
 	return fdMap, execFD, nil
+}
+
+// SignalProcessArgs is the arguments to SignalProcess.
+type SignalProcessArgs struct {
+	// Signal number to send.
+	Signo int `json:"signo"`
+
+	// Process ID (in the root PID namespace) to signal.
+	PID int `json:"pid"`
+}
+
+// SignalProcess sends a signal to the process with the given PID.
+func (proc *Proc) SignalProcess(args *SignalProcessArgs, _ *struct{}) error {
+	tg := proc.Kernel.RootPIDNamespace().ThreadGroupWithID(kernel.ThreadID(args.PID))
+	if tg == nil {
+		return fmt.Errorf("no such process with PID %d", args.PID)
+	}
+	return proc.Kernel.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(args.Signo)})
 }

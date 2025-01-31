@@ -8,13 +8,14 @@ package(
 go_library(
     name = "metric",
     srcs = [
-        "condmetric_profiling.go",
-        "condmetric_profiling_fake.go",
-        "fake_metric.go",
+        "condmetric.go",
         "metric.go",
         "metric_unsafe.go",
         "profiling_metric.go",
+        "sentry_profiling.go",
+        "sentry_profiling_fake.go",
     ],
+    stateify = False,
     visibility = ["//:sandbox"],
     deps = [
         ":metric_go_proto",
@@ -24,6 +25,7 @@ go_library(
         "//pkg/log",
         "//pkg/prometheus",
         "//pkg/sync",
+        "@org_golang_google_protobuf//encoding/protojson:go_default_library",
         "@org_golang_google_protobuf//types/known/timestamppb",
     ],
 )
@@ -50,8 +52,10 @@ go_test(
         "//pkg/eventchannel",
         "//pkg/prometheus",
         "//pkg/sync",
+        "@com_github_google_go_cmp//cmp:go_default_library",
         "@com_github_prometheus_common//expfmt",
         "@org_golang_google_protobuf//proto:go_default_library",
+        "@org_golang_google_protobuf//testing/protocmp:go_default_library",
     ],
 )
 

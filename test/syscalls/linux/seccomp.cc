@@ -71,27 +71,27 @@ void ApplySeccompFilter(uint32_t sysno, uint32_t filtered_result,
   MaybeSave();
 
   struct sock_filter filter[] = {
-    // A = seccomp_data.arch
-    BPF_STMT(BPF_LD | BPF_ABS | BPF_W, 4),
+      // A = seccomp_data.arch
+      BPF_STMT(BPF_LD | BPF_ABS | BPF_W, 4),
 #if defined(__x86_64__)
-    // if (A != AUDIT_ARCH_X86_64) goto kill
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 4),
+      // if (A != AUDIT_ARCH_X86_64) goto kill
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 4),
 #elif defined(__aarch64__)
-    // if (A != AUDIT_ARCH_AARCH64) goto kill
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 4),
+      // if (A != AUDIT_ARCH_AARCH64) goto kill
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 4),
 #else
 #error "Unknown architecture"
 #endif
-    // A = seccomp_data.nr
-    BPF_STMT(BPF_LD | BPF_ABS | BPF_W, 0),
-    // if (A != sysno) goto allow
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, sysno, 0, 1),
-    // return filtered_result
-    BPF_STMT(BPF_RET | BPF_K, filtered_result),
-    // allow: return SECCOMP_RET_ALLOW
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-    // kill: return SECCOMP_RET_KILL
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
+      // A = seccomp_data.nr
+      BPF_STMT(BPF_LD | BPF_ABS | BPF_W, 0),
+      // if (A != sysno) goto allow
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, sysno, 0, 1),
+      // return filtered_result
+      BPF_STMT(BPF_RET | BPF_K, filtered_result),
+      // allow: return SECCOMP_RET_ALLOW
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+      // kill: return SECCOMP_RET_KILL
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
   };
   struct sock_fprog prog;
   prog.len = ABSL_ARRAYSIZE(filter);
@@ -102,6 +102,49 @@ void ApplySeccompFilter(uint32_t sysno, uint32_t filtered_result,
   } else {
     TEST_PCHECK(prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0) == 0);
   }
+  MaybeSave();
+}
+
+// ApplyUncacheableFilter adds a no-op filter which reads one of the
+// syscall arguments when queried about `sysno`, and returns ALLOW.
+// This purposefully breaks the Linux seccomp cache.
+void ApplyUncacheableFilter(uint32_t sysno) {
+  // "Prior to [PR_SET_SECCOMP], the task must call prctl(PR_SET_NO_NEW_PRIVS,
+  // 1) or run with CAP_SYS_ADMIN privileges in its namespace." -
+  // Documentation/prctl/seccomp_filter.txt
+  //
+  // prctl(PR_SET_NO_NEW_PRIVS, 1) may be called repeatedly; calls after the
+  // first are no-ops.
+  TEST_PCHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
+  MaybeSave();
+
+  struct sock_filter filter[] = {
+      // A = seccomp_data.arch
+      BPF_STMT(BPF_LD | BPF_ABS | BPF_W, 4),
+#if defined(__x86_64__)
+      // if (A != AUDIT_ARCH_X86_64) goto kill
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 4),
+#elif defined(__aarch64__)
+      // if (A != AUDIT_ARCH_AARCH64) goto kill
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 4),
+#else
+#error "Unknown architecture"
+#endif
+      // A = seccomp_data.nr
+      BPF_STMT(BPF_LD | BPF_ABS | BPF_W, 0),
+      // if (A != sysno) goto end
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, sysno, 0, 1),
+      // A = seccomp_data.args[0]
+      BPF_STMT(BPF_LD | BPF_ABS | BPF_W, 16),
+      // end: return SECCOMP_RET_ALLOW
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+      // kill: return SECCOMP_RET_KILL
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
+  };
+  struct sock_fprog prog;
+  prog.len = ABSL_ARRAYSIZE(filter);
+  prog.filter = filter;
+  TEST_PCHECK(prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0) == 0);
   MaybeSave();
 }
 
@@ -126,8 +169,7 @@ TEST(SeccompTest, RetKillCausesDeathBySIGSYS) {
   pid_t const pid = fork();
   if (pid == 0) {
     // Register a signal handler for SIGSYS that we don't expect to be invoked.
-    RegisterSignalHandler(
-        SIGSYS, +[](int, siginfo_t*, void*) { _exit(1); });
+    RegisterSignalHandler(SIGSYS, +[](int, siginfo_t*, void*) { _exit(1); });
     ApplySeccompFilter(kFilteredSyscall, SECCOMP_RET_KILL);
     syscall(kFilteredSyscall);
     TEST_CHECK_MSG(false, "Survived invocation of test syscall");
@@ -146,8 +188,7 @@ TEST(SeccompTest, RetKillOnlyKillsOneThread) {
   pid_t const pid = fork();
   if (pid == 0) {
     // Register a signal handler for SIGSYS that we don't expect to be invoked.
-    RegisterSignalHandler(
-        SIGSYS, +[](int, siginfo_t*, void*) { _exit(1); });
+    RegisterSignalHandler(SIGSYS, +[](int, siginfo_t*, void*) { _exit(1); });
     ApplySeccompFilter(kFilteredSyscall, SECCOMP_RET_KILL);
     // Pass CLONE_VFORK to block the original thread in the child process until
     // the clone thread exits with SIGSYS.
@@ -253,8 +294,7 @@ TEST(SeccompTest, RetKillVsyscallCausesDeathBySIGSYS) {
   pid_t const pid = fork();
   if (pid == 0) {
     // Register a signal handler for SIGSYS that we don't expect to be invoked.
-    RegisterSignalHandler(
-        SIGSYS, +[](int, siginfo_t*, void*) { _exit(1); });
+    RegisterSignalHandler(SIGSYS, +[](int, siginfo_t*, void*) { _exit(1); });
     ApplySeccompFilter(SYS_time, SECCOMP_RET_KILL);
     vsyscall_time(nullptr);  // Should result in death.
     TEST_CHECK_MSG(false, "Survived invocation of test syscall");
@@ -301,6 +341,21 @@ TEST(SeccompTest, RetAllowAllowsSyscall) {
   pid_t const pid = fork();
   if (pid == 0) {
     ApplySeccompFilter(kFilteredSyscall, SECCOMP_RET_ALLOW);
+    TEST_CHECK(syscall(kFilteredSyscall) == -1 && errno == ENOSYS);
+    _exit(0);
+  }
+  ASSERT_THAT(pid, SyscallSucceeds());
+  int status;
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceedsWithValue(pid));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "status " << status;
+}
+
+TEST(SeccompTest, RetAllowAllowsNonCachableSyscall) {
+  pid_t const pid = fork();
+  if (pid == 0) {
+    ApplySeccompFilter(kFilteredSyscall, SECCOMP_RET_ALLOW);
+    ApplyUncacheableFilter(kFilteredSyscall);
     TEST_CHECK(syscall(kFilteredSyscall) == -1 && errno == ENOSYS);
     _exit(0);
   }
@@ -366,8 +421,7 @@ TEST(SeccompTest, LeastPermissiveFilterReturnValueApplies) {
   // one that causes the kill that should be ignored.
   pid_t const pid = fork();
   if (pid == 0) {
-    RegisterSignalHandler(
-        SIGSYS, +[](int, siginfo_t*, void*) { _exit(1); });
+    RegisterSignalHandler(SIGSYS, +[](int, siginfo_t*, void*) { _exit(1); });
     ApplySeccompFilter(kFilteredSyscall, SECCOMP_RET_TRACE);
     ApplySeccompFilter(kFilteredSyscall, SECCOMP_RET_KILL);
     ApplySeccompFilter(kFilteredSyscall, SECCOMP_RET_ERRNO | ENOTNAM);
@@ -409,6 +463,37 @@ TEST(SeccompTest, FiltersPreservedAcrossForkAndExecve) {
   ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceedsWithValue(pid));
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
       << "status " << status;
+}
+
+TEST(SeccompTest, EmptyProgramIsRejected) {
+  struct sock_fprog prog;
+  prog.len = 0;
+  prog.filter = nullptr;
+  ASSERT_THAT(syscall(__NR_seccomp, SECCOMP_MODE_FILTER, &prog),
+              SyscallFailsWithErrno(EINVAL));
+  MaybeSave();
+  ASSERT_THAT(prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(SeccompTest, ProgramTooLargeIsRejected) {
+  constexpr int kTooLargeFilterSize = 4097;  // BPF_MAXINSNS + 1
+  TEST_PCHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
+  MaybeSave();
+  struct sock_filter filter[kTooLargeFilterSize];
+  for (int i = 0; i < kTooLargeFilterSize; ++i) {
+    filter[i] = BPF_STMT(BPF_LD | BPF_ABS | BPF_W, 0);  // A = seccomp_data.nr
+  }
+  filter[kTooLargeFilterSize - 1] =
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);  // Return allow
+  struct sock_fprog prog;
+  prog.len = ABSL_ARRAYSIZE(filter);
+  prog.filter = filter;
+  ASSERT_THAT(syscall(__NR_seccomp, SECCOMP_MODE_FILTER, &prog),
+              SyscallFailsWithErrno(EINVAL));
+  MaybeSave();
+  ASSERT_THAT(prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0),
+              SyscallFailsWithErrno(EINVAL));
 }
 
 }  // namespace

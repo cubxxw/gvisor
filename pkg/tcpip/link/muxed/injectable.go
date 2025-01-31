@@ -16,8 +16,6 @@
 package muxed
 
 import (
-	"sync"
-
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -28,10 +26,12 @@ import (
 // trivial routing rules that determine which InjectableEndpoint a given packet
 // will be written to. Note that HandleLocal works differently for this
 // endpoint (see WritePacket).
+//
+// +stateify savable
 type InjectableEndpoint struct {
 	routes map[tcpip.Address]stack.InjectableLinkEndpoint
 
-	mu sync.RWMutex
+	mu endpointRWMutex `state:"nosave"`
 	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
 }
@@ -45,6 +45,13 @@ func (m *InjectableEndpoint) MTU() uint32 {
 		}
 	}
 	return minMTU
+}
+
+// SetMTU implements stack.LinkEndpoint.
+func (m *InjectableEndpoint) SetMTU(mtu uint32) {
+	for _, endpoint := range m.routes {
+		endpoint.SetMTU(mtu)
+	}
 }
 
 // Capabilities implements stack.LinkEndpoint.
@@ -72,6 +79,9 @@ func (m *InjectableEndpoint) LinkAddress() tcpip.LinkAddress {
 	return ""
 }
 
+// SetLinkAddress implements stack.LinkEndpoint.SetLinkAddress.
+func (m *InjectableEndpoint) SetLinkAddress(tcpip.LinkAddress) {}
+
 // Attach implements stack.LinkEndpoint.
 func (m *InjectableEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	for _, endpoint := range m.routes {
@@ -90,7 +100,7 @@ func (m *InjectableEndpoint) IsAttached() bool {
 }
 
 // InjectInbound implements stack.InjectableLinkEndpoint.
-func (m *InjectableEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+func (m *InjectableEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	m.mu.RLock()
 	d := m.dispatcher
 	m.mu.RUnlock()
@@ -145,10 +155,16 @@ func (*InjectableEndpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (*InjectableEndpoint) AddHeader(stack.PacketBufferPtr) {}
+func (*InjectableEndpoint) AddHeader(*stack.PacketBuffer) {}
 
 // ParseHeader implements stack.LinkEndpoint.ParseHeader.
-func (*InjectableEndpoint) ParseHeader(stack.PacketBufferPtr) bool { return true }
+func (*InjectableEndpoint) ParseHeader(*stack.PacketBuffer) bool { return true }
+
+// Close implements stack.LinkEndpoint.
+func (*InjectableEndpoint) Close() {}
+
+// SetOnCloseAction implements stack.LinkEndpoint.SetOnCloseAction.
+func (*InjectableEndpoint) SetOnCloseAction(func()) {}
 
 // NewInjectableEndpoint creates a new multi-endpoint injectable endpoint.
 func NewInjectableEndpoint(routes map[tcpip.Address]stack.InjectableLinkEndpoint) *InjectableEndpoint {

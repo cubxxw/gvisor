@@ -1,10 +1,17 @@
+load("//pkg/sync/locking:locking.bzl", "declare_mutex")
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
-load("//pkg/sync/locking:locking.bzl", "declare_mutex")
 
 package(
     default_applicable_licenses = ["//:license"],
     licenses = ["notice"],
+)
+
+declare_mutex(
+    name = "apl_shared_mutex",
+    out = "apl_shared_mutex.go",
+    package = "pgalloc",
+    prefix = "aplShared",
 )
 
 declare_mutex(
@@ -14,11 +21,21 @@ declare_mutex(
     prefix = "memoryFile",
 )
 
-declare_mutex(
-    name = "mappings_mutex",
-    out = "mappings_mutex.go",
+go_template_instance(
+    name = "apl_unloaded_set",
+    out = "apl_unloaded_set.go",
+    imports = {
+        "memmap": "gvisor.dev/gvisor/pkg/sentry/memmap",
+    },
     package = "pgalloc",
-    prefix = "mappings",
+    prefix = "aplUnloaded",
+    template = "//pkg/segment:generic_set",
+    types = {
+        "Key": "uint64",
+        "Range": "memmap.FileRange",
+        "Value": "aplUnloadedInfo",
+        "Functions": "aplUnloadedSetFunctions",
+    },
 )
 
 go_template_instance(
@@ -47,8 +64,28 @@ go_template_instance(
 )
 
 go_template_instance(
-    name = "usage_set",
-    out = "usage_set.go",
+    name = "memacct_set",
+    out = "memacct_set.go",
+    consts = {
+        "minDegree": "10",
+    },
+    imports = {
+        "memmap": "gvisor.dev/gvisor/pkg/sentry/memmap",
+    },
+    package = "pgalloc",
+    prefix = "memAcct",
+    template = "//pkg/segment:generic_set",
+    types = {
+        "Key": "uint64",
+        "Range": "memmap.FileRange",
+        "Value": "memAcctInfo",
+        "Functions": "memAcctSetFunctions",
+    },
+)
+
+go_template_instance(
+    name = "unfree_set",
+    out = "unfree_set.go",
     consts = {
         "minDegree": "10",
         "trackGaps": "1",
@@ -57,59 +94,67 @@ go_template_instance(
         "memmap": "gvisor.dev/gvisor/pkg/sentry/memmap",
     },
     package = "pgalloc",
-    prefix = "usage",
+    prefix = "unfree",
     template = "//pkg/segment:generic_set",
     types = {
         "Key": "uint64",
         "Range": "memmap.FileRange",
-        "Value": "usageInfo",
-        "Functions": "usageSetFunctions",
+        "Value": "unfreeInfo",
+        "Functions": "unfreeSetFunctions",
     },
 )
 
 go_template_instance(
-    name = "reclaim_set",
-    out = "reclaim_set.go",
+    name = "unwaste_set",
+    out = "unwaste_set.go",
     consts = {
         "minDegree": "10",
+        "trackGaps": "1",
     },
     imports = {
         "memmap": "gvisor.dev/gvisor/pkg/sentry/memmap",
     },
     package = "pgalloc",
-    prefix = "reclaim",
+    prefix = "unwaste",
     template = "//pkg/segment:generic_set",
     types = {
         "Key": "uint64",
         "Range": "memmap.FileRange",
-        "Value": "reclaimSetValue",
-        "Functions": "reclaimSetFunctions",
+        "Value": "unwasteInfo",
+        "Functions": "unwasteSetFunctions",
     },
 )
 
 go_library(
     name = "pgalloc",
     srcs = [
+        "apl_shared_mutex.go",
+        "apl_unloaded_set.go",
         "context.go",
+        "debug.go",
         "evictable_range.go",
         "evictable_range_set.go",
-        "mappings_mutex.go",
+        "memacct_set.go",
         "memory_file_mutex.go",
         "pgalloc.go",
         "pgalloc_unsafe.go",
-        "reclaim_set.go",
         "save_restore.go",
-        "usage_set.go",
+        "unfree_set.go",
+        "unwaste_set.go",
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/aio",
         "//pkg/atomicbitops",
+        "//pkg/bitmap",
         "//pkg/context",
         "//pkg/errors/linuxerr",
+        "//pkg/fd",
+        "//pkg/goid",
         "//pkg/hostarch",
         "//pkg/log",
-        "//pkg/memutil",
+        "//pkg/ringdeque",
         "//pkg/safemem",
         "//pkg/sentry/arch",
         "//pkg/sentry/hostmm",
@@ -119,6 +164,7 @@ go_library(
         "//pkg/state/wire",
         "//pkg/sync",
         "//pkg/sync/locking",
+        "//pkg/syncevent",
         "//pkg/usermem",
         "@org_golang_x_sys//unix:go_default_library",
     ],
@@ -129,5 +175,8 @@ go_test(
     size = "small",
     srcs = ["pgalloc_test.go"],
     library = ":pgalloc",
-    deps = ["//pkg/hostarch"],
+    deps = [
+        "//pkg/hostarch",
+        "//pkg/sentry/memmap",
+    ],
 )

@@ -17,7 +17,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,12 +28,16 @@ import (
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/syndtr/gocapability/capability"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/coretag"
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/metric"
+	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/ring0"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/util"
@@ -46,21 +49,29 @@ import (
 
 // Note that directfsSandboxCaps is the same as caps defined in gofer.go
 // except CAP_SYS_CHROOT because we don't need to chroot in directfs mode.
-var directfsSandboxCaps = []string{
-	"CAP_CHOWN",
-	"CAP_DAC_OVERRIDE",
-	"CAP_DAC_READ_SEARCH",
-	"CAP_FOWNER",
-	"CAP_FSETID",
-}
+var (
+	directfsSandboxCaps = []string{
+		"CAP_CHOWN",
+		"CAP_DAC_OVERRIDE",
+		"CAP_DAC_READ_SEARCH",
+		"CAP_FOWNER",
+		"CAP_FSETID",
+	}
 
-// directfsSandboxLinuxCaps is the minimal set of capabilities needed by the
-// sandbox to operate on files in directfs mode.
-var directfsSandboxLinuxCaps = &specs.LinuxCapabilities{
-	Bounding:  directfsSandboxCaps,
-	Effective: directfsSandboxCaps,
-	Permitted: directfsSandboxCaps,
-}
+	// directfsSandboxLinuxCaps is the minimal set of capabilities needed by the
+	// sandbox to operate on files in directfs mode.
+	directfsSandboxLinuxCaps = &specs.LinuxCapabilities{
+		Bounding:  directfsSandboxCaps,
+		Effective: directfsSandboxCaps,
+		Permitted: directfsSandboxCaps,
+	}
+
+	hostnetSandboxLinuxCaps = map[capability.Cap]string{
+		capability.CAP_NET_ADMIN:        "CAP_NET_ADMIN",
+		capability.CAP_NET_BIND_SERVICE: "CAP_NET_BIND_SERVICE",
+		capability.CAP_NET_RAW:          "CAP_NET_RAW",
+	}
+)
 
 // Boot implements subcommands.Command for the "boot" command which starts a
 // new sandbox. It should not be called directly.
@@ -81,14 +92,17 @@ type Boot struct {
 	// ioFDs is the list of FDs used to connect to FS gofers.
 	ioFDs intFlags
 
-	// overlayFilestoreFDs are FDs to the regular files that will back the tmpfs
-	// upper mount in the overlay mounts.
-	overlayFilestoreFDs intFlags
+	// devIoFD is the FD to connect to dev gofer.
+	devIoFD int
 
-	// overlayMediums contains information about how the gofer mounts have been
-	// overlaid. The first entry is for rootfs and the following entries are for
-	// bind mounts in Spec.Mounts (in the same order).
-	overlayMediums boot.OverlayMediumFlags
+	// goferFilestoreFDs are FDs to the regular files that will back the tmpfs or
+	// overlayfs mount for certain gofer mounts.
+	goferFilestoreFDs intFlags
+
+	// goferMountConfs contains information about how the gofer mounts have been
+	// configured. The first entry is for rootfs and the following entries are
+	// for bind mounts in Spec.Mounts (in the same order).
+	goferMountConfs boot.GoferMountConfFlags
 
 	// stdioFDs are the fds for stdin, stdout, and stderr. They must be
 	// provided in that order.
@@ -125,15 +139,16 @@ type Boot struct {
 
 	// mountsFD is the file descriptor to read list of mounts after they have
 	// been resolved (direct paths, no symlinks). They are resolved outside the
-	// sandbox (e.g. gofer) and sent through this FD.
+	// sandbox (e.g. gofer) and sent through this FD. When mountsFD is not
+	// provided, there is no cleaning required for mounts and the mounts in
+	// the spec can be used as is.
 	mountsFD int
 
 	podInitConfigFD int
 
 	sinkFDs intFlags
 
-	// pidns is set if the sandbox is in its own pid namespace.
-	pidns bool
+	saveFDs intFlags
 
 	// attached is set to true to kill the sandbox process when the parent process
 	// terminates. This flag is set when the command execve's itself because
@@ -144,8 +159,22 @@ type Boot struct {
 	// /sys/devices/virtual/dmi/id/product_name.
 	productName string
 
+	// Value of /sys/kernel/mm/transparent_hugepage/shmem_enabled on the host.
+	hostShmemHuge string
+
 	// FDs for profile data.
 	profileFDs profile.FDArgs
+
+	// finalMetricsFD is a file descriptor to write metric data to upon sandbox
+	// termination.
+	finalMetricsFD int
+
+	// profilingMetricsFD is a file descriptor to write Sentry metrics data to.
+	profilingMetricsFD int
+
+	// profilingMetricsLossy sets whether profilingMetricsFD is a lossy channel.
+	// If so, the format used to write to it will contain a checksum.
+	profilingMetricsLossy bool
 
 	// procMountSyncFD is a file descriptor that has to be closed when the
 	// procfs mount isn't needed anymore.
@@ -155,6 +184,9 @@ type Boot struct {
 	// boot process should invoke setuid/setgid for root user. This is mainly
 	// used to synchronize rootless user namespace initialization.
 	syncUsernsFD int
+
+	// nvidiaDriverVersion is the Nvidia driver version on the host.
+	nvidiaDriverVersion string
 }
 
 // Name implements subcommands.Command.Name.
@@ -169,7 +201,7 @@ func (*Boot) Synopsis() string {
 
 // Usage implements subcommands.Command.Usage.
 func (*Boot) Usage() string {
-	return `boot [flags] <container id>`
+	return "boot [flags] <container id>\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -177,7 +209,6 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&b.bundleDir, "bundle", "", "required path to the root of the bundle directory")
 	f.BoolVar(&b.applyCaps, "apply-caps", false, "if true, apply capabilities defined in the spec to the process")
 	f.BoolVar(&b.setUpRoot, "setup-root", false, "if true, set up an empty root for the process")
-	f.BoolVar(&b.pidns, "pidns", false, "if true, the sandbox is in its own PID namespace")
 	f.IntVar(&b.cpuNum, "cpu-num", 0, "number of CPUs to create inside the sandbox")
 	f.IntVar(&b.procMountSyncFD, "proc-mount-sync-fd", -1, "file descriptor that has to be written to when /proc isn't needed anymore and can be unmounted")
 	f.IntVar(&b.syncUsernsFD, "sync-userns-fd", -1, "file descriptor used to synchronize rootless user namespace initialization.")
@@ -185,25 +216,32 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.Uint64Var(&b.totalHostMem, "total-host-memory", 0, "total memory reported by host /proc/meminfo")
 	f.BoolVar(&b.attached, "attached", false, "if attached is true, kills the sandbox process when the parent process terminates")
 	f.StringVar(&b.productName, "product-name", "", "value to show in /sys/devices/virtual/dmi/id/product_name")
+	f.StringVar(&b.nvidiaDriverVersion, "nvidia-driver-version", "", "Nvidia driver version on the host")
+	f.StringVar(&b.hostShmemHuge, "host-shmem-huge", "", "value of /sys/kernel/mm/transparent_hugepage/shmem_enabled on the host")
 
 	// Open FDs that are donated to the sandbox.
 	f.IntVar(&b.specFD, "spec-fd", -1, "required fd with the container spec")
 	f.IntVar(&b.controllerFD, "controller-fd", -1, "required FD of a stream socket for the control server that must be donated to this process")
 	f.IntVar(&b.deviceFD, "device-fd", -1, "FD for the platform device file")
-	f.Var(&b.ioFDs, "io-fds", "list of FDs to connect gofer clients. They must follow this order: root first, then mounts as defined in the spec")
+	f.Var(&b.ioFDs, "io-fds", "list of image FDs and/or socket FDs to connect gofer clients. They must follow this order: root first, then mounts as defined in the spec")
+	f.IntVar(&b.devIoFD, "dev-io-fd", -1, "FD to connect dev gofer client")
 	f.Var(&b.stdioFDs, "stdio-fds", "list of FDs containing sandbox stdin, stdout, and stderr in that order")
 	f.Var(&b.passFDs, "pass-fd", "mapping of host to guest FDs. They must be in M:N format. M is the host and N the guest descriptor.")
 	f.IntVar(&b.execFD, "exec-fd", -1, "host file descriptor used for program execution.")
-	f.Var(&b.overlayFilestoreFDs, "overlay-filestore-fds", "FDs to the regular files that will back the tmpfs upper mount in the overlay mounts.")
-	f.Var(&b.overlayMediums, "overlay-mediums", "information about how the gofer mounts have been overlaid.")
+	f.Var(&b.goferFilestoreFDs, "gofer-filestore-fds", "FDs to the regular files that will back the overlayfs or tmpfs mount if a gofer mount is to be overlaid.")
+	f.Var(&b.goferMountConfs, "gofer-mount-confs", "information about how the gofer mounts have been configured.")
 	f.IntVar(&b.userLogFD, "user-log-fd", 0, "file descriptor to write user logs to. 0 means no logging.")
 	f.IntVar(&b.startSyncFD, "start-sync-fd", -1, "required FD to used to synchronize sandbox startup")
-	f.IntVar(&b.mountsFD, "mounts-fd", -1, "mountsFD is the file descriptor to read list of mounts after they have been resolved (direct paths, no symlinks).")
+	f.IntVar(&b.mountsFD, "mounts-fd", -1, "mountsFD is an optional file descriptor to read list of mounts after they have been resolved (direct paths, no symlinks).")
 	f.IntVar(&b.podInitConfigFD, "pod-init-config-fd", -1, "file descriptor to the pod init configuration file.")
 	f.Var(&b.sinkFDs, "sink-fds", "ordered list of file descriptors to be used by the sinks defined in --pod-init-config.")
+	f.Var(&b.saveFDs, "save-fds", "ordered list of file descriptors to be used save checkpoints. Order: kernel state, page metadata, page file")
 
 	// Profiling flags.
 	b.profileFDs.SetFromFlags(f)
+	f.IntVar(&b.finalMetricsFD, "final-metrics-log-fd", -1, "file descriptor to write metrics to upon sandbox termination.")
+	f.IntVar(&b.profilingMetricsFD, "profiling-metrics-fd", -1, "file descriptor to write sentry profiling metrics.")
+	f.BoolVar(&b.profilingMetricsLossy, "profiling-metrics-fd-lossy", false, "if true, treat the sentry profiling metrics FD as lossy and write a checksum to it.")
 }
 
 // Execute implements subcommands.Command.Execute.  It starts a sandbox in a
@@ -226,14 +264,25 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	ring0.InitDefault()
 
 	argOverride := make(map[string]string)
+
+	// Do these before chroot takes effect, otherwise we can't read /sys.
 	if len(b.productName) == 0 {
-		// Do this before chroot takes effect, otherwise we can't read /sys.
-		if product, err := ioutil.ReadFile("/sys/devices/virtual/dmi/id/product_name"); err != nil {
+		if product, err := os.ReadFile("/sys/devices/virtual/dmi/id/product_name"); err != nil {
 			log.Warningf("Not setting product_name: %v", err)
 		} else {
 			b.productName = strings.TrimSpace(string(product))
 			log.Infof("Setting product_name: %q", b.productName)
 			argOverride["product-name"] = b.productName
+		}
+	}
+	if conf.AppHugePages && len(b.hostShmemHuge) == 0 {
+		hostShmemHuge, err := hostmm.GetTransparentHugepageEnum("shmem_enabled")
+		if err != nil {
+			log.Warningf("Failed to infer --host-shmem-huge: %v", err)
+		} else {
+			b.hostShmemHuge = hostShmemHuge
+			log.Infof("Setting host-shmem-huge: %q", b.hostShmemHuge)
+			argOverride["host-shmem-huge"] = b.hostShmemHuge
 		}
 	}
 
@@ -261,7 +310,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	}
 
 	if b.setUpRoot {
-		if err := setUpChroot(b.pidns, spec, conf); err != nil {
+		if err := setUpChroot(spec, conf); err != nil {
 			util.Fatalf("error setting up chroot: %v", err)
 		}
 		argOverride["setup-root"] = "false"
@@ -307,10 +356,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	specutils.LogSpecDebug(spec, conf.OCISeccomp)
 
 	if b.applyCaps {
-		caps := spec.Process.Capabilities
-		if caps == nil {
-			caps = &specs.LinuxCapabilities{}
-		}
+		caps := &specs.LinuxCapabilities{}
 
 		gPlatform, err := platform.Lookup(conf.Platform)
 		if err != nil {
@@ -326,6 +372,31 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 
 		if conf.DirectFS {
 			caps = specutils.MergeCapabilities(caps, directfsSandboxLinuxCaps)
+		}
+		if conf.Network == config.NetworkHost {
+			curCaps, err := capability.NewPid2(0)
+			if err != nil {
+				util.Fatalf("capability.NewPid2(0) failed: %v", err)
+			}
+			if err := curCaps.Load(); err != nil {
+				util.Fatalf("unable to load capabilities: %v", err)
+			}
+			addCaps := []string{}
+			for c, strCap := range hostnetSandboxLinuxCaps {
+				if c == capability.CAP_NET_RAW && !conf.EnableRaw {
+					continue
+				}
+				if curCaps.Get(capability.PERMITTED, c) {
+					addCaps = append(addCaps, strCap)
+				}
+			}
+			if len(addCaps) != 0 {
+				caps = specutils.MergeCapabilities(caps, &specs.LinuxCapabilities{
+					Bounding:  addCaps,
+					Effective: addCaps,
+					Permitted: addCaps,
+				})
+			}
 		}
 		argOverride["apply-caps"] = "false"
 
@@ -373,15 +444,18 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		}
 	}
 
-	// Read resolved mount list and replace the original one from the spec.
-	mountsFile := os.NewFile(uintptr(b.mountsFD), "mounts file")
-	cleanMounts, err := specutils.ReadMounts(mountsFile)
-	if err != nil {
+	// When mountsFD is not provided, there is no cleaning required.
+	if b.mountsFD >= 0 {
+		// Read resolved mount list and replace the original one from the spec.
+		mountsFile := os.NewFile(uintptr(b.mountsFD), "mounts file")
+		cleanMounts, err := specutils.ReadMounts(mountsFile)
+		if err != nil {
+			mountsFile.Close()
+			util.Fatalf("Error reading mounts file: %v", err)
+		}
 		mountsFile.Close()
-		util.Fatalf("Error reading mounts file: %v", err)
+		spec.Mounts = cleanMounts
 	}
-	mountsFile.Close()
-	spec.Mounts = cleanMounts
 
 	if conf.DirectFS {
 		// sandbox should run with a umask of 0, because we want to preserve file
@@ -397,7 +471,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 
 		// Verify that all sentry threads are properly core tagged, and log
 		// current core tag.
-		coreTags, err := coretag.GetAllCoreTags(os.Getpid())
+		coreTags, err := coretag.GetAllCoreTags(0)
 		if err != nil {
 			util.Fatalf("Failed read current core tags: %v", err)
 		}
@@ -413,13 +487,14 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		Spec:                spec,
 		Conf:                conf,
 		ControllerFD:        b.controllerFD,
-		Device:              os.NewFile(uintptr(b.deviceFD), "platform device"),
+		Device:              fd.New(b.deviceFD),
 		GoferFDs:            b.ioFDs.GetArray(),
+		DevGoferFD:          b.devIoFD,
 		StdioFDs:            b.stdioFDs.GetArray(),
 		PassFDs:             b.passFDs.GetArray(),
 		ExecFD:              b.execFD,
-		OverlayFilestoreFDs: b.overlayFilestoreFDs.GetArray(),
-		OverlayMediums:      b.overlayMediums.GetArray(),
+		GoferFilestoreFDs:   b.goferFilestoreFDs.GetArray(),
+		GoferMountConfs:     b.goferMountConfs.GetArray(),
 		NumCPU:              b.cpuNum,
 		TotalMem:            b.totalMem,
 		TotalHostMem:        b.totalHostMem,
@@ -428,6 +503,9 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		PodInitConfigFD:     b.podInitConfigFD,
 		SinkFDs:             b.sinkFDs.GetArray(),
 		ProfileOpts:         b.profileFDs.ToOpts(),
+		NvidiaDriverVersion: b.nvidiaDriverVersion,
+		HostShmemHuge:       b.hostShmemHuge,
+		SaveFDs:             b.saveFDs.GetFDs(),
 	}
 	l, err := boot.New(bootArgs)
 	if err != nil {
@@ -451,8 +529,17 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	// but before the start-sync file is notified, as the parent process needs to query for
 	// registered metrics prior to sending the start signal.
 	metric.Initialize()
-	if metric.ProfilingMetricWriter != nil {
-		if err := metric.StartProfilingMetrics(conf.ProfilingMetrics, time.Duration(conf.ProfilingMetricsRate)*time.Microsecond); err != nil {
+	var finalMetricsFile *os.File
+	if b.finalMetricsFD != -1 {
+		finalMetricsFile = os.NewFile(uintptr(b.finalMetricsFD), "final metrics file")
+	}
+	if b.profilingMetricsFD != -1 {
+		if err := metric.StartProfilingMetrics(metric.ProfilingMetricsOptions[*os.File]{
+			Sink:    os.NewFile(uintptr(b.profilingMetricsFD), "metrics file"),
+			Lossy:   b.profilingMetricsLossy,
+			Metrics: conf.ProfilingMetrics,
+			Rate:    time.Duration(conf.ProfilingMetricsRate) * time.Microsecond,
+		}); err != nil {
 			l.Destroy()
 			util.Fatalf("unable to start profiling metrics: %v", err)
 		}
@@ -483,6 +570,14 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	log.Infof("application exiting with %+v", ws)
 	waitStatus := args[1].(*unix.WaitStatus)
 	*waitStatus = unix.WaitStatus(ws)
+
+	if finalMetricsFile != nil {
+		if err := exportFinalMetrics(finalMetricsFile); err != nil {
+			l.Destroy()
+			util.Fatalf("unable to export final metrics: %v", err)
+		}
+	}
+
 	l.Destroy()
 	return subcommands.ExitSuccess
 }
@@ -490,7 +585,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 // prepareArgs returns the args that can be used to re-execute the current
 // program. It manipulates the flags of the subcommands.Command identified by
 // subCmdName and fSet is the flag.FlagSet of this subcommand. It applies the
-// flags specified by override map. In case of conflict, flag is overriden.
+// flags specified by override map. In case of conflict, flag is overridden.
 //
 // Postcondition: prepareArgs() takes ownership of override map.
 func prepareArgs(subCmdName string, fSet *flag.FlagSet, override map[string]string) []string {
@@ -610,4 +705,25 @@ func validateOpenFDs(passFDs []boot.FDMapping) {
 	}); err != nil {
 		util.Fatalf("WalkDir(%s) failed: %v", selfFDDir, err)
 	}
+}
+
+// exportFinalMetrics exports all metrics to the given file.
+// The file is closed as part of this function.
+func exportFinalMetrics(f *os.File) error {
+	snapshot, err := metric.GetSnapshot(metric.SnapshotOptions{})
+	if err != nil {
+		return fmt.Errorf("getting metrics snapshot: %w", err)
+	}
+	_, err = prometheus.Write(f, prometheus.ExportOptions{}, map[*prometheus.Snapshot]prometheus.SnapshotExportOptions{
+		snapshot: {
+			ExporterPrefix: "runsc_",
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("writing metrics snapshot: %w", err)
+	}
+	if err = f.Close(); err != nil {
+		return fmt.Errorf("closing metrics snapshot file: %w", err)
+	}
+	return nil
 }

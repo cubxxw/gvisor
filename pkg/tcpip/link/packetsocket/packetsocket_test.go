@@ -35,6 +35,7 @@ type nullEndpoint struct {
 func (*nullEndpoint) MTU() uint32 {
 	return math.MaxUint32
 }
+func (*nullEndpoint) SetMTU(uint32) {}
 func (*nullEndpoint) Capabilities() stack.LinkEndpointCapabilities {
 	return 0
 }
@@ -42,8 +43,9 @@ func (*nullEndpoint) MaxHeaderLength() uint16 {
 	return 0
 }
 func (*nullEndpoint) LinkAddress() tcpip.LinkAddress {
-	var l tcpip.LinkAddress
-	return l
+	return ""
+}
+func (*nullEndpoint) SetLinkAddress(tcpip.LinkAddress) {
 }
 func (*nullEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	return pkts.Len(), nil
@@ -52,18 +54,20 @@ func (e *nullEndpoint) Attach(d stack.NetworkDispatcher)      { e.disp = d }
 func (e *nullEndpoint) IsAttached() bool                      { return e.disp != nil }
 func (*nullEndpoint) Wait()                                   {}
 func (*nullEndpoint) ARPHardwareType() header.ARPHardwareType { return header.ARPHardwareNone }
-func (*nullEndpoint) AddHeader(stack.PacketBufferPtr)         {}
-func (*nullEndpoint) ParseHeader(stack.PacketBufferPtr) bool  { return true }
+func (*nullEndpoint) AddHeader(*stack.PacketBuffer)           {}
+func (*nullEndpoint) ParseHeader(*stack.PacketBuffer) bool    { return true }
+func (*nullEndpoint) Close()                                  {}
+func (*nullEndpoint) SetOnCloseAction(func())                 {}
 
 var _ stack.NetworkDispatcher = (*testNetworkDispatcher)(nil)
 
 type linkPacketInfo struct {
-	pkt      stack.PacketBufferPtr
+	pkt      *stack.PacketBuffer
 	protocol tcpip.NetworkProtocolNumber
 }
 
 type networkPacketInfo struct {
-	pkt      stack.PacketBufferPtr
+	pkt      *stack.PacketBuffer
 	protocol tcpip.NetworkProtocolNumber
 }
 
@@ -76,17 +80,17 @@ type testNetworkDispatcher struct {
 }
 
 func (t *testNetworkDispatcher) reset() {
-	if pkt := t.linkPacket.pkt; !pkt.IsNil() {
+	if pkt := t.linkPacket.pkt; pkt != nil {
 		pkt.DecRef()
 	}
-	if pkt := t.networkPacket.pkt; !pkt.IsNil() {
+	if pkt := t.networkPacket.pkt; pkt != nil {
 		pkt.DecRef()
 	}
 
 	*t = testNetworkDispatcher{}
 }
 
-func (t *testNetworkDispatcher) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+func (t *testNetworkDispatcher) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	networkPacket := networkPacketInfo{
 		pkt:      pkt.IncRef(),
 		protocol: protocol,
@@ -99,7 +103,7 @@ func (t *testNetworkDispatcher) DeliverNetworkPacket(protocol tcpip.NetworkProto
 	t.networkPacket = networkPacket
 }
 
-func (t *testNetworkDispatcher) DeliverLinkPacket(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+func (t *testNetworkDispatcher) DeliverLinkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	linkPacket := linkPacketInfo{
 		pkt:      pkt.IncRef(),
 		protocol: protocol,

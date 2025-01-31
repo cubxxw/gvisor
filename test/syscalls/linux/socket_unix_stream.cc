@@ -142,7 +142,7 @@ TEST_P(StreamUnixSocketPairTest, SetSocketSendBuf) {
   int max = 0;
   int min = 0;
   {
-    // Discover maxmimum buffer size by setting to a really large value.
+    // Discover maximum buffer size by setting to a really large value.
     constexpr int kRcvBufSz = INT_MAX;
     ASSERT_THAT(
         setsockopt(s, SOL_SOCKET, SO_SNDBUF, &kRcvBufSz, sizeof(kRcvBufSz)),
@@ -227,6 +227,27 @@ TEST_P(StreamUnixSocketPairTest, IncreasedSocketSendBufUnblocksWrites) {
   // The send should succeed again.
   ASSERT_THAT(RetryEINTR(send)(sock, buf.data(), buf.size(), 0),
               SyscallSucceeds());
+}
+
+TEST_P(StreamUnixSocketPairTest, GetAcceptConn) {
+  auto bound = ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_UNIX, SOCK_STREAM, 0));
+  struct sockaddr_un bind_addr =
+      ASSERT_NO_ERRNO_AND_VALUE(UniqueUnixAddr(true, AF_UNIX));
+  ASSERT_THAT(bind(bound.get(), AsSockAddr(&bind_addr), sizeof(bind_addr)),
+              SyscallSucceeds());
+  int opt = 0;
+  socklen_t opt_len = sizeof(opt);
+  ASSERT_THAT(
+      getsockopt(bound.get(), SOL_SOCKET, SO_ACCEPTCONN, &opt, &opt_len),
+      SyscallSucceeds());
+  ASSERT_EQ(opt, 0);
+  ASSERT_THAT(listen(bound.get(),
+                     /* backlog = */ 5),  // NOLINT(bugprone-argument-comment)
+              SyscallSucceeds());
+  ASSERT_THAT(
+      getsockopt(bound.get(), SOL_SOCKET, SO_ACCEPTCONN, &opt, &opt_len),
+      SyscallSucceeds());
+  ASSERT_EQ(opt, 1);
 }
 
 INSTANTIATE_TEST_SUITE_P(

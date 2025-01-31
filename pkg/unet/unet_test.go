@@ -15,10 +15,9 @@
 package unet
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
-	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -28,7 +27,7 @@ import (
 
 func randomFilename() (string, error) {
 	// Return a randomly generated file in the test dir.
-	f, err := ioutil.TempFile("", "unet-test")
+	f, err := os.CreateTemp("", "unet-test")
 	if err != nil {
 		return "", err
 	}
@@ -427,7 +426,7 @@ func recvFDs(t *testing.T, s *Socket, enableSize int, origFDs []int) {
 	expected := len(origFDs)
 
 	// Count the number of FDs.
-	preEntries, err := ioutil.ReadDir("/proc/self/fd")
+	preEntries, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
 		t.Fatalf("Can't readdir, got err %v expected nil", err)
 	}
@@ -446,7 +445,7 @@ func recvFDs(t *testing.T, s *Socket, enableSize int, origFDs []int) {
 	}
 
 	// Count the new number of FDs.
-	postEntries, err := ioutil.ReadDir("/proc/self/fd")
+	postEntries, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
 		t.Fatalf("Can't readdir, got err %v expected nil", err)
 	}
@@ -479,7 +478,7 @@ func recvFDs(t *testing.T, s *Socket, enableSize int, origFDs []int) {
 	r.CloseFDs()
 
 	// Make sure the count is back to normal.
-	finalEntries, err := ioutil.ReadDir("/proc/self/fd")
+	finalEntries, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
 		t.Fatalf("Can't readdir, got err %v expected nil", err)
 	}
@@ -556,22 +555,6 @@ func TestFDsReceiveSizeZero(t *testing.T) {
 	recvFDs(t, client, 0, []int{})
 }
 
-func TestGetPeerCred(t *testing.T) {
-	server, client := socketPair(t, false)
-	defer server.Close()
-	defer client.Close()
-
-	want := &unix.Ucred{
-		Pid: int32(os.Getpid()),
-		Uid: uint32(os.Getuid()),
-		Gid: uint32(os.Getgid()),
-	}
-
-	if got, err := client.GetPeerCred(); err != nil || !reflect.DeepEqual(got, want) {
-		t.Errorf("GetPeerCred() = %v, %v, want = %+v, %+v", got, err, want, nil)
-	}
-}
-
 func newClosedSocket() (*Socket, error) {
 	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
@@ -585,18 +568,6 @@ func newClosedSocket() (*Socket, error) {
 	}
 
 	return s, s.Close()
-}
-
-func TestGetPeerCredFailure(t *testing.T) {
-	s, err := newClosedSocket()
-	if err != nil {
-		t.Fatalf("newClosedSocket got error %v want nil", err)
-	}
-
-	want := "bad file descriptor"
-	if _, err := s.GetPeerCred(); err == nil || err.Error() != want {
-		t.Errorf("s.GetPeerCred() = %v, want = %s", err, want)
-	}
 }
 
 func TestAcceptClosed(t *testing.T) {
@@ -688,7 +659,7 @@ func TestControlMessage(t *testing.T) {
 		cm.EnableFDs(i)
 		cm.PackFDs(want...)
 		got, err := cm.ExtractFDs()
-		if err != nil || !reflect.DeepEqual(got, want) {
+		if err != nil || !slices.Equal(got, want) {
 			t.Errorf("cm.ExtractFDs() = %v, %v, want = %v, %v", got, err, want, nil)
 		}
 	}
