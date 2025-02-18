@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -150,15 +151,16 @@ func (fs *filesystem) stepLocked(ctx context.Context, rp *vfs.ResolvingPath, d *
 	if name == ".." {
 		if isRoot, err := rp.CheckRoot(ctx, &d.vfsd); err != nil {
 			return nil, lookupLayerNone, false, err
-		} else if isRoot || d.parent == nil {
+		} else if isRoot || d.parent.Load() == nil {
 			rp.Advance()
 			return d, d.topLookupLayer(), false, nil
 		}
-		if err := rp.CheckMount(ctx, &d.parent.vfsd); err != nil {
+		if err := rp.CheckMount(ctx, &d.parent.Load().vfsd); err != nil {
 			return nil, lookupLayerNone, false, err
 		}
 		rp.Advance()
-		return d.parent, d.parent.topLookupLayer(), false, nil
+		parent := d.parent.Load()
+		return parent, parent.topLookupLayer(), false, nil
 	}
 	if uint64(len(name)) > fs.maxFilenameLen {
 		return nil, lookupLayerNone, false, linuxerr.ENAMETOOLONG
@@ -328,7 +330,12 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 	// directories. Override them if necessary. We can use RacyLoad() because
 	// child is still being initialized.
 	if child.isDir() {
-		child.ino.Store(fs.newDirIno(child.devMajor.RacyLoad(), child.devMinor.RacyLoad(), child.ino.RacyLoad()))
+		orig := layerDevNoAndIno{
+			layerDevNumber: layerDevNumber{child.devMajor.RacyLoad(), child.devMinor.RacyLoad()},
+			ino:            child.ino.RacyLoad(),
+		}
+		child.ino.Store(fs.newDirIno(orig))
+		child.dirInoHash = orig
 		child.devMajor = atomicbitops.FromUint32(linux.UNNAMED_MAJOR)
 		child.devMinor = atomicbitops.FromUint32(fs.dirDevMinor)
 	} else if !child.upperVD.Ok() {
@@ -343,7 +350,7 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 	}
 
 	parent.IncRef()
-	child.parent = parent
+	child.parent.Store(parent)
 	child.name = name
 	return child, topLookupLayer, nil
 }
@@ -567,9 +574,11 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, ct 
 //
 // Preconditions: pop's parent directory has been copied up.
 func CreateWhiteout(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, pop *vfs.PathOperation) error {
+	major, minor := linux.DecodeDeviceID(linux.WHITEOUT_DEV)
 	return vfsObj.MknodAt(ctx, creds, pop, &vfs.MknodOptions{
-		Mode: linux.S_IFCHR, // permissions == include/linux/fs.h:WHITEOUT_MODE == 0
-		// DevMajor == DevMinor == 0, from include/linux/fs.h:WHITEOUT_DEV
+		Mode:     linux.S_IFCHR | linux.WHITEOUT_MODE,
+		DevMajor: uint32(major),
+		DevMinor: minor,
 	})
 }
 
@@ -1093,6 +1102,14 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	// Resolve newParent first to verify that it's on this Mount.
 	var ds *[]*dentry
 	fs.renameMu.Lock()
+	// We need to DecRef outside of fs.mu because forgetting a dead mountpoint
+	// could result in this filesystem being released which acquires fs.mu.
+	var toDecRef []refs.RefCounter
+	defer func() {
+		for _, ref := range toDecRef {
+			ref.DecRef(ctx)
+		}
+	}()
 	defer fs.renameMuUnlockAndCheckDrop(ctx, &ds)
 	newParent, err := fs.walkParentDirLocked(ctx, rp, rp.Start().Impl().(*dentry), &ds)
 	if err != nil {
@@ -1142,7 +1159,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return err
 	}
 	if renamed.isDir() {
-		if renamed == newParent || genericIsAncestorDentry(renamed, newParent) {
+		if renamed == newParent || genericIsAncestorDentry(fs, renamed, newParent) {
 			return linuxerr.EINVAL
 		}
 		if oldParent != newParent {
@@ -1185,7 +1202,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			if !renamed.isDir() {
 				return linuxerr.EISDIR
 			}
-			if genericIsAncestorDentry(replaced, renamed) {
+			if genericIsAncestorDentry(fs, replaced, renamed) {
 				return linuxerr.ENOTEMPTY
 			}
 			replaced.dirMu.NestedLock(dirLockReplaced)
@@ -1308,7 +1325,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	// Below this point, the renamed dentry is now at newpop, and anything we
 	// replaced is gone forever. Commit the rename, update the overlay
 	// filesystem tree, and abandon attempts to recover from errors.
-	vfsObj.CommitRenameReplaceDentry(ctx, &renamed.vfsd, replacedVFSD)
+	toDecRef = vfsObj.CommitRenameReplaceDentry(ctx, &renamed.vfsd, replacedVFSD)
 	delete(oldParent.children, oldName)
 	if replaced != nil {
 		// Lower dentries of replaced are not reachable from the overlay anymore.
@@ -1326,9 +1343,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		oldParent.DecRef(ctx)
 		ds = appendDentry(ds, oldParent)
 		newParent.IncRef()
-		renamed.parent = newParent
 	}
-	renamed.name = newName
+	genericSetParentAndName(fs, renamed, newParent, newName)
 	if newParent.children == nil {
 		newParent.children = make(map[string]*dentry)
 	}
@@ -1355,6 +1371,14 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
+	// We need to DecRef outside of fs.mu because forgetting a dead mountpoint
+	// could result in this filesystem being released which acquires fs.mu.
+	var toDecRef []refs.RefCounter
+	defer func() {
+		for _, ref := range toDecRef {
+			ref.DecRef(ctx)
+		}
+	}()
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	start := rp.Start().Impl().(*dentry)
 	parent, err := fs.walkParentDirLocked(ctx, rp, start, &ds)
@@ -1467,8 +1491,9 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 		return err
 	}
 
-	vfsObj.CommitDeleteDentry(ctx, &child.vfsd)
+	toDecRef = vfsObj.CommitDeleteDentry(ctx, &child.vfsd)
 	delete(parent.children, name)
+	fs.releaseDirIno(child.dirInoHash)
 	ds = appendDentry(ds, child)
 	parent.dirents = nil
 	parent.watches.Notify(ctx, name, linux.IN_DELETE|linux.IN_ISDIR, 0 /* cookie */, vfs.InodeEvent, true /* unlinked */)
@@ -1525,17 +1550,24 @@ func (d *dentry) setStatLocked(ctx context.Context, rp *vfs.ResolvingPath, opts 
 
 // StatAt implements vfs.FilesystemImpl.StatAt.
 func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.StatOptions) (linux.Statx, error) {
-	var ds *[]*dentry
-	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
-	d, err := fs.resolveLocked(ctx, rp, &ds)
-	if err != nil {
-		return linux.Statx{}, err
+	var d *dentry
+	if rp.Done() {
+		d = rp.Start().Impl().(*dentry)
+	} else {
+		var ds *[]*dentry
+		fs.renameMu.RLock()
+		defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
+		var err error
+		d, err = fs.resolveLocked(ctx, rp, &ds)
+		if err != nil {
+			return linux.Statx{}, err
+		}
 	}
 
 	var stat linux.Statx
 	if layerMask := opts.Mask &^ statInternalMask; layerMask != 0 {
 		layerVD := d.topLayer()
+		var err error
 		stat, err = fs.vfsfs.VirtualFilesystem().StatAt(ctx, fs.creds, &vfs.PathOperation{
 			Root:  layerVD,
 			Start: layerVD,
@@ -1606,6 +1638,15 @@ func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
+	// We need to DecRef outside of fs.renameMu because forgetting a dead
+	// mountpoint could result in this filesystem being released which acquires
+	// fs.renameMu.
+	var toDecRef []refs.RefCounter
+	defer func() {
+		for _, ref := range toDecRef {
+			ref.DecRef(ctx)
+		}
+	}()
 	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	start := rp.Start().Impl().(*dentry)
 	parent, err := fs.walkParentDirLocked(ctx, rp, start, &ds)
@@ -1678,7 +1719,7 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 		return err
 	}
 
-	vfsObj.CommitDeleteDentry(ctx, &child.vfsd)
+	toDecRef = vfsObj.CommitDeleteDentry(ctx, &child.vfsd)
 	delete(parent.children, name)
 	if !child.isDir() {
 		// Once a whiteout is created, non-directory dentries on the lower layers
@@ -1852,9 +1893,12 @@ func (fs *filesystem) removeXattrLocked(ctx context.Context, d *dentry, mnt *vfs
 
 // PrependPath implements vfs.FilesystemImpl.PrependPath.
 func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDentry, b *fspath.Builder) error {
-	fs.renameMu.RLock()
-	defer fs.renameMu.RUnlock()
-	return genericPrependPath(vfsroot, vd.Mount(), vd.Dentry().Impl().(*dentry), b)
+	return genericPrependPath(fs, vfsroot, vd.Mount(), vd.Dentry().Impl().(*dentry), b)
+}
+
+// IsDescendant implements vfs.FilesystemImpl.IsDescendant.
+func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
+	return genericIsDescendant(fs, vfsroot.Dentry(), vd.Dentry().Impl().(*dentry))
 }
 
 // MountOptions implements vfs.FilesystemImpl.MountOptions.

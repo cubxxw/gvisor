@@ -16,7 +16,9 @@
 startup --host_jvm_args=-Dbazel.DigestFunction=SHA256
 
 # Build with C++17.
-build --cxxopt=-std=c++17
+# com_google_protobuf is compiled with a few warnings.
+build --cxxopt=-std=c++17 --cxxopt=-Wno-error=maybe-uninitialized
+build --host_cxxopt=-std=c++17 --host_cxxopt=-Wno-error=maybe-uninitialized
 
 # Display the current git revision in the info block.
 build --stamp --workspace_status_command tools/workspace_status.sh
@@ -26,6 +28,9 @@ test:race --@io_bazel_rules_go//go/config:race --@io_bazel_rules_go//go/config:p
 
 build --@io_bazel_rules_go//go/config:pure
 test --@io_bazel_rules_go//go/config:pure
+
+# Set bazel_rule as non-pure when cgo is used.
+build:plugin-tldk --@io_bazel_rules_go//go/config:pure=false --define=plugin_tldk=true --define=network_plugins=true
 
 # By default, exclude nogo targets from building. They will still be included
 # by default for all tests.
@@ -40,3 +45,5 @@ build:x86_64 --platforms=@io_bazel_rules_go//go/toolchain:linux_amd64
 build:aarch64 --crosstool_top=@crosstool//:toolchains
 build:aarch64 --cpu=aarch64
 build:aarch64 --platforms=@io_bazel_rules_go//go/toolchain:linux_arm64
+
+common --noenable_bzlmod

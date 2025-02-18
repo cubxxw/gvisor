@@ -15,11 +15,13 @@
 package boot
 
 import (
-	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
+	"gvisor.dev/gvisor/runsc/config"
 )
 
 func TestPodMountHintsHappy(t *testing.T) {
@@ -54,7 +56,7 @@ func TestPodMountHintsHappy(t *testing.T) {
 	if want := pod; want != mount1.Share {
 		t.Errorf("mount1 type, want: %q, got: %q", want, mount1.Share)
 	}
-	if want := []string(nil); !reflect.DeepEqual(want, mount1.Mount.Options) {
+	if want := []string(nil); !slices.Equal(want, mount1.Mount.Options) {
 		t.Errorf("mount1 type, want: %q, got: %q", want, mount1.Mount.Options)
 	}
 
@@ -71,7 +73,7 @@ func TestPodMountHintsHappy(t *testing.T) {
 	if want := container; want != mount2.Share {
 		t.Errorf("mount2 type, want: %q, got: %q", want, mount2.Share)
 	}
-	if want := []string{"rw", "private"}; !reflect.DeepEqual(want, mount2.Mount.Options) {
+	if want := []string{"rw", "private"}; !slices.Equal(want, mount2.Mount.Options) {
 		t.Errorf("mount2 type, want: %q, got: %q", want, mount2.Mount.Options)
 	}
 }
@@ -175,7 +177,7 @@ func TestIgnoreInvalidMountOptions(t *testing.T) {
 			MountPrefix + "mount1.source":  "foo",
 			MountPrefix + "mount1.type":    "tmpfs",
 			MountPrefix + "mount1.share":   "container",
-			MountPrefix + "mount1.options": "rw,invalid,private",
+			MountPrefix + "mount1.options": "rw,shared,noexec",
 		},
 	}
 	podHints, err := NewPodMountHints(spec)
@@ -183,7 +185,7 @@ func TestIgnoreInvalidMountOptions(t *testing.T) {
 		t.Fatalf("newPodMountHints failed: %v", err)
 	}
 	mount1 := podHints.Mounts["mount1"]
-	if want := []string{"rw", "private"}; !reflect.DeepEqual(want, mount1.Mount.Options) {
+	if want := []string{"rw", "noexec"}; !slices.Equal(want, mount1.Mount.Options) {
 		t.Errorf("mount2 type, want: %q, got: %q", want, mount1.Mount.Options)
 	}
 }
@@ -243,6 +245,107 @@ func TestHintsCheckCompatible(t *testing.T) {
 				if len(tc.err) > 0 {
 					t.Fatalf("error %q expected", tc.err)
 				}
+			}
+		})
+	}
+}
+
+// TestRootfsHintHappy tests that valid rootfs annotations can be parsed correctly.
+func TestRootfsHintHappy(t *testing.T) {
+	const imagePath = "/tmp/rootfs.img"
+	spec := &specs.Spec{
+		Annotations: map[string]string{
+			RootfsPrefix + "source":  imagePath,
+			RootfsPrefix + "type":    erofs.Name,
+			RootfsPrefix + "overlay": config.MemoryOverlay.String(),
+		},
+	}
+	hint, err := NewRootfsHint(spec)
+	if err != nil {
+		t.Fatalf("NewRootfsHint failed: %v", err)
+	}
+
+	// Check that fields were set correctly.
+	if hint.Mount.Source != imagePath {
+		t.Errorf("rootfs source, want: %q, got: %q", imagePath, hint.Mount.Source)
+	}
+	if hint.Mount.Type != erofs.Name {
+		t.Errorf("rootfs type, want: %q, got: %q", erofs.Name, hint.Mount.Type)
+	}
+	if hint.Overlay != config.MemoryOverlay {
+		t.Errorf("rootfs overlay, want: %q, got: %q", config.MemoryOverlay, hint.Overlay)
+	}
+}
+
+// TestRootfsHintErrors tests that proper errors will be returned when parsing
+// invalid rootfs annotations.
+func TestRootfsHintErrors(t *testing.T) {
+	const imagePath = "/tmp/rootfs.img"
+	for _, tst := range []struct {
+		name        string
+		annotations map[string]string
+		error       string
+	}{
+		{
+			name: "invalid source",
+			annotations: map[string]string{
+				RootfsPrefix + "source": "invalid",
+				RootfsPrefix + "type":   erofs.Name,
+			},
+			error: "invalid rootfs annotation",
+		},
+		{
+			name: "invalid type",
+			annotations: map[string]string{
+				RootfsPrefix + "source": imagePath,
+				RootfsPrefix + "type":   "invalid",
+			},
+			error: "invalid rootfs annotation",
+		},
+		{
+			name: "invalid overlay",
+			annotations: map[string]string{
+				RootfsPrefix + "source":  imagePath,
+				RootfsPrefix + "type":    erofs.Name,
+				RootfsPrefix + "overlay": "invalid",
+			},
+			error: "invalid rootfs annotation",
+		},
+		{
+			name: "invalid key",
+			annotations: map[string]string{
+				RootfsPrefix + "invalid": "invalid",
+				RootfsPrefix + "source":  imagePath,
+				RootfsPrefix + "type":    erofs.Name,
+				RootfsPrefix + "overlay": config.MemoryOverlay.String(),
+			},
+			error: "invalid rootfs annotation",
+		},
+		{
+			name: "missing source",
+			annotations: map[string]string{
+				RootfsPrefix + "type":    erofs.Name,
+				RootfsPrefix + "overlay": config.MemoryOverlay.String(),
+			},
+			error: "rootfs annotations missing required field",
+		},
+		{
+			name: "missing type",
+			annotations: map[string]string{
+				RootfsPrefix + "source":  imagePath,
+				RootfsPrefix + "overlay": config.MemoryOverlay.String(),
+			},
+			error: "rootfs annotations missing required field",
+		},
+	} {
+		t.Run(tst.name, func(t *testing.T) {
+			spec := &specs.Spec{Annotations: tst.annotations}
+			hint, err := NewRootfsHint(spec)
+			if err == nil || !strings.Contains(err.Error(), tst.error) {
+				t.Errorf("NewRootfsHint invalid error, want: .*%s.*, got: %v", tst.error, err)
+			}
+			if hint != nil {
+				t.Errorf("NewRootfsHint must return nil on failure: %+v", hint)
 			}
 		})
 	}

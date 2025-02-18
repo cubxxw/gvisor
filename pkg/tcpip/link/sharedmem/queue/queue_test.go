@@ -16,7 +16,7 @@ package queue
 
 import (
 	"encoding/binary"
-	"reflect"
+	"slices"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
@@ -69,7 +69,7 @@ func TestBasicTxQueue(t *testing.T) {
 		40, 0, 0, 0, // size 2
 	}
 
-	if !reflect.DeepEqual(want, d) {
+	if !slices.Equal(want, d) {
 		t.Fatalf("Bad posted packet: got %v, want %v", d, want)
 	}
 
@@ -147,7 +147,7 @@ func TestBasicRxQueue(t *testing.T) {
 			t.Fatalf("Tx pipe is empty after PostBuffers")
 		}
 
-		if !reflect.DeepEqual(want[i], d) {
+		if !slices.Equal(want[i], d) {
 			t.Fatalf("Bad posted packet: got %v, want %v", d, want[i])
 		}
 
@@ -188,7 +188,7 @@ func TestBasicRxQueue(t *testing.T) {
 		t.Fatalf("Bad packet size: got %v, want %v", n, 100)
 	}
 
-	if !reflect.DeepEqual(bufs, b) {
+	if !slices.Equal(bufs, b) {
 		t.Fatalf("Bad returned buffers: got %v, want %v", bufs, b)
 	}
 }
@@ -492,7 +492,7 @@ func TestLotsOfReceptions(t *testing.T) {
 }
 
 func TestRxEnableNotification(t *testing.T) {
-	// Check that enabling nofifications results in properly updated state.
+	// Check that enabling notifications results in properly updated state.
 	pb1 := make([]byte, 100)
 	pb2 := make([]byte, 100)
 
@@ -507,7 +507,7 @@ func TestRxEnableNotification(t *testing.T) {
 }
 
 func TestRxDisableNotification(t *testing.T) {
-	// Check that disabling nofifications results in properly updated state.
+	// Check that disabling notifications results in properly updated state.
 	pb1 := make([]byte, 100)
 	pb2 := make([]byte, 100)
 

@@ -295,12 +295,9 @@ func (fd *regularFileFD) writeCache(ctx context.Context, d *dentry, offset int64
 	var freed []memmap.FileRange
 
 	d.dataMu.Lock()
-	cseg := d.cache.LowerBoundSegment(mr.Start)
-	for cseg.Ok() && cseg.Start() < mr.End {
-		cseg = d.cache.Isolate(cseg, mr)
+	d.cache.RemoveRangeWith(mr, func(cseg fsutil.FileRangeIterator) {
 		freed = append(freed, memmap.FileRange{cseg.Value(), cseg.Value() + cseg.Range().Length()})
-		cseg = d.cache.Remove(cseg).NextSegment()
-	}
+	})
 	d.dataMu.Unlock()
 
 	// Invalidate mappings of removed pages.
@@ -309,7 +306,7 @@ func (fd *regularFileFD) writeCache(ctx context.Context, d *dentry, offset int64
 	d.mapsMu.Unlock()
 
 	// Finally free pages removed from the cache.
-	mf := d.fs.mfp.MemoryFile()
+	mf := d.fs.mf
 	for _, freedFR := range freed {
 		mf.DecRef(freedFR)
 	}
@@ -365,16 +362,17 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 	// unreliable), or if the file was opened O_DIRECT, read directly from
 	// readHandle() without locking dentry.dataMu.
 	rw.d.handleMu.RLock()
+	defer rw.d.handleMu.RUnlock()
 	h := rw.d.readHandle()
 	if (rw.d.mmapFD.RacyLoad() >= 0 && !rw.d.fs.opts.forcePageCache) || rw.d.fs.opts.interop == InteropModeShared || rw.direct {
 		n, err := h.readToBlocksAt(rw.ctx, dsts, rw.off)
-		rw.d.handleMu.RUnlock()
 		rw.off += n
 		return n, err
 	}
 
 	// Otherwise read from/through the cache.
-	mf := rw.d.fs.mfp.MemoryFile()
+	memCgID := pgalloc.MemoryCgroupIDFromContext(rw.ctx)
+	mf := rw.d.fs.mf
 	fillCache := mf.ShouldCacheEvictable()
 	var dataMuUnlock func()
 	if fillCache {
@@ -384,12 +382,11 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 		rw.d.dataMu.RLock()
 		dataMuUnlock = rw.d.dataMu.RUnlock
 	}
+	defer dataMuUnlock()
 
 	// Compute the range to read (limited by file size and overflow-checked).
 	end := rw.d.size.Load()
 	if rw.off >= end {
-		dataMuUnlock()
-		rw.d.handleMu.RUnlock()
 		return 0, io.EOF
 	}
 	if rend := rw.off + dsts.NumBytes(); rend > rw.off && rend < end {
@@ -405,8 +402,6 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 			// Get internal mappings from the cache.
 			ims, err := mf.MapInternal(seg.FileRangeOf(seg.Range().Intersect(mr)), hostarch.Read)
 			if err != nil {
-				dataMuUnlock()
-				rw.d.handleMu.RUnlock()
 				return done, err
 			}
 
@@ -416,8 +411,6 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 			rw.off += n
 			dsts = dsts.DropFirst64(n)
 			if err != nil {
-				dataMuUnlock()
-				rw.d.handleMu.RUnlock()
 				return done, err
 			}
 
@@ -435,12 +428,14 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 					End:   gapEnd,
 				}
 				optMR := gap.Range()
-				_, err := rw.d.cache.Fill(rw.ctx, reqMR, maxFillRange(reqMR, optMR), rw.d.size.Load(), mf, usage.PageCache, pgalloc.AllocateAndWritePopulate, h.readToBlocksAt)
+				_, err := rw.d.cache.Fill(rw.ctx, reqMR, maxFillRange(reqMR, optMR), rw.d.size.Load(), mf, pgalloc.AllocOpts{
+					Kind:    usage.PageCache,
+					MemCgID: memCgID,
+					Mode:    pgalloc.AllocateAndWritePopulate,
+				}, h.readToBlocksAt)
 				mf.MarkEvictable(rw.d, pgalloc.EvictableRange{optMR.Start, optMR.End})
 				seg, gap = rw.d.cache.Find(rw.off)
 				if !seg.Ok() {
-					dataMuUnlock()
-					rw.d.handleMu.RUnlock()
 					return done, err
 				}
 				// err might have occurred in part of gap.Range() outside gapMR
@@ -456,8 +451,6 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 				dsts = dsts.DropFirst64(n)
 				// Partial reads are fine. But we must stop reading.
 				if n != gapDsts.NumBytes() || err != nil {
-					dataMuUnlock()
-					rw.d.handleMu.RUnlock()
 					return done, err
 				}
 
@@ -466,8 +459,6 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 			}
 		}
 	}
-	dataMuUnlock()
-	rw.d.handleMu.RUnlock()
 	return done, nil
 }
 
@@ -485,24 +476,25 @@ func (rw *dentryReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, erro
 	// opened with O_DIRECT, write directly to dentry.writeHandle()
 	// without locking dentry.dataMu.
 	rw.d.handleMu.RLock()
+	defer rw.d.handleMu.RUnlock()
 	h := rw.d.writeHandle()
 	if (rw.d.mmapFD.RacyLoad() >= 0 && !rw.d.fs.opts.forcePageCache) || rw.d.fs.opts.interop == InteropModeShared || rw.direct {
 		n, err := h.writeFromBlocksAt(rw.ctx, srcs, rw.off)
 		rw.off += n
 		rw.d.dataMu.Lock()
+		defer rw.d.dataMu.Unlock()
 		if rw.off > rw.d.size.Load() {
 			rw.d.size.Store(rw.off)
 			// The remote file's size will implicitly be extended to the correct
 			// value when we write back to it.
 		}
-		rw.d.dataMu.Unlock()
-		rw.d.handleMu.RUnlock()
 		return n, err
 	}
 
 	// Otherwise write to/through the cache.
-	mf := rw.d.fs.mfp.MemoryFile()
+	mf := rw.d.fs.mf
 	rw.d.dataMu.Lock()
+	defer rw.d.dataMu.Unlock()
 
 	// Compute the range to write (overflow-checked).
 	start := rw.off
@@ -582,8 +574,6 @@ exitLoop:
 			retErr = err
 		}
 	}
-	rw.d.dataMu.Unlock()
-	rw.d.handleMu.RUnlock()
 	return done, retErr
 }
 
@@ -608,7 +598,7 @@ func (d *dentry) writeback(ctx context.Context, offset, size int64) error {
 	return fsutil.SyncDirty(ctx, memmap.MappableRange{
 		Start: uint64(offset),
 		End:   uint64(end),
-	}, &d.cache, &d.dirty, dentrySize, d.fs.mfp.MemoryFile(), h.writeFromBlocksAt)
+	}, &d.cache, &d.dirty, dentrySize, d.fs.mf, h.writeFromBlocksAt)
 }
 
 // Seek implements vfs.FileDescriptionImpl.Seek.
@@ -716,7 +706,7 @@ func (d *dentry) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar host
 	if d.fs.mayCachePagesInMemoryFile() {
 		// d.Evict() will refuse to evict memory-mapped pages, so tell the
 		// MemoryFile to not bother trying.
-		mf := d.fs.mfp.MemoryFile()
+		mf := d.fs.mf
 		for _, r := range mapped {
 			mf.MarkUnevictable(d, pgalloc.EvictableRange{r.Start, r.End})
 		}
@@ -736,7 +726,7 @@ func (d *dentry) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar h
 		// Pages that are no longer referenced by any application memory
 		// mappings are now considered unused; allow MemoryFile to evict them
 		// when necessary.
-		mf := d.fs.mfp.MemoryFile()
+		mf := d.fs.mf
 		d.dataMu.Lock()
 		for _, r := range unmapped {
 			// Since these pages are no longer mapped, they are no longer
@@ -757,8 +747,8 @@ func (d *dentry) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR,
 // Translate implements memmap.Mappable.Translate.
 func (d *dentry) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
 	d.handleMu.RLock()
+	defer d.handleMu.RUnlock()
 	if d.mmapFD.RacyLoad() >= 0 && !d.fs.opts.forcePageCache {
-		d.handleMu.RUnlock()
 		mr := optional
 		if d.fs.opts.limitHostFDTranslation {
 			mr = maxFillRange(required, optional)
@@ -773,7 +763,9 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 		}, nil
 	}
 
+	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 	d.dataMu.Lock()
+	defer d.dataMu.Unlock()
 
 	// Constrain translations to d.size (rounded up) to prevent translation to
 	// pages that may be concurrently truncated.
@@ -781,8 +773,6 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 	var beyondEOF bool
 	if required.End > pgend {
 		if required.Start >= pgend {
-			d.dataMu.Unlock()
-			d.handleMu.RUnlock()
 			return nil, &memmap.BusError{io.EOF}
 		}
 		beyondEOF = true
@@ -792,9 +782,13 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 		optional.End = pgend
 	}
 
-	mf := d.fs.mfp.MemoryFile()
+	mf := d.fs.mf
 	h := d.readHandle()
-	_, cerr := d.cache.Fill(ctx, required, maxFillRange(required, optional), d.size.Load(), mf, usage.PageCache, pgalloc.AllocateAndWritePopulate, h.readToBlocksAt)
+	_, cerr := d.cache.Fill(ctx, required, maxFillRange(required, optional), d.size.Load(), mf, pgalloc.AllocOpts{
+		Kind:    usage.PageCache,
+		MemCgID: memCgID,
+		Mode:    pgalloc.AllocateAndWritePopulate,
+	}, h.readToBlocksAt)
 
 	var ts []memmap.Translation
 	var translatedEnd uint64
@@ -802,10 +796,7 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 		segMR := seg.Range().Intersect(optional)
 		// TODO(jamieliu): Make Translations writable even if writability is
 		// not required if already kept-dirty by another writable translation.
-		perms := hostarch.AccessType{
-			Read:    true,
-			Execute: true,
-		}
+		perms := hostarch.ReadExecute
 		if at.Write {
 			// From this point forward, this memory can be dirtied through the
 			// mapping at any time.
@@ -820,9 +811,6 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 		})
 		translatedEnd = segMR.End
 	}
-
-	d.dataMu.Unlock()
-	d.handleMu.RUnlock()
 
 	// Don't return the error returned by c.cache.Fill if it occurred outside
 	// of required.
@@ -862,7 +850,7 @@ func (d *dentry) InvalidateUnsavable(ctx context.Context) error {
 
 	// Write the cache's contents back to the remote file so that if we have a
 	// host fd after restore, the remote file's contents are coherent.
-	mf := d.fs.mfp.MemoryFile()
+	mf := d.fs.mf
 	d.handleMu.RLock()
 	defer d.handleMu.RUnlock()
 	h := d.writeHandle()
@@ -884,7 +872,7 @@ func (d *dentry) InvalidateUnsavable(ctx context.Context) error {
 // Evict implements pgalloc.EvictableMemoryUser.Evict.
 func (d *dentry) Evict(ctx context.Context, er pgalloc.EvictableRange) {
 	mr := memmap.MappableRange{er.Start, er.End}
-	mf := d.fs.mfp.MemoryFile()
+	mf := d.fs.mf
 	d.mapsMu.Lock()
 	defer d.mapsMu.Unlock()
 	d.handleMu.RLock()
@@ -916,6 +904,8 @@ func (d *dentry) Evict(ctx context.Context, er pgalloc.EvictableRange) {
 //
 // +stateify savable
 type dentryPlatformFile struct {
+	memmap.NoBufferedIOFallback
+
 	*dentry
 
 	// fdRefs counts references on memmap.File offsets. fdRefs is protected
@@ -949,6 +939,11 @@ func (d *dentryPlatformFile) MapInternal(fr memmap.FileRange, at hostarch.Access
 	d.handleMu.RLock()
 	defer d.handleMu.RUnlock()
 	return d.hostFileMapper.MapInternal(fr, int(d.mmapFD.RacyLoad()), at.Write)
+}
+
+// DataFD implements memmap.File.DataFD.
+func (d *dentryPlatformFile) DataFD(fr memmap.FileRange) (int, error) {
+	return d.FD(), nil
 }
 
 // FD implements memmap.File.FD.

@@ -81,13 +81,10 @@ type TaskConfig struct {
 	// IPCNamespace is the IPCNamespace of the new task.
 	IPCNamespace *IPCNamespace
 
-	// AbstractSocketNamespace is the AbstractSocketNamespace of the new task.
-	AbstractSocketNamespace *AbstractSocketNamespace
-
 	// MountNamespace is the MountNamespace of the new task.
 	MountNamespace *vfs.MountNamespace
 
-	// RSeqAddr is a pointer to the the userspace linux.RSeq structure.
+	// RSeqAddr is a pointer to the userspace linux.RSeq structure.
 	RSeqAddr hostarch.Addr
 
 	// RSeqSignature is the signature that the rseq abort IP must be signed
@@ -101,7 +98,13 @@ type TaskConfig struct {
 	InitialCgroups map[Cgroup]struct{}
 
 	// UserCounters is user resource counters.
-	UserCounters *userCounters
+	UserCounters *UserCounters
+
+	// SessionKeyring is the session keyring associated with the parent task.
+	// It may be nil.
+	SessionKeyring *auth.Key
+
+	Origin TaskOrigin
 }
 
 // NewTask creates a new task defined by cfg.
@@ -162,7 +165,6 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		niceness:        cfg.Niceness,
 		utsns:           cfg.UTSNamespace,
 		ipcns:           cfg.IPCNamespace,
-		abstractSockets: cfg.AbstractSocketNamespace,
 		mountNamespace:  cfg.MountNamespace,
 		rseqCPU:         -1,
 		rseqAddr:        cfg.RSeqAddr,
@@ -171,11 +173,13 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		containerID:     cfg.ContainerID,
 		cgroups:         make(map[Cgroup]struct{}),
 		userCounters:    cfg.UserCounters,
+		sessionKeyring:  cfg.SessionKeyring,
+		Origin:          cfg.Origin,
+		onDestroyAction: make(map[TaskDestroyAction]struct{}),
 	}
 	t.netns = cfg.NetworkNamespace
 	t.creds.Store(cfg.Credentials)
 	t.endStopCond.L = &t.tg.signalHandlers.mu
-	t.ptraceTracer.Store((*Task)(nil))
 	// We don't construct t.blockingTimer until Task.run(); see that function
 	// for justification.
 
@@ -184,7 +188,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		charged, committed bool
 	)
 
-	// Reserve cgroup PIDs controller charge. This is either commited when the
+	// Reserve cgroup PIDs controller charge. This is either committed when the
 	// new task enters the cgroup below, or rolled back on failure.
 	//
 	// We may also get here from a non-task context (for example, when
@@ -210,6 +214,17 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		}
 	}
 
+	// If the task was the first to be added to the thread group, check if
+	// it needs to be notified of CPU limits being exceeded.
+	// We use a defer here because we need to do this without holding the
+	// TaskSet or signalHandlers lock.
+	var isFirstTask bool
+	defer func() {
+		if isFirstTask {
+			tg.notifyRlimitCPUUpdated(t)
+		}
+	}()
+
 	// Make the new task (and possibly thread group) visible to the rest of
 	// the system atomically.
 	ts.mu.Lock()
@@ -223,11 +238,19 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		// we're in uncharted territory and can return whatever we want.
 		return nil, linuxerr.EINTR
 	}
+	if ts.liveTasks == 0 && ts.noNewTasksIfZeroLive {
+		// Since liveTasks == 0, our caller cannot be a task goroutine invoking
+		// a syscall, so it's safe to return a non-errno error that is more
+		// explanatory.
+		return nil, fmt.Errorf("task creation disabled after Kernel.WaitExited() may have returned")
+	}
 	if err := ts.assignTIDsLocked(t); err != nil {
 		return nil, err
 	}
 	// Below this point, newTask is expected not to fail (there is no rollback
 	// of assignTIDsLocked or any of the following).
+
+	ts.liveTasks++
 
 	// Logging on t's behalf will panic if t.logPrefix hasn't been
 	// initialized. This is the earliest point at which we can do so
@@ -248,7 +271,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 	t.EnterInitialCgroups(srcT, cfg.InitialCgroups)
 	committed = true
 
-	if tg.leader == nil {
+	if isFirstTask = tg.leader == nil; isFirstTask {
 		// New thread group.
 		tg.leader = t
 		if parentPG := tg.parentPG(); parentPG == nil {
@@ -380,7 +403,6 @@ func (t *Task) Start(tid ThreadID) {
 	}
 	t.goroutineStopped.Add(1)
 	t.tg.liveGoroutines.Add(1)
-	t.tg.pidns.owner.liveGoroutines.Add(1)
 	t.tg.pidns.owner.runningGoroutines.Add(1)
 
 	// Task is now running in system mode.

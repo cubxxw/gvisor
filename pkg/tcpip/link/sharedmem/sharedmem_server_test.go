@@ -340,7 +340,7 @@ func TestServerBulkTransfer(t *testing.T) {
 			}
 			response.Body.Close()
 			if got, want := int(n), payloadSize; got != want {
-				t.Fatalf("unexpected resposne size got: %d, want: %d", got, want)
+				t.Fatalf("unexpected response size got: %d, want: %d", got, want)
 			}
 			log.Infof("read %d bytes", n)
 		})
@@ -396,10 +396,66 @@ func TestClientBulkTransfer(t *testing.T) {
 			}
 			response.Body.Close()
 			if got, want := int(n), payloadSize; got != want {
-				t.Fatalf("unexpected resposne size got: %d, want: %d", got, want)
+				t.Fatalf("unexpected response size got: %d, want: %d", got, want)
 			}
 			log.Infof("read %d bytes", n)
 		})
+	}
+}
+
+func TestSetLinkAddress(t *testing.T) {
+	q, err := sharedmem.NewQueuePair(sharedmem.QueueOptions{})
+	if err != nil {
+		q.Close()
+		t.Fatalf("failed to create sharedmem queue: %s", err)
+	}
+	defer q.Close()
+	ep, err := sharedmem.NewServerEndpoint(sharedmem.Options{
+		MTU:         defaultMTU,
+		BufferSize:  defaultBufferSize,
+		LinkAddress: remoteLinkAddr,
+		TX:          q.TXQueueConfig(),
+		RX:          q.RXQueueConfig(),
+		PeerFD:      123,
+	})
+	if err != nil {
+		t.Fatalf("failed to create sharedmem endpoint: %s", err)
+	}
+	addrs := []tcpip.LinkAddress{"abc", "def"}
+	for _, addr := range addrs {
+		ep.SetLinkAddress(addr)
+
+		if want, v := addr, ep.LinkAddress(); want != v {
+			t.Errorf("LinkAddress() = %v, want %v", v, want)
+		}
+	}
+}
+
+func TestMTU(t *testing.T) {
+	q, err := sharedmem.NewQueuePair(sharedmem.QueueOptions{})
+	if err != nil {
+		q.Close()
+		t.Fatalf("failed to create sharedmem queue: %s", err)
+	}
+	defer q.Close()
+	ep, err := sharedmem.NewServerEndpoint(sharedmem.Options{
+		MTU:         defaultMTU,
+		BufferSize:  defaultBufferSize,
+		LinkAddress: remoteLinkAddr,
+		TX:          q.TXQueueConfig(),
+		RX:          q.RXQueueConfig(),
+		PeerFD:      123,
+	})
+	if err != nil {
+		t.Fatalf("failed to create sharedmem endpoint: %s", err)
+	}
+	mtus := []uint32{1000, 2000}
+	for _, mtu := range mtus {
+		ep.SetMTU(mtu)
+
+		if want, v := mtu, ep.MTU(); want != v {
+			t.Errorf("MTU() = %v, want %v", v, want)
+		}
 	}
 }
 

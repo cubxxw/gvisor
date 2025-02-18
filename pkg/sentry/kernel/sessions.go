@@ -113,7 +113,7 @@ type ProcessGroup struct {
 	processGroupEntry
 }
 
-// Originator retuns the originator of the process group.
+// Originator returns the originator of the process group.
 func (pg *ProcessGroup) Originator() *ThreadGroup {
 	return pg.originator
 }
@@ -198,7 +198,7 @@ func (pg *ProcessGroup) handleOrphan() {
 
 	// See if there are any stopped jobs.
 	hasStopped := false
-	pg.originator.pidns.owner.forEachThreadGroupLocked(func(tg *ThreadGroup) {
+	pg.originator.pidns.owner.forEachThreadGroupLocked(func(tg *ThreadGroup, _ *Task) {
 		if tg.processGroup != pg {
 			return
 		}
@@ -213,13 +213,13 @@ func (pg *ProcessGroup) handleOrphan() {
 	}
 
 	// Deliver appropriate signals to all thread groups.
-	pg.originator.pidns.owner.forEachThreadGroupLocked(func(tg *ThreadGroup) {
+	pg.originator.pidns.owner.forEachThreadGroupLocked(func(tg *ThreadGroup, tgLeader *Task) {
 		if tg.processGroup != pg {
 			return
 		}
 		tg.signalHandlers.mu.NestedLock(signalHandlersLockTg)
-		tg.leader.sendSignalLocked(SignalInfoPriv(linux.SIGHUP), true /* group */)
-		tg.leader.sendSignalLocked(SignalInfoPriv(linux.SIGCONT), true /* group */)
+		tgLeader.sendSignalLocked(SignalInfoPriv(linux.SIGHUP), true /* group */)
+		tgLeader.sendSignalLocked(SignalInfoPriv(linux.SIGCONT), true /* group */)
 		tg.signalHandlers.mu.NestedUnlock(signalHandlersLockTg)
 	})
 
@@ -256,7 +256,7 @@ func (pg *ProcessGroup) SendSignal(info *linux.SignalInfo) error {
 //
 // EPERM may be returned if either the given ThreadGroup is already a Session
 // leader, or a ProcessGroup already exists for the ThreadGroup's ID.
-func (tg *ThreadGroup) CreateSession() error {
+func (tg *ThreadGroup) CreateSession() (SessionID, error) {
 	tg.pidns.owner.mu.Lock()
 	defer tg.pidns.owner.mu.Unlock()
 	tg.signalHandlers.mu.Lock()
@@ -267,7 +267,7 @@ func (tg *ThreadGroup) CreateSession() error {
 // createSession creates a new session for a threadgroup.
 //
 // Precondition: callers must hold TaskSet.mu and the signal mutex for writing.
-func (tg *ThreadGroup) createSession() error {
+func (tg *ThreadGroup) createSession() (SessionID, error) {
 	// Get the ID for this thread in the current namespace.
 	id := tg.pidns.tgids[tg]
 
@@ -278,21 +278,22 @@ func (tg *ThreadGroup) createSession() error {
 			continue
 		}
 		if s.leader == tg {
-			return linuxerr.EPERM
+			return -1, linuxerr.EPERM
 		}
 		if s.id == SessionID(id) {
-			return linuxerr.EPERM
+			return -1, linuxerr.EPERM
 		}
 		for pg := s.processGroups.Front(); pg != nil; pg = pg.Next() {
 			if pg.id == ProcessGroupID(id) {
-				return linuxerr.EPERM
+				return -1, linuxerr.EPERM
 			}
 		}
 	}
 
 	// Create a new Session, with a single reference.
+	sid := SessionID(id)
 	s := &Session{
-		id:     SessionID(id),
+		id:     sid,
 		leader: tg,
 	}
 	s.InitRefs()
@@ -356,7 +357,7 @@ func (tg *ThreadGroup) createSession() error {
 	// Disconnect from the controlling terminal.
 	tg.tty = nil
 
-	return nil
+	return sid, nil
 }
 
 // CreateProcessGroup creates a new process group.
@@ -430,13 +431,9 @@ func (tg *ThreadGroup) CreateProcessGroup() error {
 
 // JoinProcessGroup joins an existing process group.
 //
-// This function will return EACCES if an exec has been performed since fork
-// by the given ThreadGroup, and EPERM if the Sessions are not the same or the
+// This function will return EPERM if the Sessions are not the same or the
 // group does not exist.
-//
-// If checkExec is set, then the join is not permitted after the process has
-// executed exec at least once.
-func (tg *ThreadGroup) JoinProcessGroup(pidns *PIDNamespace, pgid ProcessGroupID, checkExec bool) error {
+func (tg *ThreadGroup) JoinProcessGroup(pidns *PIDNamespace, pgid ProcessGroupID) error {
 	pidns.owner.mu.Lock()
 	defer pidns.owner.mu.Unlock()
 
@@ -449,11 +446,6 @@ func (tg *ThreadGroup) JoinProcessGroup(pidns *PIDNamespace, pgid ProcessGroupID
 	pg := pidns.processGroups[pgid]
 	if pg == nil {
 		return linuxerr.EPERM
-	}
-
-	// Disallow the join if an execve has performed, per POSIX.
-	if checkExec && tg.execed {
-		return linuxerr.EACCES
 	}
 
 	// See if it's in the same session as ours.

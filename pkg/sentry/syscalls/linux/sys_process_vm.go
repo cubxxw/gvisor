@@ -20,28 +20,28 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
-type vmReadWriteOp int
+type processVMOpType int
 
 const (
-	localReadLocalWrite vmReadWriteOp = iota
-	remoteReadLocalWrite
-	localReadRemoteWrite
+	processVMOpRead = iota
+	processVMOpWrite
 )
 
 // ProcessVMReadv implements process_vm_readv(2).
 func ProcessVMReadv(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	return processVMRW(t, args, false /*isWrite*/)
+	return processVMOp(t, args, processVMOpRead)
 }
 
 // ProcessVMWritev implements process_vm_writev(2).
 func ProcessVMWritev(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	return processVMRW(t, args, true /*isWrite*/)
+	return processVMOp(t, args, processVMOpWrite)
 }
 
-func processVMRW(t *kernel.Task, args arch.SyscallArguments, isWrite bool) (uintptr, *kernel.SyscallControl, error) {
+func processVMOp(t *kernel.Task, args arch.SyscallArguments, op processVMOpType) (uintptr, *kernel.SyscallControl, error) {
 	pid := kernel.ThreadID(args[0].Int())
 	lvec := hostarch.Addr(args[1].Pointer())
 	liovcnt := int(args[2].Int64())
@@ -49,6 +49,7 @@ func processVMRW(t *kernel.Task, args arch.SyscallArguments, isWrite bool) (uint
 	riovcnt := int(args[4].Int64())
 	flags := args[5].Int()
 
+	// Parse the flags.
 	switch {
 	case flags != 0 ||
 		liovcnt < 0 ||
@@ -56,132 +57,144 @@ func processVMRW(t *kernel.Task, args arch.SyscallArguments, isWrite bool) (uint
 		liovcnt > linux.UIO_MAXIOV ||
 		riovcnt > linux.UIO_MAXIOV:
 		return 0, nil, linuxerr.EINVAL
-	case lvec == 0 || rvec == 0:
-		return 0, nil, linuxerr.EFAULT
 	case liovcnt == 0 || riovcnt == 0:
 		return 0, nil, nil
+	case lvec == 0 || rvec == 0:
+		return 0, nil, linuxerr.EFAULT
 	}
 
-	localProcess := t.ThreadGroup().Leader()
-	if localProcess == nil {
+	// Local process is always the current task (t). Remote process is the
+	// pid specified in the syscall arguments. It is allowed to be the same
+	// as the caller process.
+	remoteTask := t.PIDNamespace().TaskWithID(pid)
+	if remoteTask == nil {
 		return 0, nil, linuxerr.ESRCH
 	}
-	remoteThreadGroup := localProcess.PIDNamespace().ThreadGroupWithID(pid)
-	if remoteThreadGroup == nil {
-		return 0, nil, linuxerr.ESRCH
+
+	// man 2 process_vm_read: "Permission to read from or write to another
+	// process is governed by a ptrace access mode
+	// PTRACE_MODE_ATTACH_REALCREDS check; see ptrace(2)."
+	if !t.CanTrace(remoteTask, true /* attach */) {
+		return 0, nil, linuxerr.EPERM
 	}
-	remoteProcess := remoteThreadGroup.Leader()
 
-	isRemote := localProcess == remoteProcess
-
-	// For the write case, we read from the local process and write to the remote process.
-	op := localReadLocalWrite
-	if isWrite {
-		if isRemote {
-			op = remoteReadLocalWrite
+	// Calculate MemoryManager, IOOpts, and iovecs for each of the local
+	// and remote operations.
+	localIovecs, err := t.CopyInIovecsAsSlice(lvec, liovcnt)
+	if err != nil {
+		return 0, nil, err
+	}
+	localOps := processVMOps{
+		mm:     t.MemoryManager(),
+		ioOpts: usermem.IOOpts{AddressSpaceActive: true},
+		iovecs: localIovecs,
+	}
+	remoteIovecs, err := t.CopyInIovecsAsSlice(rvec, riovcnt)
+	if err != nil {
+		return 0, nil, err
+	}
+	remoteOps := processVMOps{
+		iovecs: remoteIovecs,
+	}
+	if remoteTask == t {
+		// No need to take remoteTask.mu to fetch the memory manager,
+		// and we can assume address space is active.
+		remoteOps.mm = t.MemoryManager()
+		remoteOps.ioOpts = usermem.IOOpts{AddressSpaceActive: true}
+	} else {
+		// Grab the remoteTask memory manager, and pin it by adding
+		// ourselves as a user.
+		remoteTask.WithMuLocked(func(*kernel.Task) {
+			remoteOps.mm = remoteTask.MemoryManager()
+		})
+		// Check remoteTask memory manager exists and
+		if remoteOps.mm == nil {
+			return 0, nil, linuxerr.ESRCH
 		}
-		return doProcessVMReadWrite(localProcess, remoteProcess, lvec, rvec, liovcnt, riovcnt, op)
+		if !remoteOps.mm.IncUsers() {
+			return 0, nil, linuxerr.EFAULT
+		}
+		defer remoteOps.mm.DecUsers(t)
 	}
-	// For the read case, we read from the remote process and write to the local process.
-	if isRemote {
-		op = localReadRemoteWrite
+
+	// Finally time to copy some bytes. The order depends on whether we are
+	// "reading" or "writing".
+	var n int
+	switch op {
+	case processVMOpRead:
+		// Copy from remote process to local.
+		n, err = processVMCopyIovecs(t, remoteOps, localOps)
+	case processVMOpWrite:
+		// Copy from local process to remote.
+		n, err = processVMCopyIovecs(t, localOps, remoteOps)
 	}
-	return doProcessVMReadWrite(remoteProcess, localProcess, rvec, lvec, riovcnt, liovcnt, op)
+	if n == 0 && err != nil {
+		return 0, nil, err
+	}
+	return uintptr(n), nil, nil
 }
 
-func doProcessVMReadWrite(rProcess, wProcess *kernel.Task, rAddr, wAddr hostarch.Addr, rIovecCount, wIovecCount int, op vmReadWriteOp) (uintptr, *kernel.SyscallControl, error) {
-	rCtx := rProcess.CopyContext(rProcess, usermem.IOOpts{})
-	wCtx := wProcess.CopyContext(wProcess, usermem.IOOpts{})
+// maxScratchBufferSize is the maximum size of a scratch buffer. It should be
+// sufficiently large to minimizing the number of trips through MM.
+const maxScratchBufferSize = 1 << 20
 
-	var wCount int
-	doProcessVMReadWriteMaybeLocked := func() error {
-		rIovecs, err := rCtx.CopyInIovecs(rAddr, rIovecCount)
-		if err != nil {
-			return err
-		}
-		wIovecs, err := wCtx.CopyInIovecs(wAddr, wIovecCount)
-		if err != nil {
-			return err
-		}
+type processVMOps struct {
+	mm     *mm.MemoryManager
+	ioOpts usermem.IOOpts
+	iovecs []hostarch.AddrRange
+}
 
-		bufSize := 0
-		for _, rIovec := range rIovecs {
-			if int(rIovec.Length()) > bufSize {
-				bufSize = int(rIovec.Length())
-			}
+func processVMCopyIovecs(t *kernel.Task, readOps, writeOps processVMOps) (int, error) {
+	// Get scratch buffer from the calling task.
+	// Size should be max be size of largest read iovec.
+	var bufSize int
+	for _, readIovec := range readOps.iovecs {
+		if int(readIovec.Length()) > bufSize {
+			bufSize = int(readIovec.Length())
 		}
-
-		var buf []byte
-		// We need to copy the called task's scratch buffer so we don't get a data race. If we are
-		// reading a remote process's memory, then we are on the writer's task goroutine, so use
-		// the write context's scratch buffer.
-		if op == remoteReadLocalWrite {
-			buf = wCtx.CopyScratchBuffer(bufSize)
-		} else {
-			buf = rCtx.CopyScratchBuffer(bufSize)
-		}
-
-		for _, rIovec := range rIovecs {
-			if len(wIovecs) <= 0 {
-				break
-			}
-
-			buf = buf[0:int(rIovec.Length())]
-			bytes, err := rCtx.CopyInBytes(rIovec.Start, buf)
-			if linuxerr.Equals(linuxerr.EFAULT, err) {
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			if bytes != int(rIovec.Length()) {
-				return nil
-			}
-			start := 0
-			for bytes > start && 0 < len(wIovecs) {
-				writeLength := int(wIovecs[0].Length())
-				if writeLength > (bytes - start) {
-					writeLength = bytes - start
-				}
-				out, err := wCtx.CopyOutBytes(wIovecs[0].Start, buf[start:writeLength+start])
-				wCount += out
-				start += out
-				if linuxerr.Equals(linuxerr.EFAULT, err) {
-					return nil
-				}
-				if err != nil {
-					return err
-				}
-				if out != writeLength {
-					return nil
-				}
-				wIovecs[0].Start += hostarch.Addr(out)
-				if !wIovecs[0].WellFormed() {
-					return err
-				}
-				if wIovecs[0].Length() == 0 {
-					wIovecs = wIovecs[1:]
-				}
-			}
-		}
-		return nil
 	}
-
-	var err error
-
-	switch op {
-	case remoteReadLocalWrite:
-		err = rCtx.WithTaskMutexLocked(doProcessVMReadWriteMaybeLocked)
-	case localReadRemoteWrite:
-		err = wCtx.WithTaskMutexLocked(doProcessVMReadWriteMaybeLocked)
-
-	case localReadLocalWrite:
-		// in the case of local reads/writes, we don't have to lock the task mutex, because we are
-		// running on the top of the task's goroutine already.
-		err = doProcessVMReadWriteMaybeLocked()
-	default:
-		panic("unsupported operation passed")
+	if bufSize > maxScratchBufferSize {
+		bufSize = maxScratchBufferSize
 	}
+	buf := t.CopyScratchBuffer(bufSize)
 
-	return uintptr(wCount), nil, err
+	// Number of bytes written.
+	var n int
+	for len(readOps.iovecs) != 0 && len(writeOps.iovecs) != 0 {
+		readIovec := readOps.iovecs[0]
+		length := readIovec.Length()
+		if length == 0 {
+			readOps.iovecs = readOps.iovecs[1:]
+			continue
+		}
+		if length > maxScratchBufferSize {
+			length = maxScratchBufferSize
+		}
+		buf = buf[0:int(length)]
+		bytes, err := readOps.mm.CopyIn(t, readIovec.Start, buf, readOps.ioOpts)
+		if bytes == 0 {
+			return n, err
+		}
+		readOps.iovecs[0].Start += hostarch.Addr(bytes)
+
+		start := 0
+		for bytes > start && len(writeOps.iovecs) > 0 {
+			writeLength := int(writeOps.iovecs[0].Length())
+			if writeLength == 0 {
+				writeOps.iovecs = writeOps.iovecs[1:]
+				continue
+			}
+			if writeLength > (bytes - start) {
+				writeLength = bytes - start
+			}
+			out, err := writeOps.mm.CopyOut(t, writeOps.iovecs[0].Start, buf[start:writeLength+start], writeOps.ioOpts)
+			n += out
+			start += out
+			if out != writeLength {
+				return n, err
+			}
+			writeOps.iovecs[0].Start += hostarch.Addr(out)
+		}
+	}
+	return n, nil
 }

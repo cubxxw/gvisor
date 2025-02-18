@@ -1,7 +1,7 @@
 """Meta and miscellaneous rules."""
 
-load("@bazel_skylib//rules:build_test.bzl", _build_test = "build_test")
 load("@bazel_skylib//:bzl_library.bzl", _bzl_library = "bzl_library")
+load("@bazel_skylib//rules:build_test.bzl", _build_test = "build_test")
 load("@bazel_skylib//rules:common_settings.bzl", _BuildSettingInfo = "BuildSettingInfo", _bool_flag = "bool_flag")
 
 build_test = _build_test
@@ -21,7 +21,7 @@ def proto_library(name, has_services = None, **kwargs):
         **kwargs
     )
 
-def select_arch(amd64 = None, arm64 = None, default = None, **kwargs):
+def select_arch(amd64 = None, arm64 = None, riscv64 = None, default = None, **kwargs):
     """Select an option against standard architectures.
 
     Args:
@@ -37,6 +37,8 @@ def select_arch(amd64 = None, arm64 = None, default = None, **kwargs):
         values["//tools/bazeldefs:amd64"] = amd64
     if arm64 != None:
         values["//tools/bazeldefs:arm64"] = arm64
+    if riscv64 != None:
+        values["//tools/bazeldefs:riscv64"] = riscv64
     if default != None:
         values["//conditions:default"] = default
     return select(values, **kwargs)
@@ -89,7 +91,7 @@ def bpf_program(name, src, bpf_object, visibility, hdrs):
 
     Args:
       name: target name for BPF program.
-      src: BPF program souce code in C.
+      src: BPF program source code in C.
       bpf_object: name of generated bpf object code.
       visibility: target visibility.
       hdrs: header files, but currently unsupported.

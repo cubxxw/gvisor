@@ -17,17 +17,17 @@ package hostinet
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"strconv"
 	"strings"
-	"time"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/nlmsg"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -92,7 +92,7 @@ func (s *Stack) Configure(allowRawSockets bool) error {
 	// SACK is important for performance and even compatibility, assume it's
 	// enabled if we can't find the actual value.
 	s.tcpSACKEnabled = true
-	if sack, err := ioutil.ReadFile("/proc/sys/net/ipv4/tcp_sack"); err == nil {
+	if sack, err := os.ReadFile("/proc/sys/net/ipv4/tcp_sack"); err == nil {
 		s.tcpSACKEnabled = strings.TrimSpace(string(sack)) != "0"
 	} else {
 		log.Warningf("Failed to read if TCP SACK if enabled, setting to true")
@@ -119,7 +119,7 @@ func (s *Stack) Configure(allowRawSockets bool) error {
 }
 
 func readTCPBufferSizeFile(filename string) (inet.TCPBufferSize, error) {
-	contents, err := ioutil.ReadFile(filename)
+	contents, err := os.ReadFile(filename)
 	if err != nil {
 		return inet.TCPBufferSize{}, fmt.Errorf("failed to read %s: %v", filename, err)
 	}
@@ -164,6 +164,64 @@ func (s *Stack) InterfaceAddrs() map[int32][]inet.InterfaceAddr {
 		return nil
 	}
 	return addrs
+}
+
+// SetInterface implements inet.Stack.SetInterface.
+func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	var ifinfomsg linux.InterfaceInfoMessage
+	attrs, ok := msg.GetData(&ifinfomsg)
+	if !ok {
+		return syserr.ErrInvalidArgument
+	}
+	for !attrs.Empty() {
+		// The index is unspecified, search by the interface name.
+		ahdr, value, rest, ok := attrs.ParseFirst()
+		if !ok {
+			return syserr.ErrInvalidArgument
+		}
+		attrs = rest
+		switch ahdr.Type {
+		case linux.IFLA_IFNAME:
+			if len(value) < 1 {
+				return syserr.ErrInvalidArgument
+			}
+			if ifinfomsg.Index != 0 {
+				// Device name changing isn't supported yet.
+				return syserr.ErrNotSupported
+			}
+			ifname := string(value[:len(value)-1])
+			for idx, ifa := range s.Interfaces() {
+				if ifname == ifa.Name {
+					ifinfomsg.Index = idx
+					break
+				}
+			}
+		default:
+			ctx.Warningf("unexpected attribute: %x", ahdr.Type)
+			return syserr.ErrNotSupported
+		}
+	}
+	if ifinfomsg.Index == 0 {
+		return syserr.ErrNoDevice
+	}
+
+	flags := msg.Header().Flags
+	if flags&(linux.NLM_F_EXCL|linux.NLM_F_REPLACE) != 0 {
+		return syserr.ErrExists
+	}
+
+	if ifinfomsg.Flags != 0 || ifinfomsg.Change != 0 {
+		if ifinfomsg.Change & ^uint32(linux.IFF_UP) != 0 {
+			ctx.Warningf("Unsupported ifi_change flags: %x", ifinfomsg.Change)
+			return syserr.ErrInvalidArgument
+		}
+		if ifinfomsg.Flags & ^uint32(linux.IFF_UP) != 0 {
+			ctx.Warningf("Unsupported ifi_flags: %x", ifinfomsg.Change)
+			return syserr.ErrInvalidArgument
+		}
+		// Netstack interfaces are always up.
+	}
+	return nil
 }
 
 // AddInterfaceAddr implements inet.Stack.AddInterfaceAddr.
@@ -323,8 +381,25 @@ func (s *Stack) RouteTable() []inet.Route {
 	return append([]inet.Route(nil), routes...)
 }
 
+// NewRoute implements inet.Stack.NewRoute.
+func (*Stack) NewRoute(context.Context, *nlmsg.Message) *syserr.Error {
+	// TODO(b/343524351): implements RTM_NEWROUTE for hostinet.
+	return syserr.ErrNotSupported
+}
+
+// RemoveRoute implements inet.Stack.RemoveRoute.
+func (*Stack) RemoveRoute(context.Context, *nlmsg.Message) *syserr.Error {
+	return syserr.ErrNotSupported
+}
+
 // Pause implements inet.Stack.Pause.
 func (*Stack) Pause() {}
+
+// Restore implements inet.Stack.Restore.
+func (*Stack) Restore() {}
+
+// ReplaceConfig implements inet.Stack.ReplaceConfig.
+func (s *Stack) ReplaceConfig(_ inet.Stack) {}
 
 // Resume implements inet.Stack.Resume.
 func (*Stack) Resume() {}
@@ -354,13 +429,17 @@ func (*Stack) SetPortRange(uint16, uint16) error {
 	return linuxerr.EACCES
 }
 
-// GROTimeout implements inet.Stack.GROTimeout.
-func (s *Stack) GROTimeout(NICID int32) (time.Duration, error) {
-	return 0, nil
+// EnableSaveRestore implements inet.Stack.EnableSaveRestore.
+func (*Stack) EnableSaveRestore() error {
+	return fmt.Errorf("s/r is not supported for hostinet")
 }
 
-// SetGROTimeout implements inet.Stack.SetGROTimeout.
-func (s *Stack) SetGROTimeout(NICID int32, timeout time.Duration) error {
-	// We don't support setting the hostinet GRO timeout.
-	return linuxerr.EINVAL
+// IsSaveRestoreEnabled implements inet.Stack.IsSaveRestoreEnabled.
+func (s *Stack) IsSaveRestoreEnabled() bool {
+	return false
+}
+
+// Stats implements inet.Stack.Stats.
+func (s *Stack) Stats() tcpip.Stats {
+	return tcpip.Stats{}
 }

@@ -17,6 +17,8 @@ package fdimport
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
@@ -31,7 +33,7 @@ import (
 // sets up TTY for sentry stdin, stdout, and stderr FDs. Used FDs are either
 // closed or released. It's safe for the caller to close any remaining files
 // upon return.
-func Import(ctx context.Context, fdTable *kernel.FDTable, console bool, uid auth.KUID, gid auth.KGID, fds map[int]*fd.FD) (*host.TTYFileDescription, error) {
+func Import(ctx context.Context, fdTable *kernel.FDTable, console bool, uid auth.KUID, gid auth.KGID, fds map[int]*fd.FD, containerName string) (*host.TTYFileDescription, error) {
 	k := kernel.KernelFromContext(ctx)
 	if k == nil {
 		return nil, fmt.Errorf("cannot find kernel from context")
@@ -50,8 +52,11 @@ func Import(ctx context.Context, fdTable *kernel.FDTable, console bool, uid auth
 		}
 	}
 
+	// We iterate through the FDs in sorted order for better determinancy
+	// in startup, but it shouldn't matter.
 	var ttyFile *vfs.FileDescription
-	for appFD, hostFD := range fds {
+	for _, appFD := range slices.Sorted(maps.Keys(fds)) {
+		hostFD := fds[appFD]
 		fdOpts := host.NewFDOptions{
 			Savable: true,
 		}
@@ -62,6 +67,7 @@ func Import(ctx context.Context, fdTable *kernel.FDTable, console bool, uid auth
 		}
 		var appFile *vfs.FileDescription
 
+		fdOpts.RestoreKey = host.MakeRestoreID(containerName, appFD)
 		if console && appFD < 3 {
 			// Import the file as a host TTY file.
 			if ttyFile == nil {
@@ -72,7 +78,7 @@ func Import(ctx context.Context, fdTable *kernel.FDTable, console bool, uid auth
 					return nil, err
 				}
 				defer appFile.DecRef(ctx)
-				hostFD.Release() // FD is transfered to host FD.
+				hostFD.Release() // FD is transferred to host FD.
 
 				// Remember this in the TTY file, as we will use it for the other stdio
 				// FDs.
@@ -90,11 +96,16 @@ func Import(ctx context.Context, fdTable *kernel.FDTable, console bool, uid auth
 				return nil, err
 			}
 			defer appFile.DecRef(ctx)
-			hostFD.Release() // FD is transfered to host FD.
+			hostFD.Release() // FD is transferred to host FD.
 		}
 
-		if err := fdTable.NewFDAt(ctx, int32(appFD), appFile, fdFlags[hostFD]); err != nil {
+		df, err := fdTable.NewFDAt(ctx, int32(appFD), appFile, fdFlags[hostFD])
+		if err != nil {
 			return nil, err
+		}
+		if df != nil {
+			df.DecRef(ctx)
+			return nil, fmt.Errorf("app FD %d displaced while importing FDs", appFD)
 		}
 	}
 	if ttyFile == nil {

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1170,9 +1171,9 @@ func TestVerifier(t *testing.T) {
 	}
 }
 
-// shortWriter implements io.Writer but fails after a given number of bytes.
+// shortWriter implements io.StringWriter but fails after a given number of bytes.
 type shortWriter struct {
-	buf     bytes.Buffer
+	buf     strings.Builder
 	size    int
 	maxSize int
 }
@@ -1189,9 +1190,9 @@ func (s *shortWriter) String() string {
 	return s.buf.String()
 }
 
-// Write implements io.Writer.Write.
-func (s *shortWriter) Write(b []byte) (n int, err error) {
-	toWrite := len(b)
+// Write implements io.StringWriter.WriteString.
+func (s *shortWriter) WriteString(x string) (n int, err error) {
+	toWrite := len(x)
 	leftToWrite := s.maxSize - s.size
 	if leftToWrite < toWrite {
 		toWrite = leftToWrite
@@ -1199,9 +1200,9 @@ func (s *shortWriter) Write(b []byte) (n int, err error) {
 	if toWrite == 0 {
 		return 0, errors.New("writer out of capacity")
 	}
-	written, err := s.buf.Write(b[:toWrite])
+	written, err := s.buf.WriteString(x[:toWrite])
 	s.size += written
-	if written == len(b) {
+	if written == len(x) {
 		return written, err
 	}
 	return written, errors.New("short write")
@@ -1631,14 +1632,18 @@ func TestWriteMultipleSnapshots(t *testing.T) {
 		snapshot1: {ExporterPrefix: "export_"},
 		snapshot2: {ExporterPrefix: "export_"},
 	})
+	fooIntName := "export_" + fooInt.PB.GetPrometheusName()
 	gotData, err := (&expfmt.TextParser{}).TextToMetricFamilies(&buf)
 	if err != nil {
 		t.Fatalf("cannot parse data written from snapshots: %v", err)
 	}
-	if len(gotData) != 1 || gotData["export_"+fooInt.PB.GetPrometheusName()] == nil {
+	if len(gotData) != 1 || gotData[fooIntName] == nil {
 		t.Fatalf("unexpected data: %v", gotData)
 	}
-	got := reflectProto(gotData["export_"+fooInt.PB.GetPrometheusName()])
+	sort.Slice(gotData[fooIntName].Metric, func(i, j int) bool {
+		return gotData[fooIntName].Metric[i].GetTimestampMs() < gotData[fooIntName].Metric[j].GetTimestampMs()
+	})
+	got := reflectProto(gotData[fooIntName])
 	var wantBuf bytes.Buffer
 	io.WriteString(&wantBuf, fmt.Sprintf(`
 		# HELP export_foo_int An integer about foo
@@ -1650,10 +1655,13 @@ func TestWriteMultipleSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cannot parse reference data: %v", err)
 	}
-	if len(wantData) != 1 || wantData["export_"+fooInt.PB.GetPrometheusName()] == nil {
+	if len(wantData) != 1 || wantData[fooIntName] == nil {
 		t.Fatalf("unexpected reference data: %v", gotData)
 	}
-	want := reflectProto(wantData["export_"+fooInt.PB.GetPrometheusName()])
+	sort.Slice(wantData[fooIntName].Metric, func(i, j int) bool {
+		return wantData[fooIntName].Metric[i].GetTimestampMs() < wantData[fooIntName].Metric[j].GetTimestampMs()
+	})
+	want := reflectProto(wantData[fooIntName])
 	if diff := cmp.Diff(want, got, protocmp.Transform()); diff != "" {
 		multiLineFormatter := &prototext.MarshalOptions{Multiline: true, Indent: "  ", EmitUnknown: true}
 		wantText, err := multiLineFormatter.Marshal(want)
@@ -1696,7 +1704,7 @@ func TestGroupSameNameMetrics(t *testing.T) {
 	// Make sure the data written does parse.
 	// We don't use this result here because the Prometheus library is more permissive than this test.
 	if _, err := (&expfmt.TextParser{}).TextToMetricFamilies(&buf); err != nil {
-		t.Fatalf("cannot parse data written from snapshots: %v", err)
+		t.Fatalf("cannot parse data written from snapshots: %v\nraw data:\n%s\n(end of raw data)", err, rawData)
 	}
 
 	// Verify that we see all metrics, and that each time we see a new one, it's one we haven't seen
@@ -1741,10 +1749,10 @@ func TestGroupSameNameMetrics(t *testing.T) {
 
 func TestNumberPacker(t *testing.T) {
 	interestingIntegers := map[uint64]struct{}{
-		uint64(0):                  struct{}{},
-		uint64(0x5555555555555555): struct{}{},
-		uint64(0xaaaaaaaaaaaaaaaa): struct{}{},
-		uint64(0xffffffffffffffff): struct{}{},
+		uint64(0):                  {},
+		uint64(0x5555555555555555): {},
+		uint64(0xaaaaaaaaaaaaaaaa): {},
+		uint64(0xffffffffffffffff): {},
 	}
 	for numBits := 0; numBits < 2; numBits++ {
 		newIntegers := map[uint64]struct{}{}

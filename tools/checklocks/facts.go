@@ -670,11 +670,15 @@ func (pc *passContext) structLockGuardFacts(structType *types.Struct, ss *ast.St
 	for i, field := range ss.Fields.List {
 		var lgf lockGuardFacts
 		fieldObj = structType.Field(i) // N.B. Captured above.
-		pc.fillLockGuardFacts(fieldObj, field.Doc, findLocal, &lgf)
+		if field.Doc != nil {
+			pc.fillLockGuardFacts(fieldObj, field.Doc, findLocal, &lgf)
+		} else if field.Comment != nil {
+			pc.fillLockGuardFacts(fieldObj, field.Comment, findLocal, &lgf)
+		}
 
 		// See above, for anonymous structure fields.
 		if ss, ok := field.Type.(*ast.StructType); ok {
-			if st, ok := fieldObj.Type().(*types.Struct); ok {
+			if st, ok := types.Unalias(fieldObj.Type()).(*types.Struct); ok {
 				pc.structLockGuardFacts(st, ss)
 			}
 		}

@@ -27,17 +27,17 @@ import (
 
 	"github.com/containerd/console"
 
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/pkg/process"
 	"github.com/containerd/containerd/pkg/stdio"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
 
 	"github.com/containerd/fifo"
 	runc "github.com/containerd/go-runc"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/shim/runsc"
+	"gvisor.dev/gvisor/pkg/shim/extension"
+	"gvisor.dev/gvisor/pkg/shim/runsccmd"
 	"gvisor.dev/gvisor/pkg/shim/utils"
 )
 
@@ -63,7 +63,7 @@ type Init struct {
 	console  console.Console
 	Platform stdio.Platform
 	io       runc.IO
-	runtime  *runsc.Runsc
+	runtime  *runsccmd.Runsc
 	status   int
 	exited   time.Time
 	pid      int
@@ -79,11 +79,11 @@ type Init struct {
 }
 
 // NewRunsc returns a new runsc instance for a process.
-func NewRunsc(root, path, namespace, runtime string, config map[string]string, spec *specs.Spec) *runsc.Runsc {
+func NewRunsc(root, path, namespace, runtime string, config map[string]string, spec *specs.Spec) *runsccmd.Runsc {
 	if root == "" {
 		root = RunscRoot
 	}
-	return &runsc.Runsc{
+	return &runsccmd.Runsc{
 		Command:      runtime,
 		PdeathSignal: unix.SIGKILL,
 		Log:          filepath.Join(path, "log.json"),
@@ -95,7 +95,7 @@ func NewRunsc(root, path, namespace, runtime string, config map[string]string, s
 }
 
 // New returns a new init process.
-func New(id string, runtime *runsc.Runsc, stdio stdio.Stdio) *Init {
+func New(id string, runtime *runsccmd.Runsc, stdio stdio.Stdio) *Init {
 	p := &Init{
 		id:        id,
 		runtime:   runtime,
@@ -126,7 +126,7 @@ func (p *Init) Create(ctx context.Context, r *CreateConfig) (err error) {
 	}
 	// pidFile is the file that will contain the sandbox pid.
 	pidFile := filepath.Join(p.Bundle, "init.pid")
-	opts := &runsc.CreateOpts{
+	opts := &runsccmd.CreateOpts{
 		PidFile: pidFile,
 	}
 	if socket != nil {
@@ -155,7 +155,7 @@ func (p *Init) Create(ctx context.Context, r *CreateConfig) (err error) {
 		if err != nil {
 			return fmt.Errorf("failed to retrieve console master: %w", err)
 		}
-		console, err = p.Platform.CopyConsole(ctx, console, r.Stdin, r.Stdout, r.Stderr, &p.wg)
+		console, err = p.Platform.CopyConsole(ctx, console, r.ID, r.Stdin, r.Stdout, r.Stderr, &p.wg)
 		if err != nil {
 			return fmt.Errorf("failed to start console copy: %w", err)
 		}
@@ -226,16 +226,27 @@ func (p *Init) Start(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	return p.initState.Start(ctx)
+	return p.initState.Start(ctx, nil /* restoreConf */)
 }
 
-func (p *Init) start(ctx context.Context) error {
+func (p *Init) start(ctx context.Context, restoreConf *extension.RestoreConfig) error {
 	var cio runc.IO
 	if !p.Sandbox {
 		cio = p.io
 	}
-	if err := p.runtime.Start(ctx, p.id, cio); err != nil {
-		return p.runtimeError(err, "OCI runtime start failed")
+	if restoreConf == nil {
+		if err := p.runtime.Start(ctx, p.id, cio); err != nil {
+			return p.runtimeError(err, "OCI runtime start failed")
+		}
+	} else {
+		if err := p.runtime.Restore(ctx, p.id, cio, &runsccmd.RestoreOpts{
+			ImagePath:  restoreConf.ImagePath,
+			Detach:     true,
+			Direct:     restoreConf.Direct,
+			Background: restoreConf.Background,
+		}); err != nil {
+			return p.runtimeError(err, "OCI runtime restore failed")
+		}
 	}
 	go func() {
 		status, err := p.runtime.Wait(context.Background(), p.id)
@@ -253,7 +264,15 @@ func (p *Init) start(ctx context.Context) error {
 	return nil
 }
 
-// SetExited set the exit stauts of the init process.
+// Restore restores the container from a snapshot.
+func (p *Init) Restore(ctx context.Context, conf *extension.RestoreConfig) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.initState.Start(ctx, conf)
+}
+
+// SetExited set the exit status of the init process.
 func (p *Init) SetExited(status int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -357,7 +376,7 @@ func (p *Init) kill(ctx context.Context, signal uint32, all bool) error {
 		if state == statusStopped {
 			return fmt.Errorf("no such process: %w", errdefs.ErrNotFound)
 		}
-		killErr = p.runtime.Kill(ctx, p.id, int(signal), &runsc.KillOpts{All: all})
+		killErr = p.runtime.Kill(ctx, p.id, int(signal), &runsccmd.KillOpts{All: all})
 		if killErr == nil {
 			return nil
 		}
@@ -376,7 +395,7 @@ func (p *Init) KillAll(context context.Context) {
 }
 
 func (p *Init) killAllLocked(context context.Context) {
-	if err := p.runtime.Kill(context, p.id, int(unix.SIGKILL), &runsc.KillOpts{All: true}); err != nil {
+	if err := p.runtime.Kill(context, p.id, int(unix.SIGKILL), &runsccmd.KillOpts{All: true}); err != nil {
 		log.L.Warningf("Ignoring error killing container %q: %v", p.id, err)
 	}
 }
@@ -387,12 +406,12 @@ func (p *Init) Stdin() io.Closer {
 }
 
 // Runtime returns the OCI runtime configured for the init process.
-func (p *Init) Runtime() *runsc.Runsc {
+func (p *Init) Runtime() *runsccmd.Runsc {
 	return p.runtime
 }
 
 // Exec returns a new child process.
-func (p *Init) Exec(ctx context.Context, path string, r *ExecConfig) (process.Process, error) {
+func (p *Init) Exec(ctx context.Context, path string, r *ExecConfig) (extension.Process, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -400,7 +419,7 @@ func (p *Init) Exec(ctx context.Context, path string, r *ExecConfig) (process.Pr
 }
 
 // exec returns a new exec'd process.
-func (p *Init) exec(path string, r *ExecConfig) (process.Process, error) {
+func (p *Init) exec(path string, r *ExecConfig) (extension.Process, error) {
 	var spec specs.Process
 	if err := json.Unmarshal(r.Spec.Value, &spec); err != nil {
 		return nil, err

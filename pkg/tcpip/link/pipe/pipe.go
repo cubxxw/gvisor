@@ -17,8 +17,6 @@
 package pipe
 
 import (
-	"sync"
-
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -42,14 +40,18 @@ func New(linkAddr1, linkAddr2 tcpip.LinkAddress, mtu uint32) (*Endpoint, *Endpoi
 }
 
 // Endpoint is one end of a pipe.
+//
+// +stateify savable
 type Endpoint struct {
-	linked   *Endpoint
-	linkAddr tcpip.LinkAddress
-	mtu      uint32
+	linked *Endpoint
 
-	mu sync.RWMutex
+	mu endpointRWMutex `state:"nosave"`
 	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
+	// +checklocks:mu
+	linkAddr tcpip.LinkAddress
+	// +checklocks:mu
+	mtu uint32
 }
 
 func (e *Endpoint) deliverPackets(pkts stack.PacketBufferList) {
@@ -98,7 +100,16 @@ func (*Endpoint) Wait() {}
 
 // MTU implements stack.LinkEndpoint.
 func (e *Endpoint) MTU() uint32 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.mtu
+}
+
+// SetMTU implements stack.LinkEndpoint.
+func (e *Endpoint) SetMTU(mtu uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mtu = mtu
 }
 
 // Capabilities implements stack.LinkEndpoint.
@@ -113,7 +124,16 @@ func (*Endpoint) MaxHeaderLength() uint16 {
 
 // LinkAddress implements stack.LinkEndpoint.
 func (e *Endpoint) LinkAddress() tcpip.LinkAddress {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.linkAddr
+}
+
+// SetLinkAddress implements stack.LinkEndpoint.
+func (e *Endpoint) SetLinkAddress(addr tcpip.LinkAddress) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.linkAddr = addr
 }
 
 // ARPHardwareType implements stack.LinkEndpoint.
@@ -122,7 +142,13 @@ func (*Endpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.
-func (*Endpoint) AddHeader(stack.PacketBufferPtr) {}
+func (*Endpoint) AddHeader(*stack.PacketBuffer) {}
 
 // ParseHeader implements stack.LinkEndpoint.
-func (*Endpoint) ParseHeader(stack.PacketBufferPtr) bool { return true }
+func (*Endpoint) ParseHeader(*stack.PacketBuffer) bool { return true }
+
+// Close implements stack.LinkEndpoint.
+func (e *Endpoint) Close() {}
+
+// SetOnCloseAction implements stack.LinkEndpoint.SetOnCloseAction.
+func (*Endpoint) SetOnCloseAction(func()) {}

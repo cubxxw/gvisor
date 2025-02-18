@@ -17,7 +17,7 @@ package tcp_test
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math"
 	"os"
 	"strings"
@@ -55,7 +55,7 @@ type endpointTester struct {
 // CheckReadError issues a read to the endpoint and checking for an error.
 func (e *endpointTester) CheckReadError(t *testing.T, want tcpip.Error) {
 	t.Helper()
-	res, got := e.ep.Read(ioutil.Discard, tcpip.ReadOptions{})
+	res, got := e.ep.Read(io.Discard, tcpip.ReadOptions{})
 	if got != want {
 		t.Fatalf("ep.Read = %s, want %s", got, want)
 	}
@@ -135,7 +135,7 @@ func TestGiveUpConnect(t *testing.T) {
 	// Wait for ep to become writable.
 	<-notifyCh
 
-	// Call Connect again to retreive the handshake failure status
+	// Call Connect again to retrieve the handshake failure status
 	// and stats updates.
 	{
 		err := ep.Connect(tcpip.FullAddress{Addr: context.TestAddr, Port: context.TestPort})
@@ -863,7 +863,7 @@ func TestClosingWithEnqueuedSegments(t *testing.T) {
 		t.Errorf("unexpected endpoint state: want %s, got %s", want, got)
 	}
 
-	// Pause the endpoint`s protocolMainLoop.
+	// Pause the endpoint.
 	ep.(interface{ StopWork() }).StopWork()
 
 	// Enqueue last ACK followed by an ACK matching the endpoint
@@ -889,10 +889,10 @@ func TestClosingWithEnqueuedSegments(t *testing.T) {
 		RcvWnd:  30000,
 	})
 
-	// Unpause endpoint`s protocolMainLoop.
+	// Unpause endpoint.
 	ep.(interface{ ResumeWork() }).ResumeWork()
 
-	// Wait for the protocolMainLoop to resume and update state.
+	// Wait for the endpoint to resume and update state.
 	time.Sleep(10 * time.Millisecond)
 
 	// Expect the endpoint to be closed.
@@ -1380,7 +1380,7 @@ func TestNoSynCookieOnFailedHandshakes(t *testing.T) {
 }
 
 // TestTCPAckBeforeAcceptV4 tests that once the 3-way handshake is complete,
-// peers can send data and expect a response within a reasonable ammount of time
+// peers can send data and expect a response within a reasonable amount of time
 // without calling Accept on the listening endpoint first.
 //
 // This test uses IPv4.
@@ -1428,7 +1428,7 @@ func TestTCPAckBeforeAcceptV4(t *testing.T) {
 }
 
 // TestTCPAckBeforeAcceptV6 tests that once the 3-way handshake is complete,
-// peers can send data and expect a response within a reasonable ammount of time
+// peers can send data and expect a response within a reasonable amount of time
 // without calling Accept on the listening endpoint first.
 //
 // This test uses IPv6.
@@ -2606,7 +2606,7 @@ func TestSmallReceiveBufferReadiness(t *testing.T) {
 					total := 0
 					defer t.Logf("read %d bytes in total", total)
 					for {
-						switch res, err := client.Read(ioutil.Discard, tcpip.ReadOptions{}); err.(type) {
+						switch res, err := client.Read(io.Discard, tcpip.ReadOptions{}); err.(type) {
 						case nil:
 							t.Logf("read %d bytes", res.Count)
 							total += res.Count
@@ -2914,7 +2914,7 @@ func TestZeroWindowSend(t *testing.T) {
 	defer b.Release()
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	checker.IPv4(t, b,
-		checker.PayloadLen(header.TCPMinimumSize),
+		checker.PayloadLen(header.TCPMinimumSize+1),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
 			checker.TCPSeqNum(uint32(c.IRS)),
@@ -3264,7 +3264,7 @@ func TestZeroScaledWindowReceive(t *testing.T) {
 	// read at least 128KB. Since our segments above were 50KB each it means
 	// we need to read at 3 packets.
 	w := tcpip.LimitedWriter{
-		W: ioutil.Discard,
+		W: io.Discard,
 		N: e2e.DefaultMTU * 2,
 	}
 	for w.N != 0 {
@@ -3998,11 +3998,11 @@ func TestReceiveOnResetConnection(t *testing.T) {
 
 loop:
 	for {
-		switch _, err := c.EP.Read(ioutil.Discard, tcpip.ReadOptions{}); err.(type) {
+		switch _, err := c.EP.Read(io.Discard, tcpip.ReadOptions{}); err.(type) {
 		case *tcpip.ErrWouldBlock:
 			<-ch
 			// Expect the state to be StateError and subsequent Reads to fail with HardError.
-			_, err := c.EP.Read(ioutil.Discard, tcpip.ReadOptions{})
+			_, err := c.EP.Read(io.Discard, tcpip.ReadOptions{})
 			if d := cmp.Diff(&tcpip.ErrConnectionReset{}, err); d != "" {
 				t.Fatalf("c.EP.Read() mismatch (-want +got):\n%s", d)
 			}
@@ -4245,7 +4245,7 @@ func TestRetransmitIPv4IDUniqueness(t *testing.T) {
 			// have DF=0. This needs to be done because the IPv4 ID uniqueness
 			// applies only to non-atomic IPv4 datagrams as defined in RFC 6864
 			// Section 4, and datagrams with DF=0 are non-atomic.
-			if err := c.EP.SetSockOptInt(tcpip.MTUDiscoverOption, tcpip.PMTUDiscoveryDont); err != nil {
+			if err := c.EP.SetSockOptInt(tcpip.MTUDiscoverOption, int(tcpip.PMTUDiscoveryDont)); err != nil {
 				t.Fatalf("disabling PMTU discovery via sockopt to force DF=0 failed: %s", err)
 			}
 
@@ -5769,11 +5769,9 @@ func TestPathMTUDiscovery(t *testing.T) {
 }
 
 func TestTCPEndpointProbe(t *testing.T) {
-	c := context.New(t, 1500)
-	defer c.Cleanup()
-
 	invoked := make(chan struct{})
-	c.Stack().AddTCPProbe(func(state *stack.TCPEndpointState) {
+	var port uint16
+	probe := func(state *tcp.TCPEndpointState) {
 		// Validate that the endpoint ID is what we expect.
 		//
 		// We don't do an extensive validation of every field but a
@@ -5781,7 +5779,7 @@ func TestTCPEndpointProbe(t *testing.T) {
 		if got, want := state.ID.LocalAddress, tcpip.Address(context.StackAddr); got != want {
 			t.Fatalf("got LocalAddress: %q, want: %q", got, want)
 		}
-		if got, want := state.ID.LocalPort, c.Port; got != want {
+		if got, want := state.ID.LocalPort, port; got != want {
 			t.Fatalf("got LocalPort: %d, want: %d", got, want)
 		}
 		if got, want := state.ID.RemoteAddress, tcpip.Address(context.TestAddr); got != want {
@@ -5792,9 +5790,13 @@ func TestTCPEndpointProbe(t *testing.T) {
 		}
 
 		invoked <- struct{}{}
-	})
+	}
+
+	c := context.NewWithProbe(t, 1500, probe)
+	defer c.Cleanup()
 
 	c.CreateConnected(context.TestInitialSequenceNumber, 30000, -1 /* epRcvBuf */)
+	port = c.Port // c.Port is set during CreateConnected.
 
 	data := []byte{1, 2, 3}
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
@@ -6073,7 +6075,7 @@ func TestKeepalive(t *testing.T) {
 		)
 	}
 
-	// Sleep for a litte over the KeepAlive interval to make sure
+	// Sleep for a little over the KeepAlive interval to make sure
 	// the timer has time to fire after the last ACK and close the
 	// close the socket.
 	time.Sleep(keepAliveInterval + keepAliveInterval/2)
@@ -7222,14 +7224,14 @@ func TestReceiveBufferAutoTuningApplicationLimited(t *testing.T) {
 	// Now read all the data from the endpoint and verify that advertised
 	// window increases to the full available buffer size.
 	for {
-		_, err := c.EP.Read(ioutil.Discard, tcpip.ReadOptions{})
+		_, err := c.EP.Read(io.Discard, tcpip.ReadOptions{})
 		if cmp.Equal(&tcpip.ErrWouldBlock{}, err) {
 			break
 		}
 	}
 
 	// Verify that we receive a non-zero window update ACK. When running
-	// under thread santizer this test can end up sending more than 1
+	// under thread sanitizer this test can end up sending more than 1
 	// ack, 1 for the non-zero window
 	p := c.GetPacket()
 	defer p.Release()
@@ -7241,7 +7243,7 @@ func TestReceiveBufferAutoTuningApplicationLimited(t *testing.T) {
 				return
 			}
 			// We use 10% here as the error margin upwards as the initial window we
-			// got was afer 1 segment was already in the receive buffer queue.
+			// got was after 1 segment was already in the receive buffer queue.
 			tolerance := 1.1
 			if w := tcp.WindowSize(); w == 0 || w > uint16(float64(rcvWnd)*tolerance) {
 				t.Errorf("expected a non-zero window: got %d, want <= %d", w, uint16(float64(rcvWnd)*tolerance))
@@ -7357,7 +7359,7 @@ func TestReceiveBufferAutoTuning(t *testing.T) {
 		// to happen before we measure the new window.
 		totalCopied := 0
 		for {
-			res, err := c.EP.Read(ioutil.Discard, tcpip.ReadOptions{})
+			res, err := c.EP.Read(io.Discard, tcpip.ReadOptions{})
 			if cmp.Equal(&tcpip.ErrWouldBlock{}, err) {
 				break
 			}
@@ -8388,7 +8390,7 @@ func TestKeepaliveWithUserTimeout(t *testing.T) {
 		),
 	)
 
-	// Sleep for a litte over the KeepAlive interval to make sure
+	// Sleep for a little over the KeepAlive interval to make sure
 	// the timer has time to fire after the last ACK and close the
 	// close the socket.
 	time.Sleep(keepAliveInterval + keepAliveInterval/2)
@@ -8470,7 +8472,7 @@ func TestIncreaseWindowOnRead(t *testing.T) {
 	// We now have < 1 MSS in the buffer space. Read at least > 2 MSS
 	// worth of data as receive buffer space
 	w := tcpip.LimitedWriter{
-		W: ioutil.Discard,
+		W: io.Discard,
 		// e2e.DefaultMTU is a good enough estimate for the MSS used for this
 		// connection.
 		N: e2e.DefaultMTU * 2,
@@ -8723,7 +8725,7 @@ func TestResetDuringClose(t *testing.T) {
 
 	// Close in a separate goroutine so that we can trigger
 	// a race with the RST we send below. This should not
-	// panic due to the route being released depeding on
+	// panic due to the route being released depending on
 	// whether Close() sends an active RST or the RST sent
 	// below is processed by the worker first.
 	var wg sync.WaitGroup
@@ -9235,7 +9237,7 @@ func TestReadAfterCloseWithBufferedData(t *testing.T) {
 			t.Fatalf("timed out waiting for read to return error %q", &tcpip.ErrClosedForReceive{})
 			return
 		default:
-			if _, err := c.EP.Read(ioutil.Discard, tcpip.ReadOptions{}); cmp.Equal(err, &tcpip.ErrClosedForReceive{}) {
+			if _, err := c.EP.Read(io.Discard, tcpip.ReadOptions{}); cmp.Equal(err, &tcpip.ErrClosedForReceive{}) {
 				return
 			}
 		}
@@ -9293,6 +9295,285 @@ func TestReleaseDanglingEndpoints(t *testing.T) {
 		checker.TCPAckNum(0),
 		checker.TCPFlags(header.TCPFlagRst),
 	))
+}
+
+// TestLateSynCookieAck ensures that we properly handle the following case
+// rather than sending a RST on a valid connection:
+//
+//   - We receive a SYN while under load and issue a SYN/ACK with cookie S.
+//   - We receive a retransmitted SYN while space exists in the SYN queue, and
+//     issue a SYN/ACK with seqnum S'.
+//   - We receive an ACK based on S.
+//   - We respond with an RST because we expected an ACK based on S'.
+func TestLateSynCookieAck(t *testing.T) {
+	c := context.New(t, e2e.DefaultMTU)
+	defer c.Cleanup()
+	stats := c.Stack().Stats()
+	wq := &waiter.Queue{}
+	ep, err := c.Stack().NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, wq)
+	if err != nil {
+		t.Fatalf("NewEndpoint failed: %s", err)
+	}
+
+	initial := stats.TCP.CurrentEstablished.Value()
+
+	if err := ep.Bind(tcpip.FullAddress{Port: context.StackPort}); err != nil {
+		t.Fatalf("Bind failed: %s", err)
+	}
+
+	// With a backlog of 2, we get one slot in the SYN queue before we
+	// start using SYN cookies. See
+	// //pkg/tcpip/transport/tcp/accept.go:handleListenSegment:useSynCookies
+	// for an explanation.
+	if err := ep.Listen(2); err != nil {
+		t.Fatalf("Listen failed: %s", err)
+	}
+
+	// To reach our desired state, we're gonna do the following:
+	//
+	//   - Send SYN S1 to force subsequent SYNs to return cookies.
+	//   - Send SYN S2, which returns a cookie SYN/ACK.
+	//   - Finish S1's handshake, opening space in the SYN queue.
+	//   - Retransmit S2, which will give use a different seqnum.
+	//   - Finish S2's handshake with the cookie SYN/ACK.
+
+	// Send S1.
+	const otherTestPort = context.TestPort + 1
+	iss := seqnum.Value(context.TestInitialSequenceNumber)
+	c.SendPacket(nil, &context.Headers{
+		SrcPort: otherTestPort,
+		DstPort: context.StackPort,
+		Flags:   header.TCPFlagSyn,
+		SeqNum:  iss,
+	})
+	// Receive the SYN-ACK reply.
+	s1Reply := c.GetPacket()
+	defer s1Reply.Release()
+	s1ReplyHdr := header.TCP(header.IPv4(s1Reply.AsSlice()).Payload())
+
+	// Send S2.
+	c.SendPacket(nil, &context.Headers{
+		SrcPort: context.TestPort,
+		DstPort: context.StackPort,
+		Flags:   header.TCPFlagSyn,
+		SeqNum:  iss,
+	})
+	// Receive the SYN-ACK reply.
+	s2CookieReply := c.GetPacket()
+	defer s2CookieReply.Release()
+	s2CookieReplyHdr := header.TCP(header.IPv4(s2CookieReply.AsSlice()).Payload())
+
+	// Finish the S1 handshake.
+	ackHeaders := &context.Headers{
+		SrcPort: otherTestPort,
+		DstPort: context.StackPort,
+		Flags:   header.TCPFlagAck,
+		SeqNum:  iss + 1,
+		AckNum:  seqnum.Value(s1ReplyHdr.SequenceNumber()) + 1,
+	}
+	c.SendPacket(nil, ackHeaders)
+
+	// Wait for S1's connection to move from the SYN to the accept queue.
+	metricPollFn := func() error {
+		if got, want := stats.TCP.CurrentEstablished.Value(), initial+1; got != want {
+			return fmt.Errorf("connection never established: got stats.TCP.CurrentEstablished.Value() = %d, want = %d", got, want)
+		}
+		return nil
+	}
+	if err := testutil.Poll(metricPollFn, 1*time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	// Retransmit S2.
+	c.SendPacket(nil, &context.Headers{
+		SrcPort: context.TestPort,
+		DstPort: context.StackPort,
+		Flags:   header.TCPFlagSyn,
+		SeqNum:  iss,
+	})
+	// Receive the SYN-ACK reply.
+	s2QueueReply := c.GetPacket()
+	defer s2QueueReply.Release()
+	s2QueueReplyHdr := header.TCP(header.IPv4(s2QueueReply.AsSlice()).Payload())
+	if s2CookieReplyHdr.SequenceNumber() == s2QueueReplyHdr.SequenceNumber() {
+		t.Fatalf("the SYN cookie and regular seqnum are equal; is the backlog too large?")
+	}
+
+	// Finish S2's handshake using the cookie.
+	ackHeaders = &context.Headers{
+		SrcPort: context.TestPort,
+		DstPort: context.StackPort,
+		Flags:   header.TCPFlagAck,
+		SeqNum:  iss + 1,
+		AckNum:  seqnum.Value(s2CookieReplyHdr.SequenceNumber()) + 1,
+	}
+	c.SendPacket(nil, ackHeaders)
+
+	// Verify that we've completed two connections.
+	metricPollFn = func() error {
+		if got, want := stats.TCP.CurrentEstablished.Value(), initial+2; got != want {
+			return fmt.Errorf("got stats.TCP.CurrentEstablished.Value() = %d, want = %d", got, want)
+		}
+		return nil
+	}
+	if err := testutil.Poll(metricPollFn, 1*time.Second); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestSetExperimentOption(t *testing.T) {
+	c := context.NewWithOpts(t, context.Options{
+		EnableV4:                 true,
+		MTU:                      e2e.DefaultMTU,
+		EnableExperimentIPOption: true,
+	})
+	defer c.Cleanup()
+
+	c.CreateConnected(context.TestInitialSequenceNumber, 30000, -1 /* epRcvBuf */)
+
+	var expval uint16 = 99
+	c.EP.SocketOptions().SetExperimentOptionValue(expval)
+
+	var r bytes.Reader
+	r.Reset(make([]byte, 1))
+	_, err := c.EP.Write(&r, tcpip.WriteOptions{})
+	if err != nil {
+		t.Fatalf("Write failed: %s", err)
+	}
+
+	v := c.GetPacket()
+	defer v.Release()
+	want := header.IPv4Options{
+		byte(header.IPv4OptionExperimentType),
+		byte(header.IPv4OptionExperimentLength),
+		0,
+		byte(expval),
+	}
+	checker.IPv4(t, v, checker.IPv4Options(want))
+}
+
+func TestSetExperimentOptionIPv6(t *testing.T) {
+	c := context.NewWithOpts(t, context.Options{
+		EnableV4:                 false,
+		EnableV6:                 true,
+		MTU:                      e2e.DefaultMTU,
+		EnableExperimentIPOption: true,
+	})
+	defer c.Cleanup()
+
+	ep, err := c.Stack().NewEndpoint(tcp.ProtocolNumber, ipv6.ProtocolNumber, &c.WQ)
+	if err != nil {
+		t.Fatalf("NewEndpoint failed: %v", err)
+	}
+	c.EP = ep
+
+	// Start connection attempt.
+	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents)
+	c.WQ.EventRegister(&waitEntry)
+	defer c.WQ.EventUnregister(&waitEntry)
+
+	err = c.EP.Connect(tcpip.FullAddress{Addr: context.TestV6Addr, Port: context.TestPort})
+	if _, ok := err.(*tcpip.ErrConnectStarted); !ok {
+		t.Fatalf("Unexpected return value from Connect: %v", err)
+	}
+
+	// Receive SYN packet.
+	b := c.GetV6Packet()
+	defer b.Release()
+	checker.IPv6(t, b,
+		checker.TCP(
+			checker.DstPort(context.TestPort),
+			checker.TCPFlags(header.TCPFlagSyn),
+		),
+	)
+	if got, want := tcp.EndpointState(c.EP.State()), tcp.StateSynSent; got != want {
+		t.Fatalf("Unexpected endpoint state: want %v, got %v", want, got)
+	}
+
+	iss := seqnum.Value(context.TestInitialSequenceNumber)
+	rcvWnd := seqnum.Size(30000)
+	tcpHdr := header.TCP(header.IPv6(b.AsSlice()).Payload())
+	synOpts := header.ParseSynOptions(tcpHdr.Options(), false /* isAck */)
+	c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
+
+	c.SendV6Packet(nil, &context.Headers{
+		SrcPort: tcpHdr.DestinationPort(),
+		DstPort: tcpHdr.SourcePort(),
+		Flags:   header.TCPFlagSyn | header.TCPFlagAck,
+		SeqNum:  iss,
+		AckNum:  c.IRS.Add(1),
+		RcvWnd:  rcvWnd,
+		TCPOpts: nil,
+	})
+
+	// Receive ACK packet.
+	b = c.GetV6Packet()
+	defer b.Release()
+	checker.IPv6(t, b,
+		checker.TCP(
+			checker.DstPort(context.TestPort),
+			checker.TCPFlags(header.TCPFlagAck),
+			checker.TCPSeqNum(uint32(c.IRS)+1),
+			checker.TCPAckNum(uint32(iss)+1),
+		),
+	)
+
+	// Wait for connection to be established.
+	select {
+	case <-notifyCh:
+		if err := c.EP.LastError(); err != nil {
+			t.Fatalf("Unexpected error when connecting: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("Timed out waiting for connection")
+	}
+	if got, want := tcp.EndpointState(c.EP.State()), tcp.StateEstablished; got != want {
+		t.Fatalf("Unexpected endpoint state: want %v, got %v", want, got)
+	}
+
+	c.RcvdWindowScale = uint8(synOpts.WS)
+	c.Port = tcpHdr.SourcePort()
+
+	var expval uint16 = 99
+	c.EP.SocketOptions().SetExperimentOptionValue(expval)
+
+	var r bytes.Reader
+	r.Reset(make([]byte, 1))
+	_, err = c.EP.Write(&r, tcpip.WriteOptions{})
+	if err != nil {
+		t.Fatalf("Write failed: %s", err)
+	}
+
+	v := c.GetV6Packet()
+	defer v.Release()
+
+	checker.IPv6WithExtHdr(t, v, checker.IPv6ExtHdr(checker.IPv6ExperimentHeader(expval)))
+}
+
+func TestSetExperimentOptionWithOptionDisabled(t *testing.T) {
+	c := context.NewWithOpts(t, context.Options{
+		EnableV4:                 true,
+		MTU:                      e2e.DefaultMTU,
+		EnableExperimentIPOption: false,
+	})
+	defer c.Cleanup()
+
+	c.CreateConnected(context.TestInitialSequenceNumber, 30000, -1 /* epRcvBuf */)
+
+	var expval uint16 = 99
+	c.EP.SocketOptions().SetExperimentOptionValue(expval)
+
+	var r bytes.Reader
+	r.Reset(make([]byte, 1))
+	_, err := c.EP.Write(&r, tcpip.WriteOptions{})
+	if err != nil {
+		t.Fatalf("Write failed: %s", err)
+	}
+
+	v := c.GetPacket()
+	defer v.Release()
+	want := header.IPv4Options{}
+	checker.IPv4(t, v, checker.IPv4Options(want))
 }
 
 func TestMain(m *testing.M) {

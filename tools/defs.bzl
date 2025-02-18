@@ -5,15 +5,15 @@ automagically creating cc_ and go_ proto targets) and act as a single point of
 change for Google-internal and bazel-compatible rules.
 """
 
-load("//tools/go_stateify:defs.bzl", "go_stateify")
-load("//tools/go_marshal:defs.bzl", "go_marshal", "marshal_deps", "marshal_test_deps")
-load("//tools/nogo:defs.bzl", "nogo_test")
+load("//tools/bazeldefs:cc.bzl", _cc_binary = "cc_binary", _cc_flags_supplier = "cc_flags_supplier", _cc_grpc_library = "cc_grpc_library", _cc_library = "cc_library", _cc_proto_library = "cc_proto_library", _cc_test = "cc_test", _cc_toolchain = "cc_toolchain", _gbenchmark = "gbenchmark", _gbenchmark_internal = "gbenchmark_internal", _grpcpp = "grpcpp", _gtest = "gtest", _select_gtest = "select_gtest", _vdso_linker_option = "vdso_linker_option")
 load("//tools/bazeldefs:defs.bzl", _BuildSettingInfo = "BuildSettingInfo", _bool_flag = "bool_flag", _bpf_program = "bpf_program", _build_test = "build_test", _bzl_library = "bzl_library", _coreutil = "coreutil", _default_net_util = "default_net_util", _more_shards = "more_shards", _most_shards = "most_shards", _proto_library = "proto_library", _select_system = "select_system", _short_path = "short_path", _version = "version")
-load("//tools/bazeldefs:cc.bzl", _cc_binary = "cc_binary", _cc_flags_supplier = "cc_flags_supplier", _cc_grpc_library = "cc_grpc_library", _cc_library = "cc_library", _cc_proto_library = "cc_proto_library", _cc_test = "cc_test", _cc_toolchain = "cc_toolchain", _gbenchmark = "gbenchmark", _gbenchmark_internal = "gbenchmark_internal", _grpcpp = "grpcpp", _gtest = "gtest", _vdso_linker_option = "vdso_linker_option")
 load("//tools/bazeldefs:go.bzl", _gazelle = "gazelle", _go_binary = "go_binary", _go_grpc_and_proto_libraries = "go_grpc_and_proto_libraries", _go_library = "go_library", _go_path = "go_path", _go_proto_library = "go_proto_library", _go_test = "go_test", _gotsan_flag_values = "gotsan_flag_values", _gotsan_values = "gotsan_values", _select_goarch = "select_goarch", _select_goos = "select_goos")
 load("//tools/bazeldefs:pkg.bzl", _pkg_deb = "pkg_deb", _pkg_tar = "pkg_tar")
-load("//tools/bazeldefs:platforms.bzl", _default_platform = "default_platform", _platform_capabilities = "platform_capabilities", _platforms = "platforms")
-load("//tools/bazeldefs:tags.bzl", "go_suffixes")
+load("//tools/bazeldefs:platforms.bzl", _default_platform = "default_platform", _platform_capabilities = "platform_capabilities", _platforms = "platforms", _save_restore_platforms = "save_restore_platforms")
+load("//tools/bazeldefs:tags.bzl", _go_suffixes = "go_suffixes", _local_test_tags = "local_test_tags")
+load("//tools/go_marshal:defs.bzl", "go_marshal", "marshal_deps", "marshal_test_deps")
+load("//tools/go_stateify:defs.bzl", "go_stateify")
+load("//tools/nogo:defs.bzl", "nogo_test")
 
 # Core rules.
 build_test = _build_test
@@ -40,6 +40,7 @@ gbenchmark_internal = _gbenchmark_internal
 gtest = _gtest
 grpcpp = _grpcpp
 vdso_linker_option = _vdso_linker_option
+select_gtest = _select_gtest
 
 # Go rules.
 gazelle = _gazelle
@@ -61,6 +62,10 @@ pkg_tar = _pkg_tar
 default_platform = _default_platform
 platforms = _platforms
 platform_capabilities = _platform_capabilities
+save_restore_platforms = _save_restore_platforms
+
+# Tags.
+local_test_tags = _local_test_tags
 
 def go_binary(name, nogo = True, pure = False, static = False, x_defs = None, **kwargs):
     """Wraps the standard go_binary.
@@ -119,7 +124,7 @@ def calculate_sets(srcs):
         if not file.endswith(".go"):
             continue
         target = ""
-        for suffix in go_suffixes:
+        for suffix in _go_suffixes:
             if file.endswith(suffix + ".go"):
                 target = suffix
         if not target in result:
@@ -138,7 +143,7 @@ def go_imports(name, src, out):
         cmd = ("$(location @org_golang_x_tools//cmd/goimports:goimports) $(SRCS) > $@"),
     )
 
-def go_library(name, srcs, deps = [], imports = [], stateify = True, marshal = False, marshal_debug = False, nogo = True, **kwargs):
+def go_library(name, srcs, deps = [], imports = [], stateify = True, force_add_state_pkg = False, marshal = False, marshal_debug = False, nogo = True, **kwargs):
     """Wraps the standard go_library and does stateification and marshalling.
 
     The recommended way is to use this rule with mostly identical configuration as the native
@@ -160,6 +165,10 @@ def go_library(name, srcs, deps = [], imports = [], stateify = True, marshal = F
       deps: the library dependencies.
       imports: imports required for stateify.
       stateify: whether statify is enabled (default: true).
+      force_add_state_pkg: whether to skip checking whether the state package
+        is included in `deps`, and to just instead include it outright.
+        This allows `go_library` to be used in conjunction with `select`
+        statements in `deps`.
       marshal: whether marshal is enabled (default: false).
       marshal_debug: whether the gomarshal tools emits debugging output (default: false).
       nogo: enable nogo analysis.
@@ -192,7 +201,7 @@ def go_library(name, srcs, deps = [], imports = [], stateify = True, marshal = F
             for suffix in state_sets.keys()
         ]
 
-        if "//pkg/state" not in all_deps:
+        if force_add_state_pkg or "//pkg/state" not in all_deps:
             all_deps = all_deps + ["//pkg/state"]
 
     if marshal:

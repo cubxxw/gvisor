@@ -17,6 +17,13 @@ go_template_instance(
     },
 )
 
+config_setting(
+    name = "debug_build",
+    values = {
+        "compilation_mode": "dbg",
+    },
+)
+
 go_library(
     name = "kvm",
     srcs = [
@@ -34,6 +41,7 @@ go_library(
         "bluepill_arm64_unsafe.go",
         "bluepill_fault.go",
         "bluepill_unsafe.go",
+        "config.go",
         "context.go",
         "filters.go",
         "filters_amd64.go",
@@ -46,15 +54,19 @@ go_library(
         "kvm_const.go",
         "kvm_const_amd64.go",
         "kvm_const_arm64.go",
+        "kvm_profiling.go",
+        "kvm_profiling_fake.go",
         "machine.go",
         "machine_amd64.go",
         "machine_amd64_unsafe.go",
         "machine_arm64.go",
         "machine_arm64_unsafe.go",
+        "machine_cgo.go",
         "machine_unsafe.go",
         "physical_map.go",
         "physical_map_amd64.go",
         "physical_map_arm64.go",
+        "seccomp_mmap_unsafe.go",
         "virtual_map.go",
     ],
     visibility = ["//pkg/sentry:internal"],
@@ -63,7 +75,10 @@ go_library(
         "//pkg/atomicbitops",
         "//pkg/context",
         "//pkg/cpuid",
+        "//pkg/fd",
         "//pkg/hostarch",
+        "//pkg/hostos",
+        "//pkg/hostsyscall",
         "//pkg/hosttid",
         "//pkg/log",
         "//pkg/metric",
@@ -76,6 +91,7 @@ go_library(
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/interrupt",
         "//pkg/sentry/time",
+        "//pkg/sigframe",
         "//pkg/sighandling",
         "//pkg/sync",
         "@org_golang_x_sys//unix:go_default_library",
@@ -95,12 +111,43 @@ go_test(
     library = ":kvm",
     # FIXME(gvisor.dev/issue/3374): Not working with all build systems.
     nogo = False,
-    # cgo has to be disabled. We have seen libc that blocks all signals and
-    # calls mmap from pthread_create, but we use SIGSYS to trap mmap system
-    # calls.
     pure = True,
     tags = [
         "manual",
+        "nogotsan",
+        "requires-kvm",
+    ],
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/cpuid",
+        "//pkg/hostarch",
+        "//pkg/memutil",
+        "//pkg/ring0",
+        "//pkg/ring0/pagetables",
+        "//pkg/safecopy",
+        "//pkg/sentry/arch",
+        "//pkg/sentry/arch/fpu",
+        "//pkg/sentry/platform",
+        "//pkg/sentry/platform/kvm/testutil",
+        "//pkg/sentry/time",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
+    name = "kvm_cgo_test",
+    srcs = [
+        "kvm_amd64_test.go",
+        "kvm_amd64_test.s",
+        "kvm_arm64_test.go",
+        "kvm_safecopy_test.go",
+        "kvm_test.go",
+        "virtual_map_test.go",
+    ],
+    library = ":kvm",
+    # FIXME(gvisor.dev/issue/3374): Not working with all build systems.
+    nogo = False,
+    tags = [
         "nogotsan",
         "requires-kvm",
     ],

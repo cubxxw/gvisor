@@ -33,7 +33,7 @@ import (
 )
 
 // socketPath creates a path inside bundleDir and ensures that the returned
-// path is under 108 charactors (the unix socket path length limit),
+// path is under 108 characters (the unix socket path length limit),
 // relativizing the path if necessary.
 func socketPath(bundleDir string) (string, error) {
 	num := rand.Intn(10000)
@@ -593,6 +593,16 @@ func TestMultiContainerTerminal(t *testing.T) {
 				}
 				if err := testutil.WaitUntilRead(ptyBuf, "foo-/-123", 5*time.Second); err != nil {
 					t.Fatalf("echo didn't execute: %v", err)
+				}
+
+				// Make sure we can open /dev/tty. We do this
+				// by asking `head` to to read 0 bytes, which
+				// causes it to simply open & close the file.
+				if _, err := tc.master.Write([]byte("head -n 0 /dev/tty; echo $?\n")); err != nil {
+					t.Fatalf("master.Write(): %v", err)
+				}
+				if err := testutil.WaitUntilRead(ptyBuf, "0", 5*time.Second); err != nil {
+					t.Fatalf("head didn't execute: %v", err)
 				}
 			}
 		})

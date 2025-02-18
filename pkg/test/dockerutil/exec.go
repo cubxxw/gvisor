@@ -40,9 +40,27 @@ type ExecOpts struct {
 
 	// WorkDir is the working directory of the process.
 	WorkDir string
+
+	// NoWrap, if true, indicates that no command-line wrapping may be performed
+	// on the command line being exec'd. Otherwise, settings are inherited from
+	// the container.
+	NoWrap bool
+}
+
+// ExecError is returned when a process terminated with a non-zero exit status.
+// It implements `error`.
+type ExecError struct {
+	ExitStatus int
+}
+
+// Error implements `error.Error`.
+func (ee *ExecError) Error() string {
+	return fmt.Sprintf("process terminated with status: %d", ee.ExitStatus)
 }
 
 // Exec creates a process inside the container.
+// If the process exits with a non-zero error code, the error will be of
+// type `ExecError`.
 func (c *Container) Exec(ctx context.Context, opts ExecOpts, args ...string) (string, error) {
 	p, err := c.doExec(ctx, opts, args)
 	if err != nil {
@@ -64,7 +82,7 @@ func (c *Container) Exec(ctx context.Context, opts ExecOpts, args ...string) (st
 		return "", err
 	} else if exitStatus != 0 {
 		<-done
-		return out, fmt.Errorf("process terminated with status: %d", exitStatus)
+		return out, &ExecError{exitStatus}
 	}
 
 	<-done
@@ -98,6 +116,9 @@ func (c *Container) doExec(ctx context.Context, r ExecOpts, args []string) (Proc
 
 func (c *Container) execConfig(r ExecOpts, cmd []string) types.ExecConfig {
 	env := append(r.Env, fmt.Sprintf("RUNSC_TEST_NAME=%s", c.Name))
+	if !r.NoWrap && c.sniffGPUOpts != nil {
+		cmd = c.sniffGPUOpts.prepend(cmd)
+	}
 	return types.ExecConfig{
 		AttachStdin:  r.UseTTY,
 		AttachStderr: true,
@@ -109,7 +130,6 @@ func (c *Container) execConfig(r ExecOpts, cmd []string) types.ExecConfig {
 		Tty:          r.UseTTY,
 		User:         r.User,
 	}
-
 }
 
 // Process represents a containerized process.

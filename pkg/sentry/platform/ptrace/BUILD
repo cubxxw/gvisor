@@ -27,8 +27,10 @@ go_library(
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/bpf",
         "//pkg/context",
         "//pkg/cpuid",
+        "//pkg/fd",
         "//pkg/hostarch",
         "//pkg/hosttid",
         "//pkg/log",

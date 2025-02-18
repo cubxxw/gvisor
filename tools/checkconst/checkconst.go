@@ -25,7 +25,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
-	"io/ioutil"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -84,7 +84,7 @@ func (c *Constants) walkObject(pass *analysis.Pass, parents []string, obj types.
 		if typ == nil || typ.Underlying() == nil {
 			break
 		}
-		if _, ok := typ.(*types.TypeParam); ok {
+		if _, ok := types.Unalias(typ).(*types.TypeParam); ok {
 			break
 		}
 		// Add basic information.
@@ -141,6 +141,7 @@ func extractFacts(pass *analysis.Pass) {
 
 	// Accumulate all facts.
 	c.walkScope(pass, make([]string, 0, 128), pass.Pkg.Scope())
+
 	pass.ExportPackageFact(&c)
 }
 
@@ -206,7 +207,7 @@ func findPackage(pkg *types.Package, pkgName string) (*types.Package, error) {
 func matchRegexp(pass *analysis.Pass, pos func() token.Pos, re *regexp.Regexp, text string) ([]string, bool) {
 	m := re.FindStringSubmatch(text)
 	if m == nil && checkconstRegexp.FindString(text) != "" {
-		pass.Reportf(pos(), "potentially misformed checkconst directives")
+		pass.Reportf(pos(), "potentially malformed checkconst directives")
 	}
 	return m, m != nil
 }
@@ -260,7 +261,7 @@ func checkAssembly(pass *analysis.Pass) error {
 		if !strings.HasSuffix(filename, ".s") {
 			continue
 		}
-		content, err := ioutil.ReadFile(filename)
+		content, err := os.ReadFile(filename)
 		if err != nil {
 			return fmt.Errorf("unable to read assembly file: %w", err)
 		}

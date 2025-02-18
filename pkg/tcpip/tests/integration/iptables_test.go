@@ -51,7 +51,7 @@ func (*inputIfNameMatcher) Name() string {
 	return "inputIfNameMatcher"
 }
 
-func (im *inputIfNameMatcher) Match(hook stack.Hook, _ stack.PacketBufferPtr, inNicName, _ string) (bool, bool) {
+func (im *inputIfNameMatcher) Match(hook stack.Hook, _ *stack.PacketBuffer, inNicName, _ string) (bool, bool) {
 	return (hook == stack.Input && im.name != "" && im.name == inNicName), false
 }
 
@@ -112,7 +112,7 @@ func genStackV4(t *testing.T) (*stack.Stack, *channel.Endpoint) {
 	return s, e
 }
 
-func genPacketV6() stack.PacketBufferPtr {
+func genPacketV6() *stack.PacketBuffer {
 	pktSize := header.IPv6MinimumSize + payloadSize
 	hdr := prependable.New(pktSize)
 	ip := header.IPv6(hdr.Prepend(pktSize))
@@ -127,7 +127,7 @@ func genPacketV6() stack.PacketBufferPtr {
 	return stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buf})
 }
 
-func genPacketV4() stack.PacketBufferPtr {
+func genPacketV4() *stack.PacketBuffer {
 	pktSize := header.IPv4MinimumSize + payloadSize
 	hdr := prependable.New(pktSize)
 	ip := header.IPv4(hdr.Prepend(pktSize))
@@ -153,7 +153,7 @@ func TestIPTablesStatsForInput(t *testing.T) {
 		name               string
 		setupStack         func(*testing.T) (*stack.Stack, *channel.Endpoint)
 		setupFilter        func(*testing.T, *stack.Stack)
-		genPacket          func() stack.PacketBufferPtr
+		genPacket          func() *stack.PacketBuffer
 		proto              tcpip.NetworkProtocolNumber
 		expectReceived     int
 		expectInputDropped int
@@ -189,7 +189,7 @@ func TestIPTablesStatsForInput(t *testing.T) {
 				filter.Rules[ruleIdx].Matchers = []stack.Matcher{&inputIfNameMatcher{nicName}}
 				// Make sure the packet is not dropped by the next rule.
 				filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
-				ipt.ReplaceTable(stack.FilterID, filter, true /* ipv6 */)
+				ipt.ForceReplaceTable(stack.FilterID, filter, true /* ipv6 */)
 			},
 			genPacket:          genPacketV6,
 			proto:              header.IPv6ProtocolNumber,
@@ -208,7 +208,7 @@ func TestIPTablesStatsForInput(t *testing.T) {
 				filter.Rules[ruleIdx].Target = &stack.DropTarget{}
 				filter.Rules[ruleIdx].Matchers = []stack.Matcher{&inputIfNameMatcher{nicName}}
 				filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
-				ipt.ReplaceTable(stack.FilterID, filter, false /* ipv6 */)
+				ipt.ForceReplaceTable(stack.FilterID, filter, false /* ipv6 */)
 			},
 			genPacket:          genPacketV4,
 			proto:              header.IPv4ProtocolNumber,
@@ -226,7 +226,7 @@ func TestIPTablesStatsForInput(t *testing.T) {
 				filter.Rules[ruleIdx].Filter = stack.IPHeaderFilter{InputInterface: anotherNicName}
 				filter.Rules[ruleIdx].Target = &stack.DropTarget{}
 				filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
-				ipt.ReplaceTable(stack.FilterID, filter, true /* ipv6 */)
+				ipt.ForceReplaceTable(stack.FilterID, filter, true /* ipv6 */)
 			},
 			genPacket:          genPacketV6,
 			proto:              header.IPv6ProtocolNumber,
@@ -244,7 +244,7 @@ func TestIPTablesStatsForInput(t *testing.T) {
 				filter.Rules[ruleIdx].Filter = stack.IPHeaderFilter{InputInterface: anotherNicName}
 				filter.Rules[ruleIdx].Target = &stack.DropTarget{}
 				filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
-				ipt.ReplaceTable(stack.FilterID, filter, false /* ipv6 */)
+				ipt.ForceReplaceTable(stack.FilterID, filter, false /* ipv6 */)
 			},
 			genPacket:          genPacketV4,
 			proto:              header.IPv4ProtocolNumber,
@@ -265,7 +265,7 @@ func TestIPTablesStatsForInput(t *testing.T) {
 				}
 				filter.Rules[ruleIdx].Target = &stack.DropTarget{}
 				filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
-				ipt.ReplaceTable(stack.FilterID, filter, true /* ipv6 */)
+				ipt.ForceReplaceTable(stack.FilterID, filter, true /* ipv6 */)
 			},
 			genPacket:          genPacketV6,
 			proto:              header.IPv6ProtocolNumber,
@@ -286,7 +286,7 @@ func TestIPTablesStatsForInput(t *testing.T) {
 				}
 				filter.Rules[ruleIdx].Target = &stack.DropTarget{}
 				filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
-				ipt.ReplaceTable(stack.FilterID, filter, false /* ipv6 */)
+				ipt.ForceReplaceTable(stack.FilterID, filter, false /* ipv6 */)
 			},
 			genPacket:          genPacketV4,
 			proto:              header.IPv4ProtocolNumber,
@@ -304,7 +304,7 @@ func TestIPTablesStatsForInput(t *testing.T) {
 				filter.Rules[ruleIdx].Target = &stack.DropTarget{}
 				filter.Rules[ruleIdx].Matchers = []stack.Matcher{&inputIfNameMatcher{anotherNicName}}
 				filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
-				ipt.ReplaceTable(stack.FilterID, filter, true /* ipv6 */)
+				ipt.ForceReplaceTable(stack.FilterID, filter, true /* ipv6 */)
 			},
 			genPacket:          genPacketV6,
 			proto:              header.IPv6ProtocolNumber,
@@ -322,7 +322,7 @@ func TestIPTablesStatsForInput(t *testing.T) {
 				filter.Rules[ruleIdx].Target = &stack.DropTarget{}
 				filter.Rules[ruleIdx].Matchers = []stack.Matcher{&inputIfNameMatcher{anotherNicName}}
 				filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
-				ipt.ReplaceTable(stack.FilterID, filter, false /* ipv6 */)
+				ipt.ForceReplaceTable(stack.FilterID, filter, false /* ipv6 */)
 			},
 			genPacket:          genPacketV4,
 			proto:              header.IPv4ProtocolNumber,
@@ -366,7 +366,7 @@ func (*udpSourcePortMatcher) Name() string {
 	return "udpSourcePortMatcher"
 }
 
-func (m *udpSourcePortMatcher) Match(_ stack.Hook, pkt stack.PacketBufferPtr, _, _ string) (matches, hotdrop bool) {
+func (m *udpSourcePortMatcher) Match(_ stack.Hook, pkt *stack.PacketBuffer, _, _ string) (matches, hotdrop bool) {
 	udp := header.UDP(pkt.TransportHeader().Slice())
 	if len(udp) < header.UDPMinimumSize {
 		// Drop immediately as the packet is invalid.
@@ -466,7 +466,7 @@ func TestIPTableWritePackets(t *testing.T) {
 					},
 				}
 
-				s.IPTables().ReplaceTable(stack.FilterID, table, false /* ipv4 */)
+				s.IPTables().ForceReplaceTable(stack.FilterID, table, false /* ipv4 */)
 			},
 			genPacket: func(r *stack.Route) stack.PacketBufferList {
 				var pkts stack.PacketBufferList
@@ -555,7 +555,7 @@ func TestIPTableWritePackets(t *testing.T) {
 					},
 				}
 
-				s.IPTables().ReplaceTable(stack.FilterID, table, true /* ipv6 */)
+				s.IPTables().ForceReplaceTable(stack.FilterID, table, true /* ipv6 */)
 			},
 			genPacket: func(r *stack.Route) stack.PacketBufferList {
 				var pkts stack.PacketBufferList
@@ -708,7 +708,7 @@ func setupDropFilter(hook stack.Hook, f stack.IPHeaderFilter) func(*testing.T, *
 		filter.Rules[ruleIdx].Target = &stack.DropTarget{NetworkProtocol: netProto}
 		// Make sure the packet is not dropped by the next rule.
 		filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{NetworkProtocol: netProto}
-		ipt.ReplaceTable(stack.FilterID, filter, ipv6)
+		ipt.ForceReplaceTable(stack.FilterID, filter, ipv6)
 	}
 }
 
@@ -944,7 +944,7 @@ func TestForwardingHook(t *testing.T) {
 					}
 
 					p := e2.Read()
-					if (!p.IsNil()) != expectTransmitPacket {
+					if (p != nil) != expectTransmitPacket {
 						t.Fatalf("got e2.Read() = %#v, want = (_ == nil) = %t", p, expectTransmitPacket)
 					}
 					if expectTransmitPacket {
@@ -1186,16 +1186,16 @@ func TestFilteringEchoPacketsWithLocalForwarding(t *testing.T) {
 
 					expectPacket := subTest.expectResult == noneDropped
 					p := e1.Read()
-					if (!p.IsNil()) != expectPacket {
+					if (p != nil) != expectPacket {
 						t.Errorf("got e1.Read() = %#v, want = (_ == nil) = %t", p, expectPacket)
 					}
-					if !p.IsNil() {
+					if p != nil {
 						payload := stack.PayloadSince(p.NetworkHeader())
 						defer payload.Release()
 						test.checker(t, payload)
 						p.DecRef()
 					}
-					if p := e2.Read(); !p.IsNil() {
+					if p := e2.Read(); p != nil {
 						t.Errorf("got e1.Read() = %#v, want = nil)", p)
 						p.DecRef()
 					}
@@ -1216,7 +1216,7 @@ func setupNAT(t *testing.T, s *stack.Stack, netProto tcpip.NetworkProtocolNumber
 	table.Rules[ruleIdx].Target = target
 	// Make sure the packet is not dropped by the next rule.
 	table.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
-	ipt.ReplaceTable(stack.NATID, table, ipv6)
+	ipt.ForceReplaceTable(stack.NATID, table, ipv6)
 }
 
 func setupDNAT(t *testing.T, s *stack.Stack, netProto tcpip.NetworkProtocolNumber, transProto tcpip.TransportProtocolNumber, target stack.Target) {
@@ -1309,7 +1309,7 @@ func setupTwiceNAT(t *testing.T, s *stack.Stack, netProto tcpip.NetworkProtocolN
 		},
 	}
 
-	ipt.ReplaceTable(stack.NATID, table, ipv6)
+	ipt.ForceReplaceTable(stack.NATID, table, ipv6)
 }
 
 type natType struct {
@@ -1324,7 +1324,7 @@ var (
 			setupNAT: func(t *testing.T, s *stack.Stack, netProto tcpip.NetworkProtocolNumber, transProto tcpip.TransportProtocolNumber, snatAddr, _ tcpip.Address, _ uint16) {
 				t.Helper()
 
-				setupSNAT(t, s, netProto, transProto, &stack.SNATTarget{NetworkProtocol: netProto, Addr: snatAddr})
+				setupSNAT(t, s, netProto, transProto, &stack.SNATTarget{NetworkProtocol: netProto, Addr: snatAddr, ChangeAddress: true, ChangePort: true})
 			},
 		},
 		{
@@ -1342,7 +1342,7 @@ var (
 		setupNAT: func(t *testing.T, s *stack.Stack, netProto tcpip.NetworkProtocolNumber, transProto tcpip.TransportProtocolNumber, _, dnatAddr tcpip.Address, dnatPort uint16) {
 			t.Helper()
 
-			setupDNAT(t, s, netProto, transProto, &stack.DNATTarget{NetworkProtocol: netProto, Addr: dnatAddr, Port: dnatPort})
+			setupDNAT(t, s, netProto, transProto, &stack.DNATTarget{NetworkProtocol: netProto, Addr: dnatAddr, Port: dnatPort, ChangeAddress: true, ChangePort: true})
 		},
 	}
 
@@ -1364,7 +1364,7 @@ var (
 			setupNAT: func(t *testing.T, s *stack.Stack, netProto tcpip.NetworkProtocolNumber, transProto tcpip.TransportProtocolNumber, snatAddr, dnatAddr tcpip.Address, dnatPort uint16) {
 				t.Helper()
 
-				setupTwiceNAT(t, s, netProto, transProto, dnatAddr, &stack.DNATTarget{NetworkProtocol: netProto, Addr: dnatAddr, Port: dnatPort}, &stack.MasqueradeTarget{NetworkProtocol: netProto})
+				setupTwiceNAT(t, s, netProto, transProto, dnatAddr, &stack.DNATTarget{NetworkProtocol: netProto, Addr: dnatAddr, Port: dnatPort, ChangeAddress: true, ChangePort: true}, &stack.MasqueradeTarget{NetworkProtocol: netProto})
 			},
 		},
 		{
@@ -1372,7 +1372,7 @@ var (
 			setupNAT: func(t *testing.T, s *stack.Stack, netProto tcpip.NetworkProtocolNumber, transProto tcpip.TransportProtocolNumber, snatAddr, dnatAddr tcpip.Address, dnatPort uint16) {
 				t.Helper()
 
-				setupTwiceNAT(t, s, netProto, transProto, dnatAddr, &stack.DNATTarget{NetworkProtocol: netProto, Addr: dnatAddr, Port: dnatPort}, &stack.SNATTarget{NetworkProtocol: netProto, Addr: snatAddr})
+				setupTwiceNAT(t, s, netProto, transProto, dnatAddr, &stack.DNATTarget{NetworkProtocol: netProto, Addr: dnatAddr, Port: dnatPort, ChangeAddress: true, ChangePort: true}, &stack.SNATTarget{NetworkProtocol: netProto, Addr: snatAddr, ChangeAddress: true, ChangePort: true})
 			},
 		},
 	}
@@ -1544,7 +1544,7 @@ func TestNATEcho(t *testing.T) {
 									Payload: buffer.MakeWithData(test.echoPkt(natTypeTest.requestSrc, natTypeTest.requestDst, false /* reply */)),
 								}))
 								pkt := ep1.Read()
-								if pkt.IsNil() {
+								if pkt == nil {
 									t.Fatal("expected to read a packet on ep1")
 								}
 								payload := stack.PayloadSince(pkt.NetworkHeader())
@@ -1563,7 +1563,7 @@ func TestNATEcho(t *testing.T) {
 									Payload: buffer.MakeWithData(test.echoPkt(natTypeTest.expectedRequestDst, natTypeTest.expectedRequestSrc, true /* reply */)),
 								}))
 								pkt := ep2.Read()
-								if pkt.IsNil() {
+								if pkt == nil {
 									t.Fatal("expected to read a packet on ep2")
 								}
 								payload := stack.PayloadSince(pkt.NetworkHeader())
@@ -2484,7 +2484,7 @@ func TestNATICMPError(t *testing.T) {
 													CheckProtocol:  true,
 													InputInterface: utils.RouterNIC2Name,
 												},
-												Target: &stack.DNATTarget{NetworkProtocol: test.netProto, Addr: test.host1Addr, Port: dstPort},
+												Target: &stack.DNATTarget{NetworkProtocol: test.netProto, Addr: test.host1Addr, Port: dstPort, ChangeAddress: true, ChangePort: true},
 											},
 											{
 												Target: &stack.AcceptTarget{},
@@ -2527,7 +2527,7 @@ func TestNATICMPError(t *testing.T) {
 										},
 									}
 
-									ipt.ReplaceTable(stack.NATID, table, ipv6)
+									ipt.ForceReplaceTable(stack.NATID, table, ipv6)
 
 									buf := transportType.buf
 
@@ -2537,7 +2537,7 @@ func TestNATICMPError(t *testing.T) {
 
 									{
 										pkt := ep1.Read()
-										if pkt.IsNil() {
+										if pkt == nil {
 											t.Fatal("expected to read a packet on ep1")
 										}
 										pktView := stack.PayloadSince(pkt.NetworkHeader())
@@ -2558,7 +2558,7 @@ func TestNATICMPError(t *testing.T) {
 
 									pkt := ep2.Read()
 									expectResponse := icmpType.expectResponse && trimTest.expectNATedICMP
-									if (!pkt.IsNil()) != expectResponse {
+									if (pkt != nil) != expectResponse {
 										t.Fatalf("got ep2.Read() = %#v, want = (_ == nil) = %t", pkt, expectResponse)
 									}
 									if !expectResponse {
@@ -2826,7 +2826,7 @@ func TestSNATHandlePortOrIdentConflicts(t *testing.T) {
 		{
 			name: "SNAT",
 			target: func(netProto tcpip.NetworkProtocolNumber, addr tcpip.Address) stack.Target {
-				return &stack.SNATTarget{NetworkProtocol: netProto, Addr: addr}
+				return &stack.SNATTarget{NetworkProtocol: netProto, Addr: addr, ChangeAddress: true, ChangePort: true}
 			},
 		},
 	}
@@ -2898,7 +2898,7 @@ func TestSNATHandlePortOrIdentConflicts(t *testing.T) {
 												},
 											}
 
-											ipt.ReplaceTable(stack.NATID, table, ipv6)
+											ipt.ForceReplaceTable(stack.NATID, table, ipv6)
 
 											for i, srcAddr := range test.srcAddrs {
 												t.Run(fmt.Sprintf("Packet#%d", i), func(t *testing.T) {
@@ -2907,7 +2907,7 @@ func TestSNATHandlePortOrIdentConflicts(t *testing.T) {
 													}))
 
 													pkt := ep1.Read()
-													if pkt.IsNil() {
+													if pkt == nil {
 														t.Fatal("expected to read a packet on ep1")
 													}
 													pktView := stack.PayloadSince(pkt.NetworkHeader())
@@ -2925,6 +2925,208 @@ func TestSNATHandlePortOrIdentConflicts(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+func TestSNATLocallyGeneratedTrafficPorts(t *testing.T) {
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
+	})
+	defer s.Destroy()
+
+	ep1 := channel.New(1, header.IPv4MinimumMTU, "")
+	ep2 := channel.New(1, header.IPv4MinimumMTU, "")
+	utils.SetupRouterStack(t, s, ep1, ep2)
+
+	// Configure Masquerade NAT on the router stack.
+	ipt := s.IPTables()
+	table := stack.Table{
+		Rules: []stack.Rule{
+			// Prerouting
+			{
+				Target: &stack.AcceptTarget{},
+			},
+
+			// Input
+			{
+				Target: &stack.AcceptTarget{},
+			},
+
+			// Forward
+			{
+				Target: &stack.AcceptTarget{},
+			},
+
+			// Output
+			{
+				Target: &stack.AcceptTarget{},
+			},
+
+			// Postrouting
+			{
+				Filter: stack.IPHeaderFilter{
+					Protocol:        udp.ProtocolNumber,
+					CheckProtocol:   true,
+					OutputInterface: utils.RouterNIC2Name,
+				},
+				Target: &stack.MasqueradeTarget{NetworkProtocol: ipv4.ProtocolNumber},
+			},
+			{
+				Target: &stack.AcceptTarget{},
+			},
+		},
+		BuiltinChains: [stack.NumHooks]int{
+			stack.Prerouting:  0,
+			stack.Input:       1,
+			stack.Forward:     2,
+			stack.Output:      3,
+			stack.Postrouting: 4,
+		},
+	}
+	ipt.ForceReplaceTable(stack.NATID, table, false /* ipv6 */)
+
+	routerNIC2Addr := utils.RouterNIC2IPv4Addr.AddressWithPrefix.Address
+	ep1Addr := utils.Host1IPv4Addr.AddressWithPrefix.Address
+	var ep1Port uint16 = 1234
+	ep2Addr := utils.Host2IPv4Addr.AddressWithPrefix.Address
+	var ep2Port uint16 = 2345
+
+	// Inject an incoming packet on NIC1 destined to an address that will be
+	// routed out of NIC2. Expect that we can read the packet on ep2 coming from
+	// the stack's address assigned on NIC2, because it should have performed
+	// Masquerade NAT on the forwarded traffic.
+	ep1.InjectInbound(ipv4.ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(udpv4Packet(ep1Addr, ep2Addr, ep1Port, ep2Port, 0 /* dataSize */)),
+	}))
+	pkt := ep2.Read()
+	if pkt == nil {
+		t.Fatal("expected to read a packet on ep2")
+	}
+	pktView := stack.PayloadSince(pkt.NetworkHeader())
+	defer pktView.Release()
+	pkt.DecRef()
+	checker.IPv4(t, pktView,
+		checker.SrcAddr(routerNIC2Addr),
+		checker.DstAddr(ep2Addr),
+		checker.UDP(
+			checker.SrcPort(ep1Port),
+			checker.DstPort(ep2Port),
+		),
+	)
+
+	// Now bind a UDP socket on the stack itself to the same port used by the
+	// previous packet, and send a packet to the same address.
+	var wq waiter.Queue
+	we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+	wq.EventRegister(&we)
+	defer wq.EventUnregister(&we)
+
+	ep, err := s.NewEndpoint(udp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
+	if err != nil {
+		t.Fatalf("s.NewEndpoint(%d, %d, _): %s", udp.ProtocolNumber, ipv4.ProtocolNumber, err)
+	}
+	defer ep.Close()
+
+	srcAddr := tcpip.FullAddress{Addr: routerNIC2Addr, Port: ep1Port}
+	if err := ep.Bind(srcAddr); err != nil {
+		t.Fatalf("ep.Bind(%#v): %s", srcAddr, err)
+	}
+	dstAddr := tcpip.FullAddress{Addr: ep2Addr, Port: ep2Port}
+	if err := ep.Connect(dstAddr); err != nil {
+		t.Fatalf("ep.Connect(%#v): %s", dstAddr, err)
+	}
+
+	data := []byte{1, 2, 3, 4}
+	var r bytes.Reader
+	r.Reset(data)
+	var wOpts tcpip.WriteOptions
+	n, err := ep.Write(&r, wOpts)
+	if err != nil {
+		t.Fatalf("ep.Write(_, %#v): %s", wOpts, err)
+	}
+	if want := int64(len(data)); n != want {
+		t.Fatalf("got ep.Write(_, %#v) = (%d, _), want = (%d, _)", wOpts, n, want)
+	}
+
+	// The router should perform source port remapping for the locally generated
+	// traffic so that it does not conflict with the existing conntrack entry, so
+	// ep2 should observe the traffic as coming from the router's address, but
+	// *not* from the same port as the traffic from ep1 before.
+	pkt = ep2.Read()
+	if pkt == nil {
+		t.Fatal("expected to read a packet on ep2")
+	}
+	pktView = stack.PayloadSince(pkt.NetworkHeader())
+	defer pktView.Release()
+	pkt.DecRef()
+	checker.IPv4(t, pktView,
+		checker.SrcAddr(routerNIC2Addr),
+		checker.DstAddr(ep2Addr),
+		checker.UDP(
+			checker.DstPort(ep2Port),
+			checker.Payload(data),
+		),
+	)
+	gotPort := header.UDP(header.IPv4(pktView.AsSlice()).Payload()).SourcePort()
+	if gotPort == ep1Port {
+		t.Errorf("got src port == ep1Port (%d), should be remapped to avoid conflict", gotPort)
+	}
+
+	// We should also be able to reply on either connection, by injecting inbound
+	// traffic on ep2 destined to the router.
+	//
+	// Traffic destined to the port originally used in the traffic injected on ep1
+	// should go to ep1.
+	ep2.InjectInbound(ipv4.ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(udpv4Packet(ep2Addr, routerNIC2Addr, ep2Port, ep1Port, 0 /* dataSize */)),
+	}))
+	pkt = ep1.Read()
+	if pkt == nil {
+		t.Fatal("expected to read a packet on ep2")
+	}
+	pktView = stack.PayloadSince(pkt.NetworkHeader())
+	defer pktView.Release()
+	pkt.DecRef()
+	checker.IPv4(t, pktView,
+		checker.SrcAddr(ep2Addr),
+		checker.DstAddr(ep1Addr),
+		checker.UDP(
+			checker.SrcPort(ep2Port),
+			checker.DstPort(ep1Port),
+		),
+	)
+
+	// And traffic destined to the remapped source port chosen by conntrack for
+	// the socket bound on the stack should go to the socket.
+	reply := udpv4Packet(ep2Addr, routerNIC2Addr, ep2Port, gotPort, 0 /* dataSize */)
+	reply = append(reply, data...)
+	ep2.InjectInbound(ipv4.ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(reply),
+	}))
+	var buf bytes.Buffer
+	var res tcpip.ReadResult
+	for {
+		var err tcpip.Error
+		res, err = ep.Read(&buf, tcpip.ReadOptions{})
+		if _, ok := err.(*tcpip.ErrWouldBlock); ok {
+			<-ch
+			continue
+		}
+		if err != nil {
+			t.Fatalf("ep.Read(_, {}): %s", err)
+		}
+		break
+	}
+	if diff := cmp.Diff(
+		tcpip.ReadResult{
+			Count: 0,
+			Total: 0,
+		},
+		res,
+		checker.IgnoreCmpPath("ControlMessages"),
+	); diff != "" {
+		t.Errorf("ep.Read: unexpected result (-want +got):\n%s", diff)
 	}
 }
 
@@ -2979,7 +3181,7 @@ func TestLocallyRoutedPackets(t *testing.T) {
 				ipv6 := test.netProto == ipv6.ProtocolNumber
 				ipt := s.IPTables()
 				filter := ipt.GetTable(stack.FilterID, ipv6)
-				ipt.ReplaceTable(stack.FilterID, filter, ipv6)
+				ipt.ForceReplaceTable(stack.FilterID, filter, ipv6)
 			}
 
 			var wq waiter.Queue
@@ -3049,7 +3251,7 @@ type icmpv4Matcher struct {
 	icmpType header.ICMPv4Type
 }
 
-func (m *icmpv4Matcher) Match(_ stack.Hook, pkt stack.PacketBufferPtr, _, _ string) (matches bool, hotdrop bool) {
+func (m *icmpv4Matcher) Match(_ stack.Hook, pkt *stack.PacketBuffer, _, _ string) (matches bool, hotdrop bool) {
 	if pkt.NetworkProtocolNumber != header.IPv4ProtocolNumber {
 		return false, false
 	}
@@ -3065,7 +3267,7 @@ type icmpv6Matcher struct {
 	icmpType header.ICMPv6Type
 }
 
-func (m *icmpv6Matcher) Match(_ stack.Hook, pkt stack.PacketBufferPtr, _, _ string) (matches bool, hotdrop bool) {
+func (m *icmpv6Matcher) Match(_ stack.Hook, pkt *stack.PacketBuffer, _, _ string) (matches bool, hotdrop bool) {
 	if pkt.NetworkProtocolNumber != header.IPv6ProtocolNumber {
 		return false, false
 	}
@@ -3303,7 +3505,7 @@ func TestRejectWith(t *testing.T) {
 								filter.Rules[ruleIdx].Target = test.rejectTarget(t, s.NetworkProtocolInstance(test.netProto), rejectWith.val)
 								// Make sure the packet is not dropped by the next rule.
 								filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
-								ipt.ReplaceTable(stack.FilterID, filter, ipv6)
+								ipt.ForceReplaceTable(stack.FilterID, filter, ipv6)
 							}
 
 							func() {
@@ -3316,7 +3518,7 @@ func TestRejectWith(t *testing.T) {
 
 							{
 								pkt := ep1.Read()
-								if pkt.IsNil() {
+								if pkt == nil {
 									t.Fatal("expected to read a packet on ep1")
 								}
 								payload := stack.PayloadSince(pkt.NetworkHeader())
@@ -3345,7 +3547,7 @@ func TestInvalidTransportHeader(t *testing.T) {
 	tests := []struct {
 		name       string
 		setupStack func(*testing.T) (*stack.Stack, *channel.Endpoint)
-		genPacket  func(int8) stack.PacketBufferPtr
+		genPacket  func(int8) *stack.PacketBuffer
 		offset     int8
 	}{
 		{
@@ -3405,7 +3607,7 @@ func TestInvalidTransportHeader(t *testing.T) {
 			// Enable iptables and conntrack.
 			ipt := s.IPTables()
 			filter := ipt.GetTable(stack.FilterID, false /* ipv6 */)
-			ipt.ReplaceTable(stack.FilterID, filter, false /* ipv6 */)
+			ipt.ForceReplaceTable(stack.FilterID, filter, false /* ipv6 */)
 
 			// This can panic if conntrack isn't checking lengths.
 			e.InjectInbound(header.IPv4ProtocolNumber, test.genPacket(test.offset))
@@ -3413,7 +3615,7 @@ func TestInvalidTransportHeader(t *testing.T) {
 	}
 }
 
-func genTCP4(offset int8) stack.PacketBufferPtr {
+func genTCP4(offset int8) *stack.PacketBuffer {
 	pktSize := header.IPv4MinimumSize + header.TCPMinimumSize
 	hdr := prependable.New(pktSize)
 
@@ -3445,7 +3647,7 @@ func genTCP4(offset int8) stack.PacketBufferPtr {
 	return stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buf})
 }
 
-func genTCP6(offset int8) stack.PacketBufferPtr {
+func genTCP6(offset int8) *stack.PacketBuffer {
 	pktSize := header.IPv6MinimumSize + header.TCPMinimumSize
 	hdr := prependable.New(pktSize)
 
@@ -3471,7 +3673,7 @@ func genTCP6(offset int8) stack.PacketBufferPtr {
 	return stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buf})
 }
 
-func genUDP4(offset int8) stack.PacketBufferPtr {
+func genUDP4(offset int8) *stack.PacketBuffer {
 	pktSize := header.IPv4MinimumSize + header.UDPMinimumSize
 	hdr := prependable.New(pktSize)
 
@@ -3502,7 +3704,7 @@ func genUDP4(offset int8) stack.PacketBufferPtr {
 	return stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buf})
 }
 
-func genUDP6(offset int8) stack.PacketBufferPtr {
+func genUDP6(offset int8) *stack.PacketBuffer {
 	pktSize := header.IPv6MinimumSize + header.UDPMinimumSize
 	hdr := prependable.New(pktSize)
 

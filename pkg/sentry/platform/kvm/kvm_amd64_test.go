@@ -29,6 +29,13 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/platform/kvm/testutil"
 )
 
+func TestGetCS(t *testing.T) {
+	cs := getcs()
+	if cs != 0x33 {
+		t.Fatalf("cs = 0x%x", cs)
+	}
+}
+
 func TestSegments(t *testing.T) {
 	applicationTest(t, true, testutil.AddrOfTwiddleSegments(), func(c *vCPU, regs *arch.Registers, pt *pagetables.PageTables) bool {
 		testutil.SetTestSegments(regs)
@@ -48,6 +55,24 @@ func TestSegments(t *testing.T) {
 				t.Errorf("application segment check with full restore failed: %v", err)
 			}
 			break // Done.
+		}
+		return false
+	})
+}
+
+func vmcall(ax uintptr) uintptr
+func vmmcall(ax uintptr) uintptr
+
+func BenchmarkVMCall(b *testing.B) {
+	vmcallIsSupported := cpuid.HostFeatureSet().Intel()
+	kvmTest(b, nil, func(c *vCPU) bool {
+		for i := 0; i < b.N; i++ {
+			bluepill(c)
+			if vmcallIsSupported {
+				vmcall(0)
+			} else {
+				vmmcall(0)
+			}
 		}
 		return false
 	})

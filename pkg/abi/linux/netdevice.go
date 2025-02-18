@@ -58,9 +58,7 @@ func (ifr *IFReq) Name() string {
 // SetName sets the name.
 func (ifr *IFReq) SetName(name string) {
 	n := copy(ifr.IFName[:], []byte(name))
-	for i := n; i < len(ifr.IFName); i++ {
-		ifr.IFName[i] = 0
-	}
+	clear(ifr.IFName[n:])
 }
 
 // SizeOfIFReq is the binary size of an IFReq struct (40 bytes).
@@ -86,6 +84,9 @@ type IFConf struct {
 	_   [4]byte // Pad to sizeof(struct ifconf).
 	Ptr uint64
 }
+
+// SizeOfIFConf is the binary size of an IFConf struct (16 bytes).
+var SizeOfIFConf = (*IFConf)(nil).SizeBytes()
 
 // EthtoolCmd is a marshallable type to be able to easily copyin the
 // the command for an SIOCETHTOOL ioctl.
@@ -120,3 +121,8 @@ type EthtoolGetFeaturesBlock struct {
 	Active       uint32
 	NeverChanged uint32
 }
+
+const (
+	// LOOPBACK_IFINDEX is defined in include/net/flow.h.
+	LOOPBACK_IFINDEX = 1
+)

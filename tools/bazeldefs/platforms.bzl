@@ -41,4 +41,5 @@ platform_capabilities = {
     },
 }
 
-default_platform = "ptrace"
+default_platform = "systrap"
+save_restore_platforms = ["systrap"]

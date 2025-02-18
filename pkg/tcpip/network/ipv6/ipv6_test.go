@@ -18,7 +18,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math"
 	"net"
 	"reflect"
@@ -169,7 +169,7 @@ func testReceiveUDP(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst 
 	}
 }
 
-func compareFragments(packets []stack.PacketBufferPtr, sourcePacket stack.PacketBufferPtr, mtu uint32, wantFragments []fragmentInfo, proto tcpip.TransportProtocolNumber) error {
+func compareFragments(packets []*stack.PacketBuffer, sourcePacket *stack.PacketBuffer, mtu uint32, wantFragments []fragmentInfo, proto tcpip.TransportProtocolNumber) error {
 	// sourcePacket does not have its IP Header populated. Let's copy the one
 	// from the first fragment.
 	source := header.IPv6(packets[0].NetworkHeader().Slice())
@@ -516,7 +516,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 
 					// Discard & send ICMP if option is unknown.
 					191, 6, 1, 2, 3, 4, 5, 6,
-					//^ Unknown option.
+					// Unknown option.
 				}, hopByHopExtHdrID
 			},
 			shouldAccept: false,
@@ -536,7 +536,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 
 					// Discard & send ICMP if option is unknown.
 					191, 6, 1, 2, 3, 4, 5, 6,
-					//^ Unknown option.
+					// Unknown option.
 				}, hopByHopExtHdrID
 			},
 			multicast:    true,
@@ -558,7 +558,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 					// Discard & send ICMP unless packet is for multicast destination if
 					// option is unknown.
 					255, 6, 1, 2, 3, 4, 5, 6,
-					//^ Unknown option.
+					// Unknown option.
 				}, hopByHopExtHdrID
 			},
 			expectICMP: true,
@@ -578,7 +578,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 					// Discard & send ICMP unless packet is for multicast destination if
 					// option is unknown.
 					255, 6, 1, 2, 3, 4, 5, 6,
-					//^ Unknown option.
+					// Unknown option.
 				}, hopByHopExtHdrID
 			},
 			multicast:    true,
@@ -719,7 +719,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 
 					// Discard & send ICMP if option is unknown.
 					191, 6, 1, 2, 3, 4, 5, 6,
-					//^  191 is an unknown option.
+					//  191 is an unknown option.
 				}, destinationExtHdrID
 			},
 			shouldAccept: false,
@@ -729,7 +729,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 			pointer:      header.IPv6FixedHeaderSize + 8,
 		},
 		{
-			name: "destination with unknown option discard and send icmp action (muilticast)",
+			name: "destination with unknown option discard and send icmp action (multicast)",
 			extHdr: func(nextHdr uint8) ([]byte, uint8) {
 				return []byte{
 					nextHdr, 1,
@@ -739,7 +739,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 
 					// Discard & send ICMP if option is unknown.
 					191, 6, 1, 2, 3, 4, 5, 6,
-					//^  191 is an unknown option.
+					//  191 is an unknown option.
 				}, destinationExtHdrID
 			},
 			multicast:    true,
@@ -761,7 +761,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 					// Discard & send ICMP unless packet is for multicast destination if
 					// option is unknown.
 					255, 6, 1, 2, 3, 4, 5, 6,
-					//^ 255 is unknown.
+					// 255 is unknown.
 				}, destinationExtHdrID
 			},
 			shouldAccept: false,
@@ -782,7 +782,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 					// Discard & send ICMP unless packet is for multicast destination if
 					// option is unknown.
 					255, 6, 1, 2, 3, 4, 5, 6,
-					//^ 255 is unknown.
+					// 255 is unknown.
 				}, destinationExtHdrID
 			},
 			shouldAccept: false,
@@ -1035,7 +1035,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 				}
 
 				if !test.expectICMP {
-					if p := e.Read(); !p.IsNil() {
+					if p := e.Read(); p != nil {
 						t.Fatalf("unexpected packet received: %#v", p)
 					}
 					return
@@ -1043,7 +1043,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 
 				// ICMP required.
 				p := e.Read()
-				if p.IsNil() {
+				if p == nil {
 					t.Fatalf("expected packet wasn't written out")
 				}
 				defer p.DecRef()
@@ -1096,7 +1096,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 			}
 
 			// Should not have any more UDP packets.
-			res, err := ep.Read(ioutil.Discard, tcpip.ReadOptions{})
+			res, err := ep.Read(io.Discard, tcpip.ReadOptions{})
 			if _, ok := err.(*tcpip.ErrWouldBlock); !ok {
 				t.Fatalf("got Read = (%v, %v), want = (_, %s)", res, err, &tcpip.ErrWouldBlock{})
 			}
@@ -1931,7 +1931,7 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 				}
 			}
 
-			res, err := ep.Read(ioutil.Discard, tcpip.ReadOptions{})
+			res, err := ep.Read(io.Discard, tcpip.ReadOptions{})
 			if _, ok := err.(*tcpip.ErrWouldBlock); !ok {
 				t.Fatalf("(last) got Read = (%v, %v), want = (_, %s)", res, err, &tcpip.ErrWouldBlock{})
 			}
@@ -2197,12 +2197,12 @@ func TestInvalidIPv6Fragments(t *testing.T) {
 
 			reply := e.Read()
 			if !test.expectICMP {
-				if !reply.IsNil() {
+				if reply != nil {
 					t.Fatalf("unexpected ICMP error message received: %#v", reply)
 				}
 				return
 			}
-			if reply.IsNil() {
+			if reply == nil {
 				t.Fatal("expected ICMP error message missing")
 			}
 
@@ -2453,12 +2453,12 @@ func TestFragmentReassemblyTimeout(t *testing.T) {
 
 			reply := e.Read()
 			if !test.expectICMP {
-				if !reply.IsNil() {
+				if reply != nil {
 					t.Fatalf("unexpected ICMP error message received: %#v", reply)
 				}
 				return
 			}
-			if reply.IsNil() {
+			if reply == nil {
 				t.Fatal("expected ICMP error message missing")
 			}
 			if firstFragmentSent == nil {
@@ -2519,7 +2519,7 @@ func TestWriteStats(t *testing.T) {
 				filter := ipt.GetTable(stack.FilterID, true /* ipv6 */)
 				ruleIdx := filter.BuiltinChains[stack.Output]
 				filter.Rules[ruleIdx].Target = &stack.DropTarget{}
-				ipt.ReplaceTable(stack.FilterID, filter, true /* ipv6 */)
+				ipt.ForceReplaceTable(stack.FilterID, filter, true /* ipv6 */)
 			},
 			allowPackets:             math.MaxInt32,
 			expectSent:               0,
@@ -2534,7 +2534,7 @@ func TestWriteStats(t *testing.T) {
 				filter := ipt.GetTable(stack.NATID, true /* ipv6 */)
 				ruleIdx := filter.BuiltinChains[stack.Postrouting]
 				filter.Rules[ruleIdx].Target = &stack.DropTarget{}
-				ipt.ReplaceTable(stack.NATID, filter, true /* ipv6 */)
+				ipt.ForceReplaceTable(stack.NATID, filter, true /* ipv6 */)
 			},
 			allowPackets:             math.MaxInt32,
 			expectSent:               0,
@@ -2554,7 +2554,7 @@ func TestWriteStats(t *testing.T) {
 				filter.Rules[ruleIdx].Matchers = []stack.Matcher{&limitedMatcher{nPackets - 1}}
 				// Make sure the next rule is ACCEPT.
 				filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
-				ipt.ReplaceTable(stack.FilterID, filter, true /* ipv6 */)
+				ipt.ForceReplaceTable(stack.FilterID, filter, true /* ipv6 */)
 			},
 			allowPackets:             math.MaxInt32,
 			expectSent:               nPackets - 1,
@@ -2574,7 +2574,7 @@ func TestWriteStats(t *testing.T) {
 				filter.Rules[ruleIdx].Matchers = []stack.Matcher{&limitedMatcher{nPackets - 1}}
 				// Make sure the next rule is ACCEPT.
 				filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
-				ipt.ReplaceTable(stack.NATID, filter, true /* ipv6 */)
+				ipt.ForceReplaceTable(stack.NATID, filter, true /* ipv6 */)
 			},
 			allowPackets:             math.MaxInt32,
 			expectSent:               nPackets - 1,
@@ -2672,7 +2672,7 @@ func (*limitedMatcher) Name() string {
 }
 
 // Match implements Matcher.Match.
-func (lm *limitedMatcher) Match(stack.Hook, stack.PacketBufferPtr, string, string) (bool, bool) {
+func (lm *limitedMatcher) Match(stack.Hook, *stack.PacketBuffer, string, string) (bool, bool) {
 	if lm.limit == 0 {
 		return true, false
 	}
@@ -2961,22 +2961,24 @@ var (
 
 func TestForwarding(t *testing.T) {
 	tests := []struct {
-		name                             string
-		extHdr                           func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker)
-		TTL                              uint8
-		payloadLength                    int
-		srcAddr                          tcpip.Address
-		dstAddr                          tcpip.Address
-		expectedPacketUnrouteableErrors  uint64
-		expectedInitializingSourceErrors uint64
-		expectedLinkLocalSourceErrors    uint64
-		expectedLinkLocalDestErrors      uint64
-		expectedExtensionHeaderErrors    uint64
-		expectedPacketTooBigErrors       uint64
-		expectedExhaustedTTLErrors       uint64
-		expectPacketForwarded            bool
-		expectedFragmentsForwarded       []fragmentInfo
-		expectedICMPError                *icmpError
+		name                                 string
+		extHdr                               func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker)
+		TTL                                  uint8
+		payloadLength                        int
+		srcAddr                              tcpip.Address
+		dstAddr                              tcpip.Address
+		closeOutgoingEndpoint                bool
+		expectedPacketUnrouteableErrors      uint64
+		expectedInitializingSourceErrors     uint64
+		expectedLinkLocalSourceErrors        uint64
+		expectedLinkLocalDestErrors          uint64
+		expectedExtensionHeaderErrors        uint64
+		expectedPacketTooBigErrors           uint64
+		expectedExhaustedTTLErrors           uint64
+		expectedOutgoingEndpointClosedErrors uint64
+		expectPacketForwarded                bool
+		expectedFragmentsForwarded           []fragmentInfo
+		expectedICMPError                    *icmpError
 	}{
 		{
 			name:    "TTL of zero",
@@ -3190,6 +3192,15 @@ func TestForwarding(t *testing.T) {
 			expectedPacketTooBigErrors: 1,
 			expectPacketForwarded:      false,
 		},
+		{
+			name:                                 "close outgoing endpoint",
+			TTL:                                  2,
+			srcAddr:                              remoteIPv6Addr1,
+			dstAddr:                              remoteIPv6Addr2,
+			expectedOutgoingEndpointClosedErrors: 1,
+			closeOutgoingEndpoint:                true,
+			expectPacketForwarded:                false,
+		},
 	}
 
 	for _, test := range tests {
@@ -3279,18 +3290,22 @@ func TestForwarding(t *testing.T) {
 				t.Fatalf("endpoints[%d] = (_, false), want (_, true)", incomingNICID)
 			}
 
-			incomingEndpoint.InjectInbound(ProtocolNumber, request)
-			request.DecRef()
-
-			reply := incomingEndpoint.Read()
-
 			outgoingEndpoint, ok := endpoints[outgoingNICID]
 			if !ok {
 				t.Fatalf("endpoints[%d] = (_, false), want (_, true)", outgoingNICID)
 			}
 
+			if test.closeOutgoingEndpoint {
+				outgoingEndpoint.Close()
+			}
+
+			incomingEndpoint.InjectInbound(ProtocolNumber, request)
+			request.DecRef()
+
+			reply := incomingEndpoint.Read()
+
 			if test.expectedICMPError != nil {
-				if reply.IsNil() {
+				if reply == nil {
 					t.Fatalf("Expected ICMP packet type %d through incoming NIC", test.expectedICMPError.icmpType)
 				}
 
@@ -3324,13 +3339,13 @@ func TestForwarding(t *testing.T) {
 				if n := outgoingEndpoint.Drain(); n != 0 {
 					t.Fatalf("e2.Drain() = %d, want = 0", n)
 				}
-			} else if !reply.IsNil() {
+			} else if reply != nil {
 				t.Fatalf("Expected no ICMP packet through incoming NIC, instead found: %#v", reply)
 			}
 
 			reply = outgoingEndpoint.Read()
 			if test.expectPacketForwarded {
-				if reply.IsNil() {
+				if reply == nil {
 					t.Fatal("Expected ICMP Echo Request packet through outgoing NIC")
 				}
 
@@ -3352,7 +3367,7 @@ func TestForwarding(t *testing.T) {
 				if n := incomingEndpoint.Drain(); n != 0 {
 					t.Fatalf("e1.Drain() = %d, want = 0", n)
 				}
-			} else if !reply.IsNil() {
+			} else if reply != nil {
 				t.Fatalf("Expected no ICMP Echo packet through outgoing NIC, instead found: %#v", reply)
 			}
 
@@ -3384,7 +3399,11 @@ func TestForwarding(t *testing.T) {
 				t.Errorf("s.Stats().IP.Forwarding.PacketTooBig.Value() = %d, want = %d", got, want)
 			}
 
-			totalExpectedErrors := test.expectedPacketUnrouteableErrors + test.expectedPacketTooBigErrors + test.expectedExtensionHeaderErrors + test.expectedLinkLocalSourceErrors + test.expectedLinkLocalDestErrors + test.expectedExhaustedTTLErrors + test.expectedInitializingSourceErrors
+			if got, want := s.Stats().IP.Forwarding.OutgoingDeviceClosedForSend.Value(), test.expectedOutgoingEndpointClosedErrors; got != want {
+				t.Errorf("s.Stats().IP.Forwarding.OutgoingDeviceClosedForSend.Value() = %d, want = %d", got, want)
+			}
+
+			totalExpectedErrors := test.expectedPacketUnrouteableErrors + test.expectedPacketTooBigErrors + test.expectedExtensionHeaderErrors + test.expectedLinkLocalSourceErrors + test.expectedLinkLocalDestErrors + test.expectedExhaustedTTLErrors + test.expectedInitializingSourceErrors + test.expectedOutgoingEndpointClosedErrors
 			if got, want := s.Stats().IP.Forwarding.Errors.Value(), totalExpectedErrors; got != want {
 				t.Errorf("s.Stats().IP.Forwarding.Errors.Value() = %d, want = %d", got, want)
 			}
@@ -3625,7 +3644,7 @@ func TestMulticastForwarding(t *testing.T) {
 			}
 
 			if test.expectedICMPError != nil {
-				if reply.IsNil() {
+				if reply == nil {
 					t.Fatalf("Expected ICMP packet type %d through incoming NIC", test.expectedICMPError.icmpType)
 				}
 
@@ -3659,13 +3678,13 @@ func TestMulticastForwarding(t *testing.T) {
 				if n := outgoingEndpoint.Drain(); n != 0 {
 					t.Fatalf("e2.Drain() = %d, want = 0", n)
 				}
-			} else if !reply.IsNil() {
+			} else if reply != nil {
 				t.Fatalf("Expected no ICMP packet through incoming NIC, instead found: %#v", reply)
 			}
 
 			reply = outgoingEndpoint.Read()
 			if test.expectPacketForwarded {
-				if reply.IsNil() {
+				if reply == nil {
 					t.Fatal("Expected ICMP Echo Request packet through outgoing NIC")
 				}
 
@@ -3687,7 +3706,7 @@ func TestMulticastForwarding(t *testing.T) {
 				if n := incomingEndpoint.Drain(); n != 0 {
 					t.Fatalf("e1.Drain() = %d, want = 0", n)
 				}
-			} else if !reply.IsNil() {
+			} else if reply != nil {
 				t.Fatalf("Expected no ICMP Echo packet through outgoing NIC, instead found: %#v", reply)
 			}
 
@@ -3806,7 +3825,7 @@ func TestIcmpRateLimit(t *testing.T) {
 			},
 			check: func(t *testing.T, e *channel.Endpoint, round int) {
 				p := e.Read()
-				if p.IsNil() {
+				if p == nil {
 					t.Fatalf("expected echo response, no packet read in endpoint in round %d", round)
 				}
 				defer p.DecRef()
@@ -3854,13 +3873,13 @@ func TestIcmpRateLimit(t *testing.T) {
 			check: func(t *testing.T, e *channel.Endpoint, round int) {
 				p := e.Read()
 				if round >= icmpBurst {
-					if !p.IsNil() {
+					if p != nil {
 						t.Errorf("got packet %x in round %d, expected ICMP rate limit to stop it", p.Data().AsRange().ToSlice(), round)
 						p.DecRef()
 					}
 					return
 				}
-				if p.IsNil() {
+				if p == nil {
 					t.Fatalf("expected unreachable in round %d, no packet read in endpoint", round)
 				}
 				payload := stack.PayloadSince(p.NetworkHeader())

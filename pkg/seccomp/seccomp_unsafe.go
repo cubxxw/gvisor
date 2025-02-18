@@ -21,10 +21,11 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/bpf"
 )
 
 // SetFilter installs the given BPF program.
-func SetFilter(instrs []linux.BPFInstruction) error {
+func SetFilter(instrs []bpf.Instruction) error {
 	// PR_SET_NO_NEW_PRIVS is required in order to enable seccomp. See
 	// seccomp(2) for details.
 	//
@@ -73,7 +74,7 @@ func SetFilter(instrs []linux.BPFInstruction) error {
 //
 //go:norace
 //go:nosplit
-func SetFilterInChild(instrs []linux.BPFInstruction) unix.Errno {
+func SetFilterInChild(instrs []bpf.Instruction) unix.Errno {
 	if _, _, errno := unix.RawSyscall6(unix.SYS_PRCTL, linux.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0); errno != 0 {
 		return errno
 	}
@@ -112,6 +113,8 @@ func isKillProcessAvailable() (bool, error) {
 //
 //go:nosplit
 func seccomp(op, flags uint32, ptr unsafe.Pointer) (uintptr, unix.Errno) {
-	n, _, errno := unix.RawSyscall(SYS_SECCOMP, uintptr(op), uintptr(flags), uintptr(ptr))
+	// Note: Usage of RawSyscall6 over RawSyscall is intentional in order to
+	//       reduce stack-growth.
+	n, _, errno := unix.RawSyscall6(SYS_SECCOMP, uintptr(op), uintptr(flags), uintptr(ptr), 0, 0, 0)
 	return n, errno
 }

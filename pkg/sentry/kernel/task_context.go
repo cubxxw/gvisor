@@ -20,11 +20,12 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/devutil"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/shm"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -103,8 +104,12 @@ func (t *Task) contextValue(key any, isTaskGoroutine bool) any {
 		}
 		t.mountNamespace.IncRef()
 		return t.mountNamespace
+	case devutil.CtxDevGoferClient:
+		return t.k.GetDevGoferClient(t.k.ContainerName(t.containerID))
 	case inet.CtxStack:
 		return t.NetworkContext()
+	case inet.CtxNamespaceByFD:
+		return t.NetworkNamespaceByFD
 	case ktime.CtxRealtimeClock:
 		return t.k.RealtimeClock()
 	case limits.CtxLimits:
@@ -117,8 +122,6 @@ func (t *Task) contextValue(key any, isTaskGoroutine bool) any {
 		return t.memCgID.Load()
 	case pgalloc.CtxMemoryFile:
 		return t.k.mf
-	case pgalloc.CtxMemoryFileProvider:
-		return t.k
 	case platform.CtxPlatform:
 		return t.k
 	case shm.CtxDeviceID:

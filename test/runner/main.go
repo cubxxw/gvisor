@@ -17,11 +17,11 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -34,8 +34,11 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/syndtr/gocapability/capability"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
+	"gvisor.dev/gvisor/pkg/state/pretty"
+	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/test/runner/gtest"
@@ -63,15 +66,19 @@ var (
 	addHostConnector = flag.Bool("add-host-connector", false, "create goroutines that connect to bound UDS that will be created by sandbox")
 	addHostFIFO      = flag.Bool("add-host-fifo", false, "expose a tree of FIFO to test communication with the host")
 	ioUring          = flag.Bool("iouring", false, "Enables IO_URING API for asynchronous I/O")
-	// TODO(gvisor.dev/issue/4572): properly support leak checking for runsc, and
-	// set to true as the default for the test runner.
-	leakCheck  = flag.Bool("leak-check", false, "check for reference leaks")
-	waitForPid = flag.Duration("delay-for-debugger", 0, "Print out the sandbox PID and wait for the specified duration to start the test. This is useful for attaching a debugger to the runsc-sandbox process.")
+	leakCheck        = flag.Bool("leak-check", false, "check for reference leaks")
+	waitForPid       = flag.Duration("delay-for-debugger", 0, "Print out the sandbox PID and wait for the specified duration to start the test. This is useful for attaching a debugger to the runsc-sandbox process.")
+	save             = flag.Bool("save", false, "enables save restore")
+	saveResume       = flag.Bool("save-resume", false, "enables save resume")
+	netstackSR       = flag.Bool("netstack-sr", false, "enables netstack s/r")
 )
 
 const (
 	// Environment variable used by platform_util.cc to determine platform capabilities.
 	platformSupportEnvVar = "GVISOR_PLATFORM_SUPPORT"
+
+	// checkpointFile is the name of the checkpoint/save state file.
+	checkpointFile = "checkpoint.img"
 )
 
 // getSetupContainerPath returns the path to the setup_container binary.
@@ -90,7 +97,7 @@ func getSetupContainerPath() string {
 func runTestCaseNative(testBin string, tc *gtest.TestCase, args []string, t *testing.T) {
 	// These tests might be running in parallel, so make sure they have a
 	// unique test temp dir.
-	tmpDir, err := ioutil.TempDir(testutil.TmpDir(), "")
+	tmpDir, err := os.MkdirTemp(testutil.TmpDir(), "")
 	if err != nil {
 		t.Fatalf("could not create temp dir: %v", err)
 	}
@@ -159,6 +166,8 @@ func runTestCaseNative(testBin string, tc *gtest.TestCase, args []string, t *tes
 		args = tc.Args()
 	}
 
+	args = append(args, gtest.TestFlags...)
+	log.Infof("Executing: %v", append([]string{testBin}, args...))
 	cmd := exec.Command(testBin, args...)
 	cmd.Env = env
 	cmd.Stdout = os.Stdout
@@ -177,7 +186,7 @@ func runTestCaseNative(testBin string, tc *gtest.TestCase, args []string, t *tes
 		// setup_container takes in its target argv as positional arguments.
 		cmd.Path = getSetupContainerPath()
 		cmd.Args = append([]string{cmd.Path}, cmd.Args...)
-		cmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWUSER | unix.CLONE_NEWNET | unix.CLONE_NEWIPC | unix.CLONE_NEWUTS
+		cmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWUSER | unix.CLONE_NEWNET | unix.CLONE_NEWIPC | unix.CLONE_NEWUTS | unix.CLONE_NEWNS
 		// Set current user/group as root inside the namespace.
 		cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{
 			{ContainerID: 0, HostID: os.Getuid(), Size: 1},
@@ -196,6 +205,93 @@ func runTestCaseNative(testBin string, tc *gtest.TestCase, args []string, t *tes
 		ws := err.(*exec.ExitError).Sys().(syscall.WaitStatus)
 		t.Errorf("test %q exited with status %d, want 0", tc.FullName(), ws.ExitStatus())
 	}
+}
+
+func deleteIfEmptyFile(dir string) (bool, error) {
+	fName := filepath.Join(dir, checkpointFile)
+	fi, err := os.Stat(fName)
+	if err != nil {
+		return false, fmt.Errorf("stat error: %v", err)
+	}
+	if fi.Size() > 0 {
+		return false, nil
+	}
+	os.RemoveAll(dir)
+	return true, nil
+}
+
+func printAll(dirs []string) {
+	for _, dir := range dirs {
+		f := filepath.Join(dir, checkpointFile)
+		printOne(dir, f, false, ".txt")
+		printOne(dir, f, true, ".html")
+	}
+}
+
+func printOne(dir string, file string, html bool, postfix string) {
+	f, err := os.Open(file)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	r, m, err := statefile.NewReader(f, nil)
+	if err != nil {
+		return
+	}
+	w, err := os.Create(dir + postfix)
+	if err != nil {
+		return
+	}
+	defer w.Close()
+
+	cu := cleanup.Make(func() {
+		os.Remove(dir + postfix)
+	})
+	defer cu.Clean()
+	if html {
+		// Print just the HTML stream.
+		if err := pretty.PrintHTML(w, r); err != nil {
+			return
+		}
+	} else {
+		// Print the metadata first.
+		if _, err := fmt.Fprintf(w, "%v\n", m); err != nil {
+			return
+		}
+		// Then print the rest of the text.
+		if err := pretty.PrintText(w, r); err != nil {
+			return
+		}
+	}
+	cu.Release()
+}
+
+func removeAll(dirs []string) {
+	for _, dir := range dirs {
+		os.RemoveAll(dir)
+	}
+}
+
+func prepareSave(args []string, undeclaredOutputsDir string, dirs []string, index int) ([]string, []string, error) {
+	// Create the state file directory.
+	dir, err := os.MkdirTemp(undeclaredOutputsDir, fmt.Sprintf("state.%v.", index))
+	if err != nil {
+		return args, dirs, fmt.Errorf("failed to create state file directory: %v", err)
+	}
+	// Pass the directory path of the state file to the sandbox.
+	args = append(args, "-TESTONLY-autosave-image-path", dir)
+	dirs = append(dirs, dir)
+	return args, dirs, nil
+}
+
+func deleteSandbox(args []string, id string) error {
+	deleteArgs := append(args, "delete", "-force=true", id)
+	log.Infof("Executing: %v", append([]string{specutils.ExePath}, deleteArgs...))
+	deleteCmd := exec.Command(specutils.ExePath, deleteArgs...)
+	if err := deleteCmd.Run(); err != nil {
+		return fmt.Errorf("delete error: %v", err)
+	}
+	return nil
 }
 
 // runRunsc runs spec in runsc in a standard test configuration.
@@ -232,7 +328,8 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 		"-watchdog-action=panic",
 		"-platform", *platform,
 		"-file-access", *fileAccess,
-		"-gvisor-gro=200000ns",
+		"-gvisor-gro",
+		"-host-settings=check_mandatory",
 	}
 
 	if *network == "host" && !testutil.TestEnvSupportsNetAdmin {
@@ -278,25 +375,54 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 	}
 
 	testLogDir := ""
-	if undeclaredOutputsDir, ok := unix.Getenv("TEST_UNDECLARED_OUTPUTS_DIR"); ok {
+	runscLogDir := ""
+	runscCoverageDir := ""
+	undeclaredOutputsDir := ""
+	dirs := []string{}
+	saveArgs := []string{}
+	var ok bool
+	undeclaredOutputsDir, ok = unix.Getenv("TEST_UNDECLARED_OUTPUTS_DIR")
+	if ok {
 		// Create log directory dedicated for this test.
 		testLogDir = filepath.Join(undeclaredOutputsDir, strings.Replace(name, "/", "_", -1))
 		if err := os.MkdirAll(testLogDir, 0755); err != nil {
 			return fmt.Errorf("could not create test dir: %v", err)
 		}
-		debugLogDir, err := ioutil.TempDir(testLogDir, "runsc")
+		tmpDir, err := os.MkdirTemp(testLogDir, "runsc")
 		if err != nil {
 			return fmt.Errorf("could not create temp dir: %v", err)
 		}
-		debugLogDir += "/"
-		log.Infof("runsc logs: %s", debugLogDir)
-		args = append(args, "-debug-log", debugLogDir)
-		args = append(args, "-coverage-report", debugLogDir)
+		runscLogDir = filepath.Join(tmpDir, "logs")
+		log.Infof("runsc logs: %s", runscLogDir)
+		// Pass a trailing slash to --debug-log flag to ensure that runscLogDir is
+		// populated with per-command log files. See specutils.DebugLogFile().
+		args = append(args, "-debug-log", runscLogDir+"/")
+		runscCoverageDir = filepath.Join(tmpDir, "coverage")
+		args = append(args, "-coverage-report", runscCoverageDir+"/")
 
 		// Default -log sends messages to stderr which makes reading the test log
 		// difficult. Instead, drop them when debug log is enabled given it's a
 		// better place for these messages.
 		args = append(args, "-log=/dev/null")
+
+		// Create the state file.
+		if *save || *saveResume {
+			if *netstackSR {
+				args = append(args, "--TESTONLY-save-restore-netstack=true")
+			}
+			saveArgs = args
+			args, dirs, err = prepareSave(args, undeclaredOutputsDir, dirs, 0)
+			if err != nil {
+				return fmt.Errorf("prepareSave error: %v", err)
+			}
+			if *saveResume {
+				args = append(args, "-TESTONLY-autosave-resume=true")
+			}
+		}
+	} else if *save || *saveResume {
+		// TEST_UNDECLARED_OUTPUTS_DIR directory should be present with S/R to create
+		// the state file.
+		return fmt.Errorf("TEST_UNDECLARED_OUTPUTS_DIR is not set with S/R enabled")
 	}
 
 	// Current process doesn't have CAP_SYS_ADMIN, create user namespace and run
@@ -320,6 +446,7 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 	if *waitForPid != 0 {
 		createArgs := append(args, "create", "-pid-file", filepath.Join(testLogDir, "pid"), "--bundle", bundleDir, id)
 		defer os.Remove(filepath.Join(testLogDir, "pid"))
+		log.Infof("Executing: %v", append([]string{specutils.ExePath}, createArgs...))
 		createCmd := exec.Command(specutils.ExePath, createArgs...)
 		createCmd.SysProcAttr = sysProcAttr
 		createCmd.Stdout = os.Stdout
@@ -332,10 +459,17 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 		if err != nil {
 			return fmt.Errorf("could not read pid file: %v", err)
 		}
-		log.Infof("Sandbox process ID is %s. You can attach to it from a debugger of your choice.", sandboxPidBytes)
-		log.Infof("For example, with Delve you can call: $ dlv attach %s", sandboxPidBytes)
-		log.Infof("The test will automatically start after %s.", *waitForPid)
-		log.Infof("You may also signal the test process to start the test immediately: $ kill -SIGUSR1 %d", os.Getpid())
+		msg := `
+
+		Sandbox is running. You can now attach to it from a debugger of your choice.
+		For example, with Delve you can call: $ dlv attach %s.
+		The test will automatically start after %s.
+		You may also signal the test process to start the test immediately: $ kill -SIGUSR1 %d.
+
+		If you're running a test using Make/docker, you'll have to obtain the runsc and test PIDs manually.
+		To attach run: $ dlv attach $(ps aux | grep -m 1 -e 'runsc-sandbox' | awk '{print $2}')
+		To signal the test process run: $ kill -SIGUSR1 $(ps aux | grep -m 1 -e 'bash.*test/syscalls' | awk '{print $2}')`
+		log.Infof(msg, sandboxPidBytes, *waitForPid, os.Getpid())
 
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, unix.SIGUSR1)
@@ -349,6 +483,7 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 	} else {
 		cmdArgs = append(args, "run", "--bundle", bundleDir, id)
 	}
+	log.Infof("Executing: %v", append([]string{specutils.ExePath}, cmdArgs...))
 	cmd := exec.Command(specutils.ExePath, cmdArgs...)
 	cmd.SysProcAttr = sysProcAttr
 	if *container || *network == "host" || (cmd.SysProcAttr.Cloneflags&unix.CLONE_NEWNET != 0) {
@@ -371,6 +506,7 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 		done := make(chan bool, 1)
 		dArgs := append([]string{}, args...)
 		dArgs = append(dArgs, "debug", "--stacks", id)
+		log.Infof("Executing: %v", append([]string{specutils.ExePath}, dArgs...))
 		go func(dArgs []string) {
 			debug := exec.Command(specutils.ExePath, dArgs...)
 			debug.Stdout = os.Stdout
@@ -390,43 +526,210 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 		dArgs = append(args, "debug",
 			fmt.Sprintf("--signal=%d", unix.SIGTERM),
 			id)
+		log.Infof("Executing: %v", append([]string{specutils.ExePath}, dArgs...))
 		signal := exec.Command(specutils.ExePath, dArgs...)
 		signal.Stdout = os.Stdout
 		signal.Stderr = os.Stderr
 		signal.Run()
 	}()
 
-	err = cmd.Run()
-	if *waitForPid != 0 {
+	if *save {
+		err = cmd.Run()
 		if err != nil {
-			return fmt.Errorf("could not start container: %v", err)
+			return fmt.Errorf("run error: %v", err)
 		}
-		waitArgs := append(args, "wait", id)
-		waitCmd := exec.Command(specutils.ExePath, waitArgs...)
-		waitCmd.SysProcAttr = sysProcAttr
-		waitCmd.Stderr = os.Stderr
 
-		buf := bytes.NewBuffer(nil)
-		waitCmd.Stdout = buf
-		err = waitCmd.Run()
-		wres := struct {
-			ID         string `json:"id"`
-			ExitStatus int    `json:"exitStatus"`
-		}{}
-		if err := json.NewDecoder(buf).Decode(&wres); err != nil {
-			return fmt.Errorf("could not decode wait result: %v", err)
+		// Restore the sandbox with the previous state file.
+		for i := 1; ; i++ {
+			// Check if the latest state file is valid. If the file
+			// is empty, delete it and exit the loop.
+			isEmpty, err := deleteIfEmptyFile(dirs[i-1])
+			if err != nil {
+				return err
+			}
+			if isEmpty {
+				dirs = dirs[:i-1]
+				break
+			}
+
+			// Delete the existing sandbox.
+			if err := deleteSandbox(saveArgs, id); err != nil {
+				printAll(dirs)
+				removeAll(dirs)
+				return fmt.Errorf("deleteSandbox error %v", err)
+			}
+
+			// Restore into new sandbox.
+			restoreArgs := saveArgs
+			restoreArgs, dirs, err = prepareSave(restoreArgs, undeclaredOutputsDir, dirs, i)
+			if err != nil {
+				printAll(dirs)
+				removeAll(dirs)
+				return fmt.Errorf("prepareSave error: %v", err)
+			}
+			restoreArgs = append(restoreArgs, "restore", "--image-path", dirs[i-1], "--bundle", bundleDir, id)
+			log.Infof("Executing: %v", append([]string{specutils.ExePath}, restoreArgs...))
+			restoreCmd := exec.Command(specutils.ExePath, restoreArgs...)
+			restoreCmd.SysProcAttr = sysProcAttr
+			if *container || *network == "host" || (restoreCmd.SysProcAttr.Cloneflags&unix.CLONE_NEWNET != 0) {
+				restoreCmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWNET
+				restoreCmd.Path = getSetupContainerPath()
+				restoreCmd.Args = append([]string{restoreCmd.Path}, restoreCmd.Args...)
+			}
+			restoreCmd.Stdout = os.Stdout
+			restoreCmd.Stderr = os.Stderr
+			if err := restoreCmd.Run(); err != nil {
+				printAll(dirs)
+				removeAll(dirs)
+				return fmt.Errorf("after restore error: %v", err)
+			}
 		}
-		if wres.ExitStatus != 0 {
-			return fmt.Errorf("test failed with status: %d", wres.ExitStatus)
+		// Do not output state files when the test succeeds.
+		removeAll(dirs)
+	} else if *saveResume {
+		err = cmd.Run()
+		if err != nil {
+			printAll(dirs)
+			removeAll(dirs)
+			return fmt.Errorf("run error: %v", err)
+		}
+		removeAll(dirs)
+	} else {
+		err = cmd.Run()
+		if *waitForPid != 0 {
+			if err != nil {
+				return fmt.Errorf("could not start container: %v", err)
+			}
+			waitArgs := append(args, "wait", id)
+			log.Infof("Executing: %v", append([]string{specutils.ExePath}, waitArgs...))
+			waitCmd := exec.Command(specutils.ExePath, waitArgs...)
+			waitCmd.SysProcAttr = sysProcAttr
+			waitCmd.Stderr = os.Stderr
+
+			buf := bytes.NewBuffer(nil)
+			waitCmd.Stdout = buf
+			err = waitCmd.Run()
+			wres := struct {
+				ID         string `json:"id"`
+				ExitStatus int    `json:"exitStatus"`
+			}{}
+			if err := json.NewDecoder(buf).Decode(&wres); err != nil {
+				return fmt.Errorf("could not decode wait result: %v", err)
+			}
+			if wres.ExitStatus != 0 {
+				return fmt.Errorf("test failed with status: %d", wres.ExitStatus)
+			}
 		}
 	}
 	if err == nil && len(testLogDir) > 0 {
+		var warningsFound []string
+		files, err := os.ReadDir(runscLogDir)
+		if err != nil {
+			return err
+		}
+		for _, file := range files {
+			f, err := os.Open(filepath.Join(runscLogDir, file.Name()))
+			if err != nil {
+				return err
+			}
+			scanner := bufio.NewScanner(f)
+			for scanner.Scan() {
+				if line := scanner.Text(); isWarning(line) {
+					warningsFound = append(warningsFound, strings.TrimSpace(line))
+				}
+			}
+		}
+		if len(warningsFound) > 0 {
+			return fmt.Errorf("%s", warningsFound)
+		}
 		// If the test passed, then we erase the log directory. This speeds up
 		// uploading logs in continuous integration & saves on disk space.
 		os.RemoveAll(testLogDir)
 	}
 
 	return err
+}
+
+func isWarning(line string) bool {
+	if len(line) >= 5 && line[:5] == "panic" {
+		return true
+	}
+	if !hasWarningPrefix(line) {
+		return false
+	}
+	// Ignore a basic set of warnings that we've
+	// determined to be fine. We want these to stay
+	// as warnings, even if they are constant.
+	switch {
+	// Reasonable warnings, allowed during tests.
+	case strings.Contains(line, "Will try waiting on the sandbox process instead."):
+	case strings.Contains(line, "lisafs: batch closing FDs"):
+	case strings.Contains(line, "This is only safe in tests!"):
+	case strings.Contains(line, "Capability \"checkpoint_restore\" is not permitted, dropping it."):
+	case strings.Contains(line, "syscall filters less restrictive!"):
+	case strings.Contains(line, "Getdent64: skipping file"):
+	// Capability "perfmon" is not permitted, dropping it.
+	case strings.Contains(line, "is not permitted, dropping it."):
+	case strings.Contains(line, "sndPrepopulatedMsg failed"):
+	case strings.Contains(line, "PR_SET_NO_NEW_PRIVS is assumed to always be set."):
+	case strings.Contains(line, "TSC snapshot unavailable"):
+	case strings.Contains(line, "copy up failed to copy up contents"):
+	case strings.Contains(line, "populate failed for"):
+	case strings.Contains(line, "ASAN is enabled: syscall filters less restrictive"):
+	case strings.Contains(line, "MSAN is enabled: syscall filters less restrictive"):
+	case strings.Contains(line, "TSAN is enabled: syscall filters less restrictive"):
+	case strings.Contains(line, "Optional feature EnablePCID not supported"):
+	case strings.Contains(line, "Optional feature EnableSMEP not supported"):
+	case strings.Contains(line, "Optional feature EnableVPID not supported"):
+	case strings.Contains(line, "Optional feature GMPWithVPID not supported"):
+	case strings.Contains(line, "Optional feature ValidateGMPPF not supported"):
+	case strings.Contains(line, "Pass-through networking enabled"):
+	// Expected in some tests that create files as 0755,
+	// ex. /gvisor/test/syscalls/linux/exec.cc
+	case strings.Contains(line, "Opened a writable executable"):
+	// Expected in some tests, eg. /gvisor/test/syscalls/linux/sysret.cc
+	case strings.Contains(line, "invalid rip for 64 bit mode"):
+	// Expected in some tests that create pipes or sockets.
+	case strings.Contains(line, "Rejecting attempt to open fifo/pipe"):
+	case strings.Contains(line, "Rejecting attempt to open unix domain socket"):
+	case strings.Contains(line, "Rejecting attempt to connect to unix domain socket"):
+	case strings.Contains(line, "Rejecting attempt to create unix domain socket"):
+
+	// Ignore clock frequency adjustment messages.
+	case strings.Contains(line, "adjusted frequency from"):
+
+	// FIXME(b/70990997): URPC error: possible race?
+	case strings.Contains(line, "urpc: error decoding: bad file descriptor"):
+
+	// FIXME(b/147228315): GVISOR_PREEMPTION_INTERRUPT not yet supported on AMD.
+	case strings.Contains(line, "Optional feature PreemptionInterrupt not supported"):
+
+	// Ignore denied dirty timestamp writebacks. It occurs because,
+	// in tests, gofer doesn't have permission to change atime.
+	case strings.Contains(line, "gofer.dentry.destroyLocked: failed to close file with write dirty timestamps: operation not permitted"):
+	case strings.Contains(line, "Tsetattrclunk failed, losing FID"):
+	// gsys_get_timekeeping_params hasn't been implemented for ARM.
+	case strings.Contains(line, "Error retrieving TSC snapshot, unable to save TSC: function not implemented"):
+
+	case *save:
+		// Ignore these warnings for S/R tests as we try to delete the sandbox
+		// after the sandbox has exited and before attempting to restore it.
+		if strings.Contains(line, "couldn't find container") ||
+			strings.Contains(line, "Container not found, creating new one, cid:") ||
+			strings.Contains(line, "Error sending signal") ||
+			strings.Contains(line, "Cannot signal container") {
+			break
+		}
+
+	default:
+		return true
+	}
+	return false
+}
+
+func hasWarningPrefix(line string) bool {
+	// This is trivial match for Google's log file format.
+	return len(line) >= 2 && (line[0] == 'E' || line[0] == 'W') && (line[1] >= '0' && line[1] <= '9')
 }
 
 // setupHostUDSTree updates the spec to expose a UDS files tree for testing
@@ -444,7 +747,7 @@ func setupHostUDSTree(spec *specs.Spec) (cleanup func(), err error) {
 		Type:        "bind",
 	})
 
-	// Individial attach points for each socket to test mounts that attach
+	// Individual attach points for each socket to test mounts that attach
 	// directly to the sockets.
 	for _, protocol := range []string{"stream", "seqpacket"} {
 		for _, name := range []string{"echo", "nonlistening"} {
@@ -525,6 +828,7 @@ func runTestCaseRunsc(testBin string, tc *gtest.TestCase, args []string, t *test
 	if args == nil {
 		args = tc.Args()
 	}
+	args = append(args, gtest.TestFlags...)
 	var spec *specs.Spec
 	if *fusefs {
 		fuseServer, err := testutil.FindFile("test/runner/fuse/fuse")
@@ -559,7 +863,7 @@ func runTestCaseRunsc(testBin string, tc *gtest.TestCase, args []string, t *test
 		//
 		// Some tests (e.g., sticky) access this mount from other
 		// users, so make sure it is world-accessible.
-		tmpDir, err := ioutil.TempDir(testutil.TmpDir(), "")
+		tmpDir, err := os.MkdirTemp(testutil.TmpDir(), "")
 		if err != nil {
 			t.Fatalf("could not create temp dir: %v", err)
 		}
@@ -594,6 +898,7 @@ func runTestCaseRunsc(testBin string, tc *gtest.TestCase, args []string, t *test
 		networkVar  = "GVISOR_NETWORK"
 		ioUringVar  = "IOURING_ENABLED"
 		fuseVar     = "GVISOR_FUSE_TEST"
+		saveVar     = "GVISOR_SAVE_TEST"
 	)
 	env := append(os.Environ(), platformVar+"="+*platform, networkVar+"="+*network)
 	if *platformSupport != "" {
@@ -608,6 +913,11 @@ func runTestCaseRunsc(testBin string, tc *gtest.TestCase, args []string, t *test
 		env = append(env, fuseVar+"=TRUE")
 	} else {
 		env = append(env, fuseVar+"=FALSE")
+	}
+	if *save || *saveResume {
+		env = append(env, saveVar+"=TRUE")
+	} else {
+		env = append(env, saveVar+"=FALSE")
 	}
 
 	// Remove shard env variables so that the gunit binary does not try to
@@ -642,6 +952,11 @@ func runTestCaseRunsc(testBin string, tc *gtest.TestCase, args []string, t *test
 		defer cleanup()
 	}
 
+	// Add cgroup mount to enable cgroups for all tests.
+	spec.Mounts = append(spec.Mounts, specs.Mount{
+		Destination: "/sys/fs/cgroup",
+		Type:        "cgroup",
+	})
 	if err := runRunsc(tc, spec); err != nil {
 		t.Errorf("test %q failed with error %v, want nil", tc.FullName(), err)
 	}

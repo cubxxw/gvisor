@@ -2,17 +2,32 @@
 
 [![Build status](https://badge.buildkite.com/3b159f20b9830461a71112566c4171c0bdfd2f980a8e4c0ae6.svg?branch=master)](https://buildkite.com/gvisor/pipeline)
 [![Issue reviver](https://github.com/google/gvisor/actions/workflows/issue_reviver.yml/badge.svg)](https://github.com/google/gvisor/actions/workflows/issue_reviver.yml)
+[![CodeQL](https://github.com/google/gvisor/actions/workflows/codeql.yml/badge.svg)](https://github.com/google/gvisor/actions/workflows/codeql.yml)
 [![gVisor chat](https://badges.gitter.im/gvisor/community.png)](https://gitter.im/gvisor/community)
 [![code search](https://img.shields.io/badge/code-search-blue)](https://cs.opensource.google/gvisor/gvisor)
 
 ## What is gVisor?
 
-**gVisor** is an application kernel, written in Go, that implements a
-substantial portion of the Linux system surface. It includes an
-[Open Container Initiative (OCI)][oci] runtime called `runsc` that provides an
-isolation boundary between the application and the host kernel. The `runsc`
-runtime integrates with Docker and Kubernetes, making it simple to run sandboxed
+**gVisor** provides a strong layer of isolation between running applications and
+the host operating system. It is an application kernel that implements a
+[Linux-like interface][linux]. Unlike Linux, it is written in a memory-safe
+language (Go) and runs in userspace.
+
+gVisor includes an [Open Container Initiative (OCI)][oci] runtime called `runsc`
+that makes it easy to work with existing container tooling. The `runsc` runtime
+integrates with Docker and Kubernetes, making it simple to run sandboxed
 containers.
+
+## What **isn't** gVisor?
+
+*   gVisor is **not a syscall filter** (e.g. `seccomp-bpf`), nor a wrapper over
+    Linux isolation primitives (e.g. `firejail`, AppArmor, etc.).
+*   gVisor is also **not a VM** in the everyday sense of the term (e.g.
+    VirtualBox, QEMU).
+
+**gVisor takes a distinct third approach**, providing many security benefits of
+VMs while maintaining the lower resource footprint, fast startup, and
+flexibility of regular userspace applications.
 
 ## Why does gVisor exist?
 
@@ -64,6 +79,12 @@ Build and install the `runsc` binary:
 mkdir -p bin
 make copy TARGETS=runsc DESTINATION=bin/
 sudo cp ./bin/runsc /usr/local/bin
+```
+
+To build specific libraries or binaries, you can specify the target:
+
+```sh
+make build TARGETS="//pkg/tcpip:tcpip"
 ```
 
 ### Testing
@@ -126,6 +147,7 @@ See [Contributing.md](CONTRIBUTING.md).
 [gvisor-users-list]: https://groups.google.com/forum/#!forum/gvisor-users
 [gvisor-dev]: https://gvisor.dev
 [gvisor-dev-list]: https://groups.google.com/forum/#!forum/gvisor-dev
+[linux]: https://en.wikipedia.org/wiki/Linux_kernel_interfaces
 [oci]: https://www.opencontainers.org
 [old-linux]: https://gvisor.dev/docs/user_guide/networking/#gso
 [sandbox]: https://en.wikipedia.org/wiki/Sandbox_(computer_security)

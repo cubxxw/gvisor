@@ -20,12 +20,14 @@ package config
 import (
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/version"
@@ -58,7 +60,15 @@ type Config struct {
 	LogFormat string `flag:"log-format"`
 
 	// DebugLog is the path to log debug information to, if not empty.
+	// If specified together with `DebugToUserLog`, debug logs are emitted
+	// to both.
 	DebugLog string `flag:"debug-log"`
+
+	// DebugToUserLog indicates that Sentry debug logs should be emitted
+	// to user-visible logs.
+	// If specified together with `DebugLog`, debug logs are emitted
+	// to both.
+	DebugToUserLog bool `flag:"debug-to-user-log"`
 
 	// DebugCommand is a comma-separated list of commands to be debugged if
 	// --debug-log is also set. Empty means debug all. "!" negates the expression.
@@ -98,6 +108,9 @@ type Config struct {
 	// HostFifo controls permission to access host FIFO (or named pipes).
 	HostFifo HostFifo `flag:"host-fifo"`
 
+	// HostSettings controls how host settings are handled.
+	HostSettings HostSettingsPolicy `flag:"host-settings"`
+
 	// Network indicates what type of network to use.
 	Network NetworkType `flag:"network"`
 
@@ -112,13 +125,12 @@ type Config struct {
 	// HostGSO indicates that host segmentation offload is enabled.
 	HostGSO bool `flag:"gso"`
 
-	// GvisorGSO indicates that gVisor segmentation offload is enabled. The flag
+	// GVisorGSO indicates that gVisor segmentation offload is enabled. The flag
 	// retains its old name of "software" GSO for API consistency.
-	GvisorGSO bool `flag:"software-gso"`
+	GVisorGSO bool `flag:"software-gso"`
 
-	// GvisorGROTimeout sets gVisor's generic receive offload timeout. Zero
-	// bypasses GRO.
-	GvisorGROTimeout time.Duration `flag:"gvisor-gro"`
+	// GVisorGRO enables gVisor's generic receive offload.
+	GVisorGRO bool `flag:"gvisor-gro"`
 
 	// TXChecksumOffload indicates that TX Checksum Offload is enabled.
 	TXChecksumOffload bool `flag:"tx-checksum-offload"`
@@ -154,6 +166,10 @@ type Config struct {
 	// an indication that the container being created wishes that its metrics should be exported).
 	// The value of this flag must also match across the two command lines.
 	MetricServer string `flag:"metric-server"`
+
+	// FinalMetricsLog is the file to which all metric data should be written
+	// upon sandbox termination.
+	FinalMetricsLog string `flag:"final-metrics-log"`
 
 	// ProfilingMetrics is a comma separated list of metric names which are
 	// going to be written to the ProfilingMetricsLog file from within the
@@ -226,13 +242,16 @@ type Config struct {
 	// for the duration of the container execution.
 	TraceFile string `flag:"trace"`
 
-	// RestoreFile is the path to the saved container image.
-	RestoreFile string
-
 	// NumNetworkChannels controls the number of AF_PACKET sockets that map
 	// to the same underlying network device. This allows netstack to better
 	// scale for high throughput use cases.
 	NumNetworkChannels int `flag:"num-network-channels"`
+
+	// NetworkProcessorsPerChannel controls the number of goroutines used to
+	// handle packets on a single network channel. A higher number can help handle
+	// many simultaneous connections. If this is 0, runsc will divide GOMAXPROCS
+	// evenly among each network channel.
+	NetworkProcessorsPerChannel int `flag:"network-processors-per-channel"`
 
 	// Rootless allows the sandbox to be started with a user that is not root.
 	// Defense in depth measures are weaker in rootless mode. Specifically, the
@@ -259,9 +278,6 @@ type Config struct {
 	// Enables seccomp inside the sandbox.
 	OCISeccomp bool `flag:"oci-seccomp"`
 
-	// Mounts the cgroup filesystem backed by the sentry's cgroupfs.
-	Cgroupfs bool `flag:"cgroupfs"`
-
 	// Don't configure cgroups.
 	IgnoreCgroups bool `flag:"ignore-cgroups"`
 
@@ -275,16 +291,19 @@ type Config struct {
 	// Use pools to manage buffer memory instead of heap.
 	BufferPooling bool `flag:"buffer-pooling"`
 
-	// AFXDP defines whether to use an AF_XDP socket to receive packets
-	// (rather than AF_PACKET). Enabling it disables RX checksum offload.
-	AFXDP bool `flag:"EXPERIMENTAL-afxdp"`
+	// XDP controls Whether and how to use XDP.
+	XDP XDP `flag:"EXPERIMENTAL-xdp"`
+
+	// AFXDPUseNeedWakeup determines whether XDP_USE_NEED_WAKEUP is set
+	// when using AF_XDP sockets.
+	AFXDPUseNeedWakeup bool `flag:"EXPERIMENTAL-xdp-need-wakeup"`
 
 	// FDLimit specifies a limit on the number of host file descriptors that can
 	// be open simultaneously by the sentry and gofer. It applies separately to
 	// each.
 	FDLimit int `flag:"fdlimit"`
 
-	// DCache sets the global dirent cache size. If zero, per-mount caches are
+	// DCache sets the global dirent cache size. If negative, per-mount caches are
 	// used.
 	DCache int `flag:"dcache"`
 
@@ -297,13 +316,26 @@ type Config struct {
 	// exists, but is mostly idle. Not supported in rootless mode.
 	DirectFS bool `flag:"directfs"`
 
+	// AppHugePages enables support for application huge pages.
+	AppHugePages bool `flag:"app-huge-pages"`
+
 	// NVProxy enables support for Nvidia GPUs.
 	NVProxy bool `flag:"nvproxy"`
 
-	// NVProxyDocker exposes GPUs to containers based on the
-	// NVIDIA_VISIBLE_DEVICES container environment variable, as requested by
-	// containers or set by `docker --gpus`.
+	// NVProxyDocker is deprecated. Please use nvidia-container-runtime or
+	// `docker run --gpus` directly. For backward compatibility, this has the
+	// effect of injecting nvidia-container-runtime-hook as a prestart hook.
 	NVProxyDocker bool `flag:"nvproxy-docker"`
+
+	// NVProxyDriverVersion is the version of the NVIDIA driver ABI to use.
+	// If empty, it is autodetected from the installed NVIDIA driver.
+	// It can also be set to the special value "latest" to force the use of
+	// the latest supported NVIDIA driver ABI.
+	NVProxyDriverVersion string `flag:"nvproxy-driver-version"`
+
+	// NVProxyAllowUnsupportedCapabilities is a comma-separated list of driver
+	// capabilities that are allowed to be requested by the container.
+	NVProxyAllowedDriverCapabilities string `flag:"nvproxy-allowed-driver-capabilities"`
 
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
@@ -330,6 +362,32 @@ type Config struct {
 	// explicitlySet contains whether a flag was explicitly set on the command-line from which this
 	// Config was constructed. Nil when the Config was not initialized from a FlagSet.
 	explicitlySet map[string]struct{}
+
+	// ReproduceNAT, when true, tells runsc to scrape the host network
+	// namespace's NAT iptables and reproduce it inside the sandbox.
+	ReproduceNAT bool `flag:"reproduce-nat"`
+
+	// ReproduceNftables attempts to scrape nftables routing rules if
+	// present, and reproduce them in the sandbox.
+	ReproduceNftables bool `flag:"reproduce-nftables"`
+
+	// Indicates whether open network connections and open unix domain
+	// sockets should be disconnected upon save."
+	NetDisconnectOk bool `flag:"net-disconnect-ok"`
+
+	// TestOnlyAutosaveImagePath if not empty enables auto save for syscall tests
+	// and stores the directory path to the saved state file.
+	TestOnlyAutosaveImagePath string `flag:"TESTONLY-autosave-image-path"`
+
+	// TestOnlyAutosaveResume indicates save resume for syscall tests.
+	TestOnlyAutosaveResume bool `flag:"TESTONLY-autosave-resume"`
+
+	// TestOnlySaveRestoreNetstack indicates netstack should be saved and restored.
+	TestOnlySaveRestoreNetstack bool `flag:"TESTONLY-save-restore-netstack"`
+
+	// RestoreSpecValidation indicates the level of spec validation to be
+	// performed during restore.
+	RestoreSpecValidation RestoreSpecValidationPolicy `flag:"restore-spec-validation"`
 }
 
 func (c *Config) validate() error {
@@ -365,7 +423,47 @@ func (c *Config) validate() error {
 	if len(c.ProfilingMetrics) > 0 && len(c.ProfilingMetricsLog) == 0 {
 		return fmt.Errorf("profiling-metrics flag requires defining a profiling-metrics-log for output")
 	}
+	allowedCaps, _, err := nvconf.DriverCapsFromString(c.NVProxyAllowedDriverCapabilities)
+	if err != nil {
+		return fmt.Errorf("--nvproxy-allowed-driver-capabilities=%q: %w", c.NVProxyAllowedDriverCapabilities, err)
+	}
+	if unsupported := allowedCaps & ^nvconf.SupportedDriverCaps; unsupported != 0 {
+		return fmt.Errorf("--nvproxy-allowed-driver-capabilities=%q: unsupported capabilities: %v", c.NVProxyAllowedDriverCapabilities, unsupported)
+	}
 	return nil
+}
+
+// Log logs important aspects of the configuration to the given log function.
+func (c *Config) Log() {
+	log.Infof("Platform: %v", c.Platform)
+	log.Infof("RootDir: %s", c.RootDir)
+	log.Infof("FileAccess: %v / Directfs: %t / Overlay: %v", c.FileAccess, c.DirectFS, c.GetOverlay2())
+	log.Infof("Network: %v", c.Network)
+	if c.Debug || c.Strace {
+		log.Infof("Debug: %t. Strace: %t, max size: %d, syscalls: %s", c.Debug, c.Strace, c.StraceLogSize, c.StraceSyscalls)
+	}
+	if c.Debug {
+		obj := reflect.ValueOf(c).Elem()
+		st := obj.Type()
+		for i := 0; i < st.NumField(); i++ {
+			f := st.Field(i)
+			var val any
+			if strVal := obj.Field(i).String(); strVal == "" {
+				val = "(empty)"
+			} else if !f.IsExported() {
+				// Cannot convert to `interface{}` for non-exported fields,
+				// so just use `strVal`.
+				val = fmt.Sprintf("%s (unexported)", strVal)
+			} else {
+				val = obj.Field(i).Interface()
+			}
+			if flagName, hasFlag := f.Tag.Lookup("flag"); hasFlag {
+				log.Debugf("Config.%s (--%s): %v", f.Name, flagName, val)
+			} else {
+				log.Debugf("Config.%s: %v", f.Name, val)
+			}
+		}
+	}
 }
 
 // GetHostUDS returns the FS gofer communication that is allowed, taking into
@@ -521,6 +619,9 @@ const (
 
 	// NetworkNone sets up just loopback using netstack.
 	NetworkNone
+
+	// NetworkPlugin uses third-party network stack.
+	NetworkPlugin
 )
 
 func networkTypePtr(v NetworkType) *NetworkType {
@@ -536,6 +637,8 @@ func (n *NetworkType) Set(v string) error {
 		*n = NetworkHost
 	case "none":
 		*n = NetworkNone
+	case "plugin":
+		*n = NetworkPlugin
 	default:
 		return fmt.Errorf("invalid network type %q", v)
 	}
@@ -556,6 +659,8 @@ func (n NetworkType) String() string {
 		return "host"
 	case NetworkNone:
 		return "none"
+	case NetworkPlugin:
+		return "plugin"
 	}
 	panic(fmt.Sprintf("Invalid network type %d", n))
 }
@@ -733,17 +838,73 @@ func (g HostFifo) AllowOpen() bool {
 	return g&HostFifoOpen != 0
 }
 
+// OverlayMedium describes how overlay medium is configured.
+type OverlayMedium string
+
+const (
+	// NoOverlay indicates that no overlay will be applied.
+	NoOverlay = OverlayMedium("")
+
+	// MemoryOverlay indicates that the overlay is backed by app memory.
+	MemoryOverlay = OverlayMedium("memory")
+
+	// SelfOverlay indicates that the overlaid mount is backed by itself.
+	SelfOverlay = OverlayMedium("self")
+
+	// AnonOverlayPrefix is the prefix that users should specify in the
+	// config for the anonymous overlay.
+	AnonOverlayPrefix = "dir="
+)
+
+// String returns a human-readable string representing the overlay medium config.
+func (m OverlayMedium) String() string {
+	return string(m)
+}
+
+// Set sets the value. Set(String()) should be idempotent.
+func (m *OverlayMedium) Set(v string) error {
+	switch OverlayMedium(v) {
+	case NoOverlay, MemoryOverlay, SelfOverlay: // OK
+	default:
+		if !strings.HasPrefix(v, AnonOverlayPrefix) {
+			return fmt.Errorf("unexpected medium: %q", v)
+		}
+		if hostFileDir := strings.TrimPrefix(v, AnonOverlayPrefix); !filepath.IsAbs(hostFileDir) {
+			return fmt.Errorf("overlay host file directory should be an absolute path, got %q", hostFileDir)
+		}
+	}
+	*m = OverlayMedium(v)
+	return nil
+}
+
+// IsBackedByAnon indicates whether the overlaid mount is backed by a host file
+// in an anonymous directory.
+func (m OverlayMedium) IsBackedByAnon() bool {
+	return strings.HasPrefix(string(m), AnonOverlayPrefix)
+}
+
+// HostFileDir indicates the directory in which the overlay-backing host file
+// should be created.
+//
+// Precondition: m.IsBackedByAnon().
+func (m OverlayMedium) HostFileDir() string {
+	if !m.IsBackedByAnon() {
+		panic(fmt.Sprintf("anonymous overlay medium = %q does not have %v prefix", m, AnonOverlayPrefix))
+	}
+	return strings.TrimPrefix(string(m), AnonOverlayPrefix)
+}
+
 // Overlay2 holds the configuration for setting up overlay filesystems for the
 // container.
 type Overlay2 struct {
 	rootMount bool
 	subMounts bool
-	medium    string
+	medium    OverlayMedium
 }
 
 func defaultOverlay2() *Overlay2 {
 	// Rootfs overlay is enabled by default and backed by a file in rootfs itself.
-	return &Overlay2{rootMount: true, subMounts: false, medium: "self"}
+	return &Overlay2{rootMount: true, subMounts: false, medium: SelfOverlay}
 }
 
 // Set implements flag.Value. Set(String()) should be idempotent.
@@ -751,7 +912,7 @@ func (o *Overlay2) Set(v string) error {
 	if v == "none" {
 		o.rootMount = false
 		o.subMounts = false
-		o.medium = ""
+		o.medium = NoOverlay
 		return nil
 	}
 	vs := strings.Split(v, ":")
@@ -769,18 +930,7 @@ func (o *Overlay2) Set(v string) error {
 		return fmt.Errorf("unexpected mount specifier for --overlay2: %q", mount)
 	}
 
-	o.medium = vs[1]
-	switch o.medium {
-	case "memory", "self": // OK
-	default:
-		if !strings.HasPrefix(o.medium, "dir=") {
-			return fmt.Errorf("unexpected medium specifier for --overlay2: %q", o.medium)
-		}
-		if hostFileDir := strings.TrimPrefix(o.medium, "dir="); !filepath.IsAbs(hostFileDir) {
-			return fmt.Errorf("overlay host file directory should be an absolute path, got %q", hostFileDir)
-		}
-	}
-	return nil
+	return o.medium.Set(vs[1])
 }
 
 // Get implements flag.Value.
@@ -802,47 +952,252 @@ func (o Overlay2) String() string {
 	default:
 		panic("invalid state of subMounts = true and rootMount = false")
 	}
-
-	return res + ":" + o.medium
+	return res + ":" + o.medium.String()
 }
 
 // Enabled returns true if the overlay option is enabled for any mounts.
 func (o *Overlay2) Enabled() bool {
-	return o.rootMount || o.subMounts
+	return o.medium != NoOverlay
 }
 
-// RootEnabled returns true if the overlay is enabled for the root mount.
-func (o *Overlay2) RootEnabled() bool {
-	return o.rootMount
-}
-
-// SubMountEnabled returns true if the overlay is enabled for submounts.
-func (o *Overlay2) SubMountEnabled() bool {
-	return o.subMounts
-}
-
-// IsBackedByMemory indicates whether the overlay is backed by app memory.
-func (o *Overlay2) IsBackedByMemory() bool {
-	return o.Enabled() && o.medium == "memory"
-}
-
-// IsBackedBySelf indicates whether the overlaid mounts are backed by
-// themselves.
-func (o *Overlay2) IsBackedBySelf() bool {
-	return o.Enabled() && o.medium == "self"
-}
-
-// HostFileDir indicates the directory in which the overlay-backing host file
-// should be created.
-//
-// Precondition: o.IsBackedByHostFile() && !o.IsBackedBySelf().
-func (o *Overlay2) HostFileDir() string {
-	if !strings.HasPrefix(o.medium, "dir=") {
-		panic(fmt.Sprintf("Overlay2.Medium = %q does not have dir= prefix when overlay is backed by a host file", o.medium))
+// RootOverlayMedium returns the overlay medium config of the root mount.
+func (o *Overlay2) RootOverlayMedium() OverlayMedium {
+	if !o.rootMount {
+		return NoOverlay
 	}
-	hostFileDir := strings.TrimPrefix(o.medium, "dir=")
-	if !filepath.IsAbs(hostFileDir) {
-		panic(fmt.Sprintf("overlay host file directory should be an absolute path, got %q", hostFileDir))
+	return o.medium
+}
+
+// SubMountOverlayMedium returns the overlay medium config of submounts.
+func (o *Overlay2) SubMountOverlayMedium() OverlayMedium {
+	if !o.subMounts {
+		return NoOverlay
 	}
-	return hostFileDir
+	return o.medium
+}
+
+// Medium returns the overlay medium config.
+func (o Overlay2) Medium() OverlayMedium {
+	return o.medium
+}
+
+// HostSettingsPolicy dictates how host settings should be handled.
+type HostSettingsPolicy int
+
+// HostSettingsPolicy values.
+const (
+	// HostSettingsCheck checks the host settings. If any are not optimal, it
+	// will fail if any of them are mandatory, but will otherwise only log
+	// warnings. It never attempts to modify host settings.
+	HostSettingsCheck HostSettingsPolicy = iota
+
+	// HostSettingsCheck checks the host settings. If any are not optimal, it
+	// will fail if any of them are mandatory, but will otherwise not log
+	// anything about non-mandatory settings.
+	// It never attempts to modify host settings.
+	HostSettingsCheckMandatory
+
+	// HostSettingsIgnore does not check nor adjust any host settings.
+	// This is useful in case the host settings are already known to be
+	// optimal, or to avoid errors if `runsc` is running within a seccomp
+	// or AppArmor policy that prevents it from checking host settings.
+	HostSettingsIgnore
+
+	// HostSettingsAdjust automatically adjusts host settings if they are not
+	// optimal. It will fail if any setting is mandatory but cannot be adjusted.
+	// For non-mandatory settings, it logs a warning if adjustment fails.
+	HostSettingsAdjust
+
+	// HostSettingsEnforce automatically adjusts host settings if they are not
+	// optimal, and fails if adjustment of any setting fails.
+	HostSettingsEnforce
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *HostSettingsPolicy) Set(v string) error {
+	switch v {
+	case "check":
+		*p = HostSettingsCheck
+	case "check_mandatory":
+		*p = HostSettingsCheckMandatory
+	case "ignore":
+		*p = HostSettingsIgnore
+	case "adjust":
+		*p = HostSettingsAdjust
+	case "enforce":
+		*p = HostSettingsEnforce
+	default:
+		return fmt.Errorf("invalid host settings policy %q", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `p`.
+// Useful in flag declaration line.
+func (p HostSettingsPolicy) Ptr() *HostSettingsPolicy {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *HostSettingsPolicy) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p HostSettingsPolicy) String() string {
+	switch p {
+	case HostSettingsCheck:
+		return "check"
+	case HostSettingsCheckMandatory:
+		return "check_mandatory"
+	case HostSettingsAdjust:
+		return "adjust"
+	case HostSettingsIgnore:
+		return "ignore"
+	case HostSettingsEnforce:
+		return "enforce"
+	default:
+		panic(fmt.Sprintf("Invalid host settings policy %d", p))
+	}
+}
+
+// RestoreSpecValidationPolicy dictates how spec validation should be handled.
+type RestoreSpecValidationPolicy int
+
+// RestoreSpecValidationPolicy values.
+const (
+	// RestoreSpecValidationIgnore does not validate the spec during restore.
+	RestoreSpecValidationIgnore RestoreSpecValidationPolicy = iota
+
+	// RestoreSpecValidationWarning will perform spec validation and logs a warning
+	// if the validation fails, however the restore will continue.
+	RestoreSpecValidationWarning
+
+	// RestoreSpecValidationEnforce will perform spec validation and returns an
+	// error if the validation fails and aborts restoring the containers.
+	RestoreSpecValidationEnforce
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *RestoreSpecValidationPolicy) Set(v string) error {
+	switch v {
+	case "ignore":
+		*p = RestoreSpecValidationIgnore
+	case "warning":
+		*p = RestoreSpecValidationWarning
+	case "enforce":
+		*p = RestoreSpecValidationEnforce
+	default:
+		return fmt.Errorf("invalid restore spec validation policy %q", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `p`.
+// Useful in flag declaration line.
+func (p RestoreSpecValidationPolicy) Ptr() *RestoreSpecValidationPolicy {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *RestoreSpecValidationPolicy) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p RestoreSpecValidationPolicy) String() string {
+	switch p {
+	case RestoreSpecValidationIgnore:
+		return "ignore"
+	case RestoreSpecValidationWarning:
+		return "warning"
+	case RestoreSpecValidationEnforce:
+		return "enforce"
+	default:
+		panic(fmt.Sprintf("invalid restore spec validation policy %d", p))
+	}
+}
+
+// XDP holds configuration for whether and how to use XDP.
+type XDP struct {
+	Mode      XDPMode
+	IfaceName string
+}
+
+// XDPMode specifies a particular use of XDP.
+type XDPMode int
+
+const (
+	// XDPModeOff doesn't use XDP.
+	XDPModeOff XDPMode = iota
+
+	// XDPModeNS uses an AF_XDP socket to read from the VETH device inside
+	// the container's network namespace.
+	XDPModeNS
+
+	// XDPModeRedirect uses an AF_XDP socket on the host NIC to bypass the
+	// Linux network stack.
+	XDPModeRedirect
+
+	// XDPModeTunnel uses XDP_REDIRECT to redirect packets directly from the
+	// host NIC to the VETH device inside the container's network
+	// namespace. Packets are read from the VETH via AF_XDP, as in
+	// XDPModeNS.
+	XDPModeTunnel
+)
+
+const (
+	xdpModeStrOff      = "off"
+	xdpModeStrNS       = "ns"
+	xdpModeStrRedirect = "redirect"
+	xdpModeStrTunnel   = "tunnel"
+)
+
+var xdpConfig XDP
+
+// Get implements flag.Getter.
+func (xd *XDP) Get() any {
+	return *xd
+}
+
+// String implements flag.Getter.
+func (xd *XDP) String() string {
+	switch xd.Mode {
+	case XDPModeOff:
+		return xdpModeStrOff
+	case XDPModeNS:
+		return xdpModeStrNS
+	case XDPModeRedirect:
+		return fmt.Sprintf("%s:%s", xdpModeStrRedirect, xd.IfaceName)
+	case XDPModeTunnel:
+		return fmt.Sprintf("%s:%s", xdpModeStrTunnel, xd.IfaceName)
+	default:
+		panic(fmt.Sprintf("unknown mode %d", xd.Mode))
+	}
+}
+
+// Set implements flag.Getter.
+func (xd *XDP) Set(input string) error {
+	parts := strings.Split(input, ":")
+	if len(parts) > 2 {
+		return fmt.Errorf("invalid --xdp value: %q", input)
+	}
+
+	switch {
+	case input == xdpModeStrOff:
+		xd.Mode = XDPModeOff
+		xd.IfaceName = ""
+	case input == xdpModeStrNS:
+		xd.Mode = XDPModeNS
+		xd.IfaceName = ""
+	case len(parts) == 2 && parts[0] == xdpModeStrRedirect && parts[1] != "":
+		xd.Mode = XDPModeRedirect
+		xd.IfaceName = parts[1]
+	case len(parts) == 2 && parts[0] == xdpModeStrTunnel && parts[1] != "":
+		xd.Mode = XDPModeTunnel
+		xd.IfaceName = parts[1]
+	default:
+		return fmt.Errorf("invalid --xdp value: %q", input)
+	}
+	return nil
 }

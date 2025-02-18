@@ -33,6 +33,18 @@ const (
 	NF_INET_NUMHOOKS     = 5
 )
 
+// Protocol families (address families). These correspond to values in
+// include/uapi/linux/netfilter.h.
+const (
+	NFPROTO_UNSPEC = 0
+	NFPROTO_INET   = 1
+	NFPROTO_IPV4   = 2
+	NFPROTO_ARP    = 3
+	NFPROTO_NETDEV = 5
+	NFPROTO_BRIDGE = 7
+	NFPROTO_IPV6   = 10
+)
+
 // Verdicts that can be returned by targets. These correspond to values in
 // include/uapi/linux/netfilter.h
 const (
@@ -389,18 +401,40 @@ type XTRedirectTarget struct {
 // SizeOfXTRedirectTarget is the size of an XTRedirectTarget.
 const SizeOfXTRedirectTarget = 56
 
-// XTSNATTarget triggers Source NAT when reached.
+// XTNATTargetV0 triggers NAT when reached.
 // Adding 4 bytes of padding to make the struct 8 byte aligned.
 //
 // +marshal
-type XTSNATTarget struct {
+type XTNATTargetV0 struct {
 	Target  XTEntryTarget
 	NfRange NfNATIPV4MultiRangeCompat
 	_       [4]byte
 }
 
-// SizeOfXTSNATTarget is the size of an XTSNATTarget.
-const SizeOfXTSNATTarget = 56
+// SizeOfXTNATTargetV0 is the size of an XTNATTargetV0.
+const SizeOfXTNATTargetV0 = 56
+
+// XTNATTargetV1 triggers NAT when reached.
+//
+// +marshal
+type XTNATTargetV1 struct {
+	Target XTEntryTarget
+	Range  NFNATRange
+}
+
+// SizeOfXTNATTargetV1 is the size of an XTNATTargetV1.
+const SizeOfXTNATTargetV1 = SizeOfXTEntryTarget + SizeOfNFNATRange
+
+// XTNATTargetV2 triggers NAT when reached.
+//
+// +marshal
+type XTNATTargetV2 struct {
+	Target XTEntryTarget
+	Range  NFNATRange2
+}
+
+// SizeOfXTNATTargetV2 is the size of an XTNATTargetV2.
+const SizeOfXTNATTargetV2 = SizeOfXTEntryTarget + SizeOfNFNATRange2
 
 // IPTGetinfo is the argument for the IPT_SO_GET_INFO sockopt. It corresponds
 // to struct ipt_getinfo in include/uapi/linux/netfilter_ipv4/ip_tables.h.
@@ -633,8 +667,8 @@ const (
 	XT_UDP_INV_MASK = 0x03
 )
 
-// IPTOwnerInfo holds data for matching packets with owner. It corresponds
-// to struct ipt_owner_info in libxt_owner.c of iptables binary.
+// IPTOwnerInfo holds data for matching packets with the owner v0 matcher. It
+// corresponds to struct ipt_owner_info in libxt_owner.c of iptables binary.
 //
 // +marshal
 type IPTOwnerInfo struct {
@@ -661,11 +695,29 @@ type IPTOwnerInfo struct {
 	Invert uint8 `marshal:"unaligned"`
 }
 
-// SizeOfIPTOwnerInfo is the size of an XTOwnerMatchInfo.
+// SizeOfIPTOwnerInfo is the size of an IPTOwnerInfo.
 const SizeOfIPTOwnerInfo = 34
 
-// Flags in IPTOwnerInfo.Match. Corresponding constants are in
-// include/uapi/linux/netfilter/xt_owner.h.
+// XTOwnerMatchInfo holds data for matching packets with the owner v1 matcher.
+// It corresponds to struct xt_owner_match_info in
+// include/uapi/linux/netfilter/xt_owner.h
+//
+// +marshal
+type XTOwnerMatchInfo struct {
+	UIDMin uint32
+	UIDMax uint32
+	GIDMin uint32
+	GIDMax uint32
+	Match  uint8
+	Invert uint8
+	_      [2]byte
+}
+
+// SizeOfXTOwnerMatchInfo is the size of an XTOwnerMatchInfo.
+const SizeOfXTOwnerMatchInfo = 20
+
+// Flags in IPTOwnerInfo.Match and XTOwnerMatchInfo.Match. Corresponding
+// constants are in include/uapi/linux/netfilter/xt_owner.h.
 const (
 	// Match the UID of the packet.
 	XT_OWNER_UID = 1 << 0
@@ -675,3 +727,63 @@ const (
 	// packets do not have an associated socket.
 	XT_OWNER_SOCKET = 1 << 2
 )
+
+// XT_MULTI_PORTS is the maximum number of ports that the
+// multiport match can handle.
+const XT_MULTI_PORTS = 15
+
+// Flags in XTMultiport{,V1}.Flags; values from "enum xt_multiport_flags"
+// in "include/uapi/linux/netfilter/xt_multiport.h".
+const (
+	XT_MULTIPORT_SOURCE      uint8 = 0x0 // Match against source ports.
+	XT_MULTIPORT_DESTINATION uint8 = 0x1 // Match against destination ports.
+	XT_MULTIPORT_EITHER      uint8 = 0x2 // Match against either ports.
+)
+
+// XTMultiport holds data for matching packets against a set
+// of ports. It corresponds to "struct xt_multiport" defined
+// in "include/uapi/linux/netfilter/xt_multiport.h".
+//
+// +marshal
+type XTMultiport struct {
+	// Flags indicates whether the match applies to
+	// source ports, destination ports, or either, as
+	// defined by "enum xt_multiport_flags".
+	Flags uint8
+
+	// Count is the number of ports in the "Ports"
+	// slice that the match will check. It must be
+	// between 1 and "XT_MULTI_PORTS" (inclusive).
+	Count uint8
+
+	// Ports is the set of ports that will be matched.
+	// Only the first "Count" entries are considered.
+	Ports [XT_MULTI_PORTS]uint16
+}
+
+// XTMultiportV1 holds data for matching packets against a set
+// of ports. It corresponds to "struct xt_multiport_v1" defined
+// in "include/uapi/linux/netfilter/xt_multiport.h".
+//
+// +marshal
+type XTMultiportV1 struct {
+	// Fields same as "XTMultiport".
+	Flags uint8
+	Count uint8
+	Ports [XT_MULTI_PORTS]uint16
+
+	// Pflags is an array of port-specific flags. Each entry
+	// in "Pflags" corresponds to the port at the same index
+	// in "Ports".
+	Pflags [XT_MULTI_PORTS]uint8
+
+	// Invert is a flag that, if nonzero, indicates
+	// that the match result should be inverted.
+	Invert uint8
+}
+
+// SizeOfXTMultiport is the size of XTMultiport (in bytes).
+const SizeOfXTMultiport = 2 + (XT_MULTI_PORTS * 2)
+
+// SizeOfXTMultiportV1 is the size of XTMultiportV1 (in bytes).
+const SizeOfXTMultiportV1 = SizeOfXTMultiport + XT_MULTI_PORTS + 1

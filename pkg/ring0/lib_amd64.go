@@ -83,6 +83,7 @@ func rdmsr(reg uintptr) uintptr
 var (
 	hasSMEP       bool
 	hasSMAP       bool
+	hasUMIP       bool
 	hasPCID       bool
 	hasXSAVEOPT   bool
 	hasXSAVE      bool
@@ -105,7 +106,9 @@ func Init(fs cpuid.FeatureSet) {
 	if VirtualAddressBits > 48 {
 		VirtualAddressBits = 48
 	}
-	PhysicalAddressBits = uintptr(fs.PhysicalAddressBits())
+	if PhysicalAddressBits == 0 {
+		PhysicalAddressBits = uintptr(fs.PhysicalAddressBits())
+	}
 	UserspaceSize = uintptr(1) << (VirtualAddressBits - 1)
 	MaximumUserAddress = (UserspaceSize - 1) & ^uintptr(hostarch.PageSize-1)
 	KernelStartAddress = ^uintptr(0) - (UserspaceSize - 1)
@@ -113,13 +116,15 @@ func Init(fs cpuid.FeatureSet) {
 	// Initialize all functions.
 	hasSMEP = fs.HasFeature(cpuid.X86FeatureSMEP)
 	hasSMAP = fs.HasFeature(cpuid.X86FeatureSMAP)
+	hasUMIP = fs.HasFeature(cpuid.X86FeatureUMIP)
 	hasPCID = fs.HasFeature(cpuid.X86FeaturePCID)
 	hasXSAVEOPT = fs.UseXsaveopt()
 	hasXSAVE = fs.UseXsave()
 	hasFSGSBASE = fs.HasFeature(cpuid.X86FeatureFSGSBase)
 	validXCR0Mask = uintptr(fs.ValidXCR0Mask())
 	if hasXSAVE {
-		localXCR0 = xgetbv(0)
+		XCR0DisabledMask := uintptr((1 << 9) | (1 << 17) | (1 << 18))
+		localXCR0 = xgetbv(0) &^ XCR0DisabledMask
 	}
 }
 

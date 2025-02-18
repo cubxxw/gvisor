@@ -1,6 +1,6 @@
+load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 load("//tools:defs.bzl", "go_library", "go_test", "most_shards")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
-load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -26,6 +26,13 @@ declare_rwmutex(
     out = "route_mutex.go",
     package = "stack",
     prefix = "route",
+)
+
+declare_rwmutex(
+    name = "bridge_mutex",
+    out = "bridge_mutex.go",
+    package = "stack",
+    prefix = "bridge",
 )
 
 declare_rwmutex(
@@ -184,18 +191,6 @@ go_template_instance(
 )
 
 go_template_instance(
-    name = "gro_packet_list",
-    out = "gro_packet_list.go",
-    package = "stack",
-    prefix = "groPacket",
-    template = "//pkg/ilist:generic_list",
-    types = {
-        "Element": "*groPacket",
-        "Linker": "*groPacket",
-    },
-)
-
-go_template_instance(
     name = "address_state_refs",
     out = "address_state_refs.go",
     package = "stack",
@@ -213,14 +208,14 @@ go_library(
         "address_state_refs.go",
         "addressable_endpoint_state.go",
         "addressable_endpoint_state_mutex.go",
+        "bridge.go",
+        "bridge_mutex.go",
         "bucket_mutex.go",
         "cleanup_endpoints_mutex.go",
         "conn_mutex.go",
         "conn_track_mutex.go",
         "conntrack.go",
         "endpoints_by_nic_mutex.go",
-        "gro.go",
-        "gro_packet_list.go",
         "headertype_string.go",
         "hook_string.go",
         "icmp_rate_limit.go",
@@ -252,12 +247,11 @@ go_library(
         "route.go",
         "route_mutex.go",
         "route_stack_mutex.go",
+        "save_restore.go",
         "stack.go",
-        "stack_global_state.go",
         "stack_mutex.go",
         "stack_options.go",
         "state_conn_mutex.go",
-        "tcp.go",
         "transport_demuxer.go",
         "transport_endpoints_mutex.go",
         "tuple_list.go",
@@ -330,7 +324,6 @@ go_test(
     srcs = [
         "conntrack_test.go",
         "forwarding_test.go",
-        "gro_test.go",
         "iptables_test.go",
         "neighbor_cache_test.go",
         "neighbor_entry_test.go",
@@ -350,5 +343,23 @@ go_test(
         "//pkg/tcpip/transport/tcpconntrack",
         "@com_github_google_go_cmp//cmp:go_default_library",
         "@com_github_google_go_cmp//cmp/cmpopts:go_default_library",
+    ],
+)
+
+go_test(
+    name = "bridge_test",
+    size = "small",
+    srcs = [
+        "bridge_test.go",
+    ],
+    deps = [
+        "//pkg/buffer",
+        "//pkg/refs",
+        "//pkg/tcpip",
+        "//pkg/tcpip/header",
+        "//pkg/tcpip/link/channel",
+        "//pkg/tcpip/link/ethernet",
+        "//pkg/tcpip/link/veth",
+        "//pkg/tcpip/stack",
     ],
 )

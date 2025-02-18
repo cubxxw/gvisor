@@ -49,8 +49,9 @@ go_library(
         "//pkg/sentry/fsmetric",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
-        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/limits",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/state",
         "//pkg/sentry/strace",
         "//pkg/sentry/usage",
@@ -72,7 +73,7 @@ go_test(
     library = ":control",
     deps = [
         "//pkg/log",
-        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/usage",
     ],
 )

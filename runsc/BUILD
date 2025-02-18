@@ -20,10 +20,29 @@ go_binary(
     ],
 )
 
+go_binary(
+    name = "runsc-plugin-stack",
+    srcs = ["main_plugin_stack.go"],
+    gotags = ["network_plugins"],
+    nogo = False,
+    pure = False,
+    static = True,
+    tags = ["network_plugins"],
+    visibility = [
+        "//visibility:public",
+    ],
+    x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
+    deps = [
+        "//pkg/sentry/socket/plugin/stack",
+        "//runsc/cli",
+        "//runsc/version",
+    ],
+)
+
 # The runsc-race target is a race-compatible BUILD target. This must be built
 # via: bazel build --features=race :runsc-race
 #
-# This is neccessary because the race feature must apply to all dependencies
+# This is necessary because the race feature must apply to all dependencies
 # due a bug in gazelle file selection.  The pure attribute must be off because
 # the race detector requires linking with non-Go components, although we still
 # require a static binary.

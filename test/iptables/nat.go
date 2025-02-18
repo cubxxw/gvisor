@@ -50,7 +50,12 @@ func init() {
 	RegisterTestCase(&NATPreRECVORIGDSTADDR{})
 	RegisterTestCase(&NATOutRECVORIGDSTADDR{})
 	RegisterTestCase(&NATPostSNATUDP{})
+	RegisterTestCase(&NATPostSNATUDP{withPort: true})
 	RegisterTestCase(&NATPostSNATTCP{})
+	RegisterTestCase(&NATPostSNATTCP{withPort: true})
+	RegisterTestCase(&NATOutDNAT{})
+	RegisterTestCase(&NATOutDNATAddrOnly{})
+	RegisterTestCase(&NATOutDNATPortOnly{})
 }
 
 // NATPreRedirectUDPPort tests that packets are redirected to different port.
@@ -671,13 +676,19 @@ func listenForRedirectedConn(ctx context.Context, ipv6 bool, originalDsts []net.
 // loopbackTests runs an iptables rule and ensures that packets sent to
 // dest:dropPort are received by localhost:acceptPort.
 func loopbackTest(ctx context.Context, ipv6 bool, dest net.IP, args ...string) error {
+	return loopbackTestPort(ctx, ipv6, dest, dropPort, args...)
+}
+
+// loopbackTests runs an iptables rule and ensures that packets sent to
+// dest:port are received by localhost:acceptPort.
+func loopbackTestPort(ctx context.Context, ipv6 bool, dest net.IP, port int, args ...string) error {
 	if err := natTable(ipv6, args...); err != nil {
 		return err
 	}
 	sendCh := make(chan error, 1)
 	listenCh := make(chan error, 1)
 	go func() {
-		sendCh <- sendUDPLoop(ctx, dest, dropPort, ipv6)
+		sendCh <- sendUDPLoop(ctx, dest, port, ipv6)
 	}()
 	go func() {
 		listenCh <- listenUDP(ctx, acceptPort, ipv6)
@@ -930,23 +941,33 @@ const (
 	snatPort   = 43
 )
 
-// NATPostSNATUDP tests that the source port/IP in the packets are modified as expected.
-type NATPostSNATUDP struct{ localCase }
+// NATPostSNATUDP tests that the source port/IP in the packets are modified as
+// expected. It tests the latest-implemented revision of the SNAT target.
+type NATPostSNATUDP struct {
+	localCase
+	withPort bool
+}
 
 var _ TestCase = (*NATPostSNATUDP)(nil)
 
 // Name implements TestCase.Name.
-func (*NATPostSNATUDP) Name() string {
+func (t *NATPostSNATUDP) Name() string {
+	if t.withPort {
+		return "NATPostSNATUDPWithPort"
+	}
 	return "NATPostSNATUDP"
 }
 
 // ContainerAction implements TestCase.ContainerAction.
-func (*NATPostSNATUDP) ContainerAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+func (t *NATPostSNATUDP) ContainerAction(ctx context.Context, ip net.IP, ipv6 bool) error {
 	var source string
 	if ipv6 {
-		source = fmt.Sprintf("[%s]:%d", snatAddrV6, snatPort)
+		source = fmt.Sprintf("[%s]", snatAddrV6)
 	} else {
-		source = fmt.Sprintf("%s:%d", snatAddrV4, snatPort)
+		source = fmt.Sprintf("%s", snatAddrV4)
+	}
+	if t.withPort {
+		source += fmt.Sprintf(":%d", snatPort)
 	}
 
 	if err := natTable(ipv6, "-A", "POSTROUTING", "-p", "udp", "-j", "SNAT", "--to-source", source); err != nil {
@@ -956,7 +977,7 @@ func (*NATPostSNATUDP) ContainerAction(ctx context.Context, ip net.IP, ipv6 bool
 }
 
 // LocalAction implements TestCase.LocalAction.
-func (*NATPostSNATUDP) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+func (t *NATPostSNATUDP) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) error {
 	remote, err := listenUDPFrom(ctx, acceptPort, ipv6)
 	if err != nil {
 		return err
@@ -970,25 +991,33 @@ func (*NATPostSNATUDP) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) er
 	if got, want := remote.IP, net.ParseIP(snatAddr); !got.Equal(want) {
 		return fmt.Errorf("got remote address = %s, want = %s", got, want)
 	}
-	if got, want := remote.Port, snatPort; got != want {
-		return fmt.Errorf("got remote port = %d, want = %d", got, want)
+	if t.withPort {
+		if got, want := remote.Port, snatPort; got != want {
+			return fmt.Errorf("got remote port = %d, want = %d", got, want)
+		}
 	}
 	return nil
 }
 
 // NATPostSNATTCP tests that the source port/IP in the packets are modified as
-// expected.
-type NATPostSNATTCP struct{ localCase }
+// expected. It tests the latest-implemented revision of the SNAT target.
+type NATPostSNATTCP struct {
+	localCase
+	withPort bool
+}
 
 var _ TestCase = (*NATPostSNATTCP)(nil)
 
 // Name implements TestCase.Name.
-func (*NATPostSNATTCP) Name() string {
+func (t *NATPostSNATTCP) Name() string {
+	if t.withPort {
+		return "NATPostSNATTCPWithPort"
+	}
 	return "NATPostSNATTCP"
 }
 
 // ContainerAction implements TestCase.ContainerAction.
-func (*NATPostSNATTCP) ContainerAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+func (t *NATPostSNATTCP) ContainerAction(ctx context.Context, ip net.IP, ipv6 bool) error {
 	addrs, err := getInterfaceAddrs(ipv6)
 	if err != nil {
 		return err
@@ -997,14 +1026,18 @@ func (*NATPostSNATTCP) ContainerAction(ctx context.Context, ip net.IP, ipv6 bool
 	for _, addr := range addrs {
 		if addr.To4() != nil {
 			if !ipv6 {
-				source = fmt.Sprintf("%s:%d", addr, snatPort)
+				source = fmt.Sprintf("%s", addr)
 			}
 		} else if ipv6 && addr.IsGlobalUnicast() {
-			source = fmt.Sprintf("[%s]:%d", addr, snatPort)
+			source = fmt.Sprintf("[%s]", addr)
 		}
 	}
 	if source == "" {
 		return fmt.Errorf("can't find any interface address to use")
+	}
+
+	if t.withPort {
+		source += fmt.Sprintf(":%d", snatPort)
 	}
 
 	if err := natTable(ipv6, "-A", "POSTROUTING", "-p", "tcp", "-j", "SNAT", "--to-source", source); err != nil {
@@ -1014,7 +1047,7 @@ func (*NATPostSNATTCP) ContainerAction(ctx context.Context, ip net.IP, ipv6 bool
 }
 
 // LocalAction implements TestCase.LocalAction.
-func (*NATPostSNATTCP) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+func (t *NATPostSNATTCP) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) error {
 	remote, err := listenTCPFrom(ctx, acceptPort, ipv6)
 	if err != nil {
 		return err
@@ -1030,8 +1063,89 @@ func (*NATPostSNATTCP) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) er
 	if err != nil {
 		return err
 	}
-	if got, want := int(port), snatPort; got != want {
-		return fmt.Errorf("got remote port = %d, want = %d", got, want)
+	if t.withPort {
+		if got, want := int(port), snatPort; got != want {
+			return fmt.Errorf("got remote port = %d, want = %d", got, want)
+		}
 	}
+	return nil
+}
+
+// NATOutDNAT tests that the source port/IP in the packets are modified as
+// expected. It tests the latest-implemented revision of the DNAT target.
+type NATOutDNAT struct{ containerCase }
+
+var _ TestCase = (*NATOutDNAT)(nil)
+
+// Name implements TestCase.Name.
+func (*NATOutDNAT) Name() string {
+	return "NATOutDNAT"
+}
+
+// ContainerAction implements TestCase.ContainerAction.
+func (*NATOutDNAT) ContainerAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+	dst := nowhereIP(ipv6)
+	return loopbackTest(ctx, ipv6, net.ParseIP(dst),
+		"-A", "OUTPUT",
+		"-d", dst,
+		"-p", "udp", "-m", "udp",
+		"-j", "DNAT", "--to-destination", fmt.Sprintf("127.0.0.1:%d", acceptPort))
+}
+
+// LocalAction implements TestCase.LocalAction.
+func (*NATOutDNAT) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+	return nil
+}
+
+// NATOutDNATAddrOnly tests that the source IP only in the packets are modified
+// as expected. It tests the latest-implemented revision of the DNAT target.
+type NATOutDNATAddrOnly struct{ containerCase }
+
+var _ TestCase = (*NATOutDNATAddrOnly)(nil)
+
+// Name implements TestCase.Name.
+func (*NATOutDNATAddrOnly) Name() string {
+	return "NATOutDNATAddrOnly"
+}
+
+// ContainerAction implements TestCase.ContainerAction.
+func (*NATOutDNATAddrOnly) ContainerAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+	dst := nowhereIP(ipv6)
+	return loopbackTestPort(ctx, ipv6, net.ParseIP(dst), acceptPort,
+		"-A", "OUTPUT",
+		"-d", dst,
+		"-p", "udp", "-m", "udp",
+		"-j", "DNAT", "--to-destination", "127.0.0.1")
+}
+
+// LocalAction implements TestCase.LocalAction.
+func (*NATOutDNATAddrOnly) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+	return nil
+}
+
+// NATOutDNATPortOnly tests that the source port only in the packets are
+// modified as expected. It tests the latest-implemented revision of the DNAT
+// target.
+type NATOutDNATPortOnly struct{ containerCase }
+
+var _ TestCase = (*NATOutDNATPortOnly)(nil)
+
+// Name implements TestCase.Name.
+func (*NATOutDNATPortOnly) Name() string {
+	return "NATOutDNATPortOnly"
+}
+
+// ContainerAction implements TestCase.ContainerAction.
+func (*NATOutDNATPortOnly) ContainerAction(ctx context.Context, ip net.IP, ipv6 bool) error {
+	const dst = "127.0.0.1"
+	return loopbackTest(ctx, ipv6, net.ParseIP(dst),
+		"-A", "OUTPUT",
+		"-d", dst,
+		"-p", "udp", "-m", "udp",
+		"-j", "DNAT", "--to-destination", fmt.Sprintf(":%d", acceptPort))
+}
+
+// LocalAction implements TestCase.LocalAction.
+func (*NATOutDNATPortOnly) LocalAction(ctx context.Context, ip net.IP, ipv6 bool) error {
 	return nil
 }

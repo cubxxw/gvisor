@@ -45,12 +45,12 @@ struct context_queue {
   uint32_t start;
   uint32_t end;
   uint32_t num_active_threads;
+  uint32_t num_spinning_threads;
   uint32_t num_threads_to_wakeup;
   uint32_t num_active_contexts;
   uint32_t num_awake_contexts;
-  uint64_t fast_path_disalbed_ts;
-  uint32_t fast_path_failed_in_row;
   uint32_t fast_path_disabled;
+  uint32_t used_fast_path;
   uint64_t ringbuffer[MAX_CONTEXT_QUEUE_ENTRIES];
 };
 
@@ -108,46 +108,61 @@ void memcpy(uint8_t *dest, uint8_t *src, size_t n) {
 //
 // This queue is lock-less to be sure that any thread scheduled out
 // from CPU doesn't block others.
-#define SPINNING_QUEUE_SIZE 128
+//
+// The size of the queue must be a divisor of 2^32, because queue indexes are
+// calculated as modules of uint32 values.
+#define SPINNING_QUEUE_SIZE 256
 
-// MAX_SPINNING_THREADS is half of SPINNING_QUEUE_SIZE to be sure that the tail
-// doesn't catch the head. More details are in spinning_queue_remove_first.
-#define MAX_SPINNING_THREADS (SPINNING_QUEUE_SIZE / 2)
+// MAX_RE_ENQUEUE defines the amount of time a given entry in the spinning queue
+// needs to reach timeout in order to be removed. Re-enqueuing a timeout is done
+// in order to mitigate rdtsc inaccuracies.
+#define MAX_RE_ENQUEUE 2
+
 struct spinning_queue {
+  uint32_t len;
   uint32_t start;
   uint32_t end;
   uint64_t start_times[SPINNING_QUEUE_SIZE];
+  uint8_t num_times_re_enqueued[SPINNING_QUEUE_SIZE];
 };
 
 struct spinning_queue *__export_spinning_queue_addr;
 
 // spinning_queue_push adds a new thread to the queue. It returns false if the
-// queue if full.
-static bool spinning_queue_push() __attribute__((warn_unused_result));
-static bool spinning_queue_push(void) {
+// queue is full, or if re_enqueue_times has reached MAX_RE_ENQUEUE.
+static bool spinning_queue_push(uint8_t re_enqueue_times)
+    __attribute__((warn_unused_result));
+static bool spinning_queue_push(uint8_t re_enqueue_times) {
   struct spinning_queue *queue = __export_spinning_queue_addr;
-  uint32_t idx, start, end;
+  uint32_t idx, end, len;
 
   BUILD_BUG_ON(sizeof(struct spinning_queue) > SPINNING_QUEUE_MEM_SIZE);
-
-  end = atomic_add(&queue->end, 1);
-  start = atomic_load(&queue->start);
-  if (end - start > MAX_SPINNING_THREADS) {
-    atomic_sub(&queue->end, 1);
+  if (re_enqueue_times >= MAX_RE_ENQUEUE) {
     return false;
   }
 
+  len = atomic_add(&queue->len, 1);
+  if (len > SPINNING_QUEUE_SIZE) {
+    atomic_sub(&queue->len, 1);
+    return false;
+  }
+  end = atomic_add(&queue->end, 1);
+
   idx = end - 1;
+  atomic_store(&queue->num_times_re_enqueued[idx % SPINNING_QUEUE_SIZE],
+               re_enqueue_times);
   atomic_store(&queue->start_times[idx % SPINNING_QUEUE_SIZE], rdtsc());
   return true;
 }
 
 // spinning_queue_pop() removes one thread from a queue that has been spinning
 // the shortest time.
+// However it doesn't take into account the spinning re-enqueue.
 static void spinning_queue_pop() {
   struct spinning_queue *queue = __export_spinning_queue_addr;
 
   atomic_sub(&queue->end, 1);
+  atomic_sub(&queue->len, 1);
 }
 
 // spinning_queue_remove_first removes one thread from a queue that has been
@@ -161,24 +176,29 @@ static bool spinning_queue_remove_first(uint64_t timeout)
 static bool spinning_queue_remove_first(uint64_t timeout) {
   struct spinning_queue *queue = __export_spinning_queue_addr;
   uint64_t ts;
-  uint32_t idx;
+  uint8_t re_enqueue = 0;
 
   while (1) {
-    idx = atomic_load(&queue->start);
-    ts = atomic_load(&queue->start_times[idx % SPINNING_QUEUE_SIZE]);
-    if (ts == 0 && timeout == 0) continue;
-    if (ts == 0 || rdtsc() - ts < timeout) return false;
+    uint32_t idx, qidx;
 
-    // The current thread is still in a queue and the length of the queue is
-    // twice of the maximum number of threads, so we can zero the element and be
-    // sure that nobody is trying to set it in a  non-zero value.
-    atomic_store(&queue->start_times[idx % SPINNING_QUEUE_SIZE], 0);
-    if (atomic_compare_exchange(&queue->start, &idx, idx + 1)) {
+    idx = atomic_load(&queue->start);
+    qidx = idx % SPINNING_QUEUE_SIZE;
+    ts = atomic_load(&queue->start_times[qidx]);
+
+    if (ts == 0) continue;
+    if (rdtsc() - ts < timeout) return false;
+    if (idx != atomic_load(&queue->start)) continue;  // Lose the race.
+
+    re_enqueue = atomic_load(&queue->num_times_re_enqueued[qidx]);
+    if (atomic_compare_exchange(&queue->start_times[qidx], &ts, 0)) {
+      atomic_add(&queue->start, 1);
       break;
     }
   }
 
-  return true;
+  atomic_sub(&queue->len, 1);
+  if (timeout == 0) return true;
+  return !spinning_queue_push(re_enqueue + 1);
 }
 
 struct thread_context *queue_get_context(struct sysmsg *sysmsg) {
@@ -206,19 +226,16 @@ struct thread_context *queue_get_context(struct sysmsg *sysmsg) {
 
     atomic_add(&queue->start, 1);
     if (context_id > MAX_GUEST_CONTEXTS) {
-      panic(context_id);
+      panic(STUB_ERROR_BAD_CONTEXT_ID, context_id);
     }
     struct thread_context *ctx = thread_context_addr(context_id);
     sysmsg->context = ctx;
-    atomic_store(&ctx->acked, 1);
+    atomic_store(&ctx->acked_time, rdtsc());
     atomic_store(&ctx->thread_id, sysmsg->thread_id);
     return ctx;
   }
   return NULL;
 }
-
-#define FAILED_FAST_PATH_LIMIT 5
-#define FAILED_FAST_PATH_TIMEOUT 20000000  // 10ms
 
 // get_context_fast sets nr_active_threads_p only if it deactivates the thread.
 static struct thread_context *get_context_fast(struct sysmsg *sysmsg,
@@ -226,20 +243,21 @@ static struct thread_context *get_context_fast(struct sysmsg *sysmsg,
                                                uint32_t *nr_active_threads_p) {
   uint32_t nr_active_threads, nr_awake_contexts;
 
-  if (!spinning_queue_push()) return NULL;
+  if (!spinning_queue_push(0)) return NULL;
+  atomic_store(&queue->used_fast_path, 1);
 
   while (1) {
     struct thread_context *ctx;
 
     ctx = queue_get_context(sysmsg);
     if (ctx) {
-      atomic_store(&queue->fast_path_failed_in_row, 0);
       spinning_queue_pop();
       return ctx;
     }
 
     if (atomic_load(&queue->fast_path_disabled) != 0) {
-      if (!spinning_queue_remove_first(0)) panic(0);
+      if (!spinning_queue_remove_first(0))
+        panic(STUB_ERROR_SPINNING_QUEUE_DECREF, 0);
       break;
     }
 
@@ -250,17 +268,14 @@ static struct thread_context *get_context_fast(struct sysmsg *sysmsg,
       if (atomic_compare_exchange(&queue->num_active_threads,
                                   &nr_active_threads, nr_active_threads - 1)) {
         nr_active_threads -= 1;
-        if (!spinning_queue_remove_first(0)) panic(0);
+        if (!spinning_queue_remove_first(0))
+          panic(STUB_ERROR_SPINNING_QUEUE_DECREF, 0);
         *nr_active_threads_p = nr_active_threads;
         break;
       }
     }
 
     if (spinning_queue_remove_first(__export_deep_sleep_timeout)) {
-      uint32_t nr = atomic_add(&queue->fast_path_failed_in_row, 1);
-      if (nr >= FAILED_FAST_PATH_LIMIT) {
-        atomic_store(&queue->fast_path_disalbed_ts, rdtsc());
-      }
       break;
     }
     spinloop();
@@ -295,41 +310,29 @@ struct thread_context *get_context(struct sysmsg *sysmsg) {
   struct context_queue *queue = __export_context_queue_addr;
   uint32_t nr_active_threads;
 
+  struct thread_context *ctx;
   for (;;) {
-    struct thread_context *ctx;
+    atomic_add(&queue->num_spinning_threads, 1);
 
     // Change sysmsg thread state just to indicate thread is not asleep.
     atomic_store(&sysmsg->state, THREAD_STATE_PREP);
     ctx = queue_get_context(sysmsg);
     if (ctx) {
-      atomic_store(&queue->fast_path_failed_in_row, 0);
-      return ctx;
+      goto exit;
     }
 
-    uint64_t slow_path_ts = atomic_load(&queue->fast_path_disalbed_ts);
-    bool fast_path_enabled = true;
-
-    if (!slow_path_ts) {
-      if (rdtsc() - slow_path_ts > FAILED_FAST_PATH_TIMEOUT) {
-        atomic_store(&queue->fast_path_failed_in_row, 0);
-        atomic_store(&queue->fast_path_disalbed_ts, 0);
-      } else {
-        fast_path_enabled = false;
-      }
-    }
-    if (atomic_load(&queue->fast_path_disabled) != 0) {
-      fast_path_enabled = false;
-    }
+    bool fast_path_enabled = atomic_load(&queue->fast_path_disabled) == 0;
 
     nr_active_threads = NR_IF_THREAD_IS_ACTIVE;
     if (fast_path_enabled) {
       ctx = get_context_fast(sysmsg, queue, &nr_active_threads);
-      if (ctx) return ctx;
+      if (ctx) goto exit;
     }
     if (nr_active_threads == NR_IF_THREAD_IS_ACTIVE) {
       nr_active_threads = atomic_sub(&queue->num_active_threads, 1);
     }
 
+    atomic_sub(&queue->num_spinning_threads, 1);
     atomic_store(&sysmsg->state, THREAD_STATE_ASLEEP);
     uint32_t nr_active_contexts = atomic_load(&queue->num_active_contexts);
     // We have to make another attempt to get a context here to prevent TOCTTOU
@@ -360,6 +363,9 @@ struct thread_context *get_context(struct sysmsg *sysmsg) {
       }
     }
   }
+exit:
+  atomic_sub(&queue->num_spinning_threads, 1);
+  return ctx;
 }
 
 // switch_context signals the sentry that the old context is ready to be worked
@@ -373,11 +379,12 @@ struct thread_context *switch_context(struct sysmsg *sysmsg,
     atomic_sub(&queue->num_active_contexts, 1);
     atomic_store(&ctx->thread_id, INVALID_THREAD_ID);
     atomic_store(&ctx->last_thread_id, sysmsg->thread_id);
+    atomic_store(&ctx->state_changed_time, rdtsc());
     atomic_store(&ctx->state, new_context_state);
     if (atomic_load(&ctx->sentry_fast_path) == 0) {
       int ret = sys_futex(&ctx->state, FUTEX_WAKE, 1, NULL, NULL, 0);
       if (ret < 0) {
-        panic(ret);
+        panic(STUB_ERROR_FUTEX, ret);
       }
     }
   }

@@ -97,7 +97,7 @@ func (m *fakeMulticastEventDispatcher) OnUnexpectedInputInterface(context stack.
 var (
 	v4Addrs = map[addrType]tcpip.Address{
 		anyAddr:                header.IPv4Any,
-		emptyAddr:              tcpip.Address{},
+		emptyAddr:              {},
 		linkLocalMulticastAddr: testutil.MustParse4("224.0.0.1"),
 		linkLocalUnicastAddr:   testutil.MustParse4("169.254.0.10"),
 		multicastAddr:          testutil.MustParse4("225.0.0.0"),
@@ -107,7 +107,7 @@ var (
 
 	v6Addrs = map[addrType]tcpip.Address{
 		anyAddr:                header.IPv6Any,
-		emptyAddr:              tcpip.Address{},
+		emptyAddr:              {},
 		linkLocalMulticastAddr: testutil.MustParse6("ff02::a"),
 		linkLocalUnicastAddr:   testutil.MustParse6("fe80::a"),
 		multicastAddr:          testutil.MustParse6("ff0e::a"),
@@ -164,7 +164,7 @@ func getEndpointAddr(protocol tcpip.NetworkProtocolNumber, addrType endpointAddr
 	}
 }
 
-func checkEchoRequest(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr, srcAddr, dstAddr tcpip.Address, ttl uint8) {
+func checkEchoRequest(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer, srcAddr, dstAddr tcpip.Address, ttl uint8) {
 	payload := stack.PayloadSince(pkt.NetworkHeader())
 	defer payload.Release()
 	switch protocol {
@@ -191,7 +191,7 @@ func checkEchoRequest(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt st
 	}
 }
 
-func checkEchoReply(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr, srcAddr, dstAddr tcpip.Address) {
+func checkEchoReply(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer, srcAddr, dstAddr tcpip.Address) {
 	payload := stack.PayloadSince(pkt.NetworkHeader())
 	defer payload.Release()
 	switch protocol {
@@ -462,7 +462,7 @@ func TestAddMulticastRoute(t *testing.T) {
 						injectPacket(incomingEp, protocol, srcAddr, dstAddr, packetTTL)
 						p := incomingEp.Read()
 
-						if !p.IsNil() {
+						if p != nil {
 							// An ICMP error should never be sent in response to a multicast packet.
 							t.Fatalf("got incomingEp.Read() = %#v, want = nil", p)
 						}
@@ -501,7 +501,7 @@ func TestAddMulticastRoute(t *testing.T) {
 
 				p := outgoingEp.Read()
 
-				if (!p.IsNil()) != test.expectForward {
+				if (p != nil) != test.expectForward {
 					t.Fatalf("got outgoingEp.Read() = %#v, want = (_ == nil) = %t", p, test.expectForward)
 				}
 
@@ -697,7 +697,7 @@ func TestMulticastRouteLastUsedTime(t *testing.T) {
 				injectPacket(incomingEp, protocol, srcAddr, dstAddr, packetTTL)
 				p := incomingEp.Read()
 
-				if !p.IsNil() {
+				if p != nil {
 					t.Fatalf("Expected no ICMP packet through incoming NIC, instead found: %#v", p)
 				}
 
@@ -861,7 +861,7 @@ func TestRemoveMulticastRoute(t *testing.T) {
 				injectPacket(incomingEp, protocol, srcAddr, dstAddr, packetTTL)
 				p := incomingEp.Read()
 
-				if !p.IsNil() {
+				if p != nil {
 					// An ICMP error should never be sent in response to a multicast
 					// packet.
 					t.Errorf("expected no ICMP packet through incoming NIC, instead found: %#v", p)
@@ -877,7 +877,7 @@ func TestRemoveMulticastRoute(t *testing.T) {
 				// If the route was successfully removed, then the packet should not be
 				// forwarded.
 				expectForward := test.wantErr != nil
-				if (!p.IsNil()) != expectForward {
+				if (p != nil) != expectForward {
 					t.Fatalf("got outgoingEp.Read() = %#v, want = (_ == nil) = %t", p, expectForward)
 				}
 
@@ -1138,7 +1138,7 @@ func TestMulticastForwarding(t *testing.T) {
 				injectPacket(incomingEp, protocol, srcAddr, dstAddr, test.ttl)
 				p := incomingEp.Read()
 
-				if !p.IsNil() {
+				if p != nil {
 					// An ICMP error should never be sent in response to a multicast packet.
 					t.Fatalf("expected no ICMP packet through incoming NIC, instead found: %#v", p)
 				}
@@ -1153,7 +1153,7 @@ func TestMulticastForwarding(t *testing.T) {
 
 					expectForward := contains(nicID, test.expectedForwardingInterfaces)
 
-					if (!p.IsNil()) != expectForward {
+					if (p != nil) != expectForward {
 						t.Fatalf("got outgoingEp.Read() = %#v, want = (_ == nil) = %t", p, expectForward)
 					}
 
@@ -1170,7 +1170,7 @@ func TestMulticastForwarding(t *testing.T) {
 
 				p = otherEp.Read()
 
-				if (!p.IsNil()) != test.joinMulticastGroup {
+				if (p != nil) != test.joinMulticastGroup {
 					t.Fatalf("got otherEp.Read() = %#v, want = (_ == nil) = %t", p, test.joinMulticastGroup)
 				}
 

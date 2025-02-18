@@ -234,18 +234,20 @@ func (b *Bundle) Execute(ctx context.Context, fs *flag.FlagSet, args ...any) sub
 	// Perform the analysis.
 	if err := b.execute(func() (check.FindingSet, facts.Serializer, error) {
 		// Discover the correct common root.
-		srcRootPrefix, err := check.FindRoot(fs.Args(), b.Root)
+		srcRootPrefixes, err := check.FindRoots(fs.Args(), b.Root)
 		if err != nil {
 			return nil, nil, err
 		}
 		// Split into packages.
 		sources := make(map[string][]string)
-		for pkg, srcs := range check.SplitPackages(fs.Args(), srcRootPrefix) {
-			path := pkg
-			if b.Prefix != "" {
-				path = b.Prefix + "/" + path // Subpackage.
+		for _, srcRootPrefix := range srcRootPrefixes {
+			for pkg, srcs := range check.SplitPackages(fs.Args(), srcRootPrefix) {
+				path := pkg
+				if b.Prefix != "" {
+					path = b.Prefix + "/" + path // Subpackage.
+				}
+				sources[path] = append(sources[path], srcs...)
 			}
-			sources[path] = append(sources[path], srcs...)
 		}
 		return check.Bundle(sources)
 	}); err != nil {
@@ -275,7 +277,7 @@ func (*Stdlib) Usage() string {
 	return `stdlib
 
 	Generates facts and findings for the standard library. This wraps
-	bundle with a mechansim that discovers the standard library source.
+	bundle with a mechanism that discovers the standard library source.
 
 `
 }
@@ -399,7 +401,7 @@ func loadConfigs(filenames []string) (*config.Config, error) {
 
 // Execute implements subcommands.Command.Execute.
 func (f *Filter) Execute(ctx context.Context, fs *flag.FlagSet, args ...any) subcommands.ExitStatus {
-	// Open and merge all configuations.
+	// Open and merge all configurations.
 	config, err := loadConfigs(f.Configs)
 	if err != nil {
 		return failure("unable to load configurations: %v", err)

@@ -1,6 +1,6 @@
+load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
-load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 
 package(default_applicable_licenses = ["//:license"])
 
@@ -26,6 +26,7 @@ go_template_instance(
     template = "//pkg/sentry/vfs/genericfstree:generic_fstree",
     types = {
         "Dentry": "Dentry",
+        "Filesystem": "Filesystem",
     },
 )
 
@@ -86,10 +87,10 @@ go_template_instance(
 )
 
 declare_rwmutex(
-    name = "filesystem_mutex",
-    out = "filesystem_mutex.go",
+    name = "ancestry_mutex",
+    out = "ancestry_mutex.go",
     package = "kernfs",
-    prefix = "filesystem",
+    prefix = "ancestry",
 )
 
 declare_mutex(
@@ -99,9 +100,17 @@ declare_mutex(
     prefix = "deferredDecRefs",
 )
 
+declare_rwmutex(
+    name = "filesystem_mutex",
+    out = "filesystem_mutex.go",
+    package = "kernfs",
+    prefix = "filesystem",
+)
+
 go_library(
     name = "kernfs",
     srcs = [
+        "ancestry_mutex.go",
         "deferred_dec_refs_mutex.go",
         "dentry_list.go",
         "dynamic_bytes_file.go",
@@ -133,7 +142,7 @@ go_library(
         "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/fsutil",
         "//pkg/sentry/kernel/auth",
-        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/memmap",
         "//pkg/sentry/socket/unix/transport",
         "//pkg/sentry/vfs",

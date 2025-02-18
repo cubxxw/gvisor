@@ -26,13 +26,14 @@ package analysis
 
 import (
 	"fmt"
-	"math/rand"
 	"reflect"
 	"testing"
 	"unsafe"
+
+	"gvisor.dev/gvisor/pkg/rand"
 )
 
-// RandomizeValue assigns random value(s) to an abitrary type. This is intended
+// RandomizeValue assigns random value(s) to an arbitrary type. This is intended
 // for used with ABI structs from go_marshal, meaning the typical restrictions
 // apply (fixed-size types, no pointers, maps, channels, etc), and should only
 // be used on zeroed values to avoid overwriting pointers to active go objects.
@@ -81,9 +82,7 @@ func RandomizeValue(x any) {
 // This is used for zeroing padding fields after calling RandomizeValue.
 func reflectZeroPaddingFields(r reflect.Type, data []byte, zero bool) {
 	if zero {
-		for i := range data {
-			data[i] = 0
-		}
+		clear(data)
 	}
 	switch r.Kind() {
 	case reflect.Int8, reflect.Uint8, reflect.Int16, reflect.Uint16, reflect.Int32, reflect.Uint32, reflect.Int64, reflect.Uint64:
@@ -165,7 +164,7 @@ func AlignmentCheck(t *testing.T, typ reflect.Type) (ok bool, delta uint64) {
 				// Final field explicitly marked unaligned.
 				break
 			}
-			t.Fatalf("Suspect offset for field %s.%s at the end of %s, detected an implicit %d byte padding from offset %d to %d at the end of the struct; either add %d bytes of explict padding at end of the struct or tag the final field %s as `marshal:\"unaligned\"`.",
+			t.Fatalf("Suspect offset for field %s.%s at the end of %s, detected an implicit %d byte padding from offset %d to %d at the end of the struct; either add %d bytes of explicit padding at end of the struct or tag the final field %s as `marshal:\"unaligned\"`.",
 				typ.Name(), f.Name, typ.Name(), implicitPad, nextXOff, typ.Size(), implicitPad, f.Name)
 		}
 	case reflect.Array:

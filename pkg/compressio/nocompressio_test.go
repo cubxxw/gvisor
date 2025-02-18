@@ -18,14 +18,10 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"math/rand"
 	"testing"
-	"time"
 )
 
 func TestNoCompress(t *testing.T) {
-	rand.Seed(time.Now().Unix())
-
 	var (
 		data  = initTest(t, 10*1024*1024)
 		data0 = data[:0]
@@ -53,11 +49,11 @@ func TestNoCompress(t *testing.T) {
 					doTest(t, testOpts{
 						Name: fmt.Sprintf("len(data)=%d, blockSize=%d, key=%s, corruptData=%v", len(data), blockSize, string(key), corruptData),
 						Data: data,
-						NewWriter: func(b *bytes.Buffer) (io.Writer, error) {
-							return NewSimpleWriter(b, key)
+						NewWriter: func(b *bytes.Buffer) (io.WriteCloser, error) {
+							return NewSimpleWriter(b, key, blockSize), nil
 						},
 						NewReader: func(b *bytes.Buffer) (io.Reader, error) {
-							return NewSimpleReader(b, key)
+							return NewSimpleReader(b, key), nil
 						},
 						CorruptData: corruptData,
 					})
@@ -65,4 +61,31 @@ func TestNoCompress(t *testing.T) {
 			}
 		}
 	}
+}
+
+// The following benchmarks aims to be representative of how the wire
+// package writes to the image. In practice, wire package only calls Write
+// with very small buffers. Because all types boil down to wire.Uint whose
+// implementation invokes Write with at most 10 bytes at a time.
+
+func BenchmarkTinyIO(b *testing.B) {
+	// Use the same chunk size as the statefile package.
+	const blockSize = 1024 * 1024
+	for _, key := range [][]byte{nil, hashKey} {
+		b.Run(benchmarkName(false, true, key != nil, blockSize), func(b *testing.B) {
+			benchmarkNoCompress8ByteWrite(b, key, blockSize)
+		})
+	}
+}
+
+func benchmarkNoCompress8ByteWrite(b *testing.B, key []byte, blockSize uint32) {
+	var (
+		buf [8]byte
+		out bytes.Buffer
+	)
+	w := NewSimpleWriter(&out, key, blockSize)
+	for i := 0; i < b.N; i++ {
+		w.Write(buf[:])
+	}
+	w.Close()
 }

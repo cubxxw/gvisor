@@ -19,22 +19,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/docker/docker/api/types/mount"
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 )
-
-func init() {
-	rand.Seed(int64(time.Now().Nanosecond()))
-}
 
 func TestMain(m *testing.M) {
 	dockerutil.EnsureSupportedDockerVersion()
@@ -91,9 +85,9 @@ func TestFsstressGofer(t *testing.T) {
 }
 
 func TestFsstressGoferShared(t *testing.T) {
-	dir, err := ioutil.TempDir(testutil.TmpDir(), "fsstress")
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "fsstress")
 	if err != nil {
-		t.Fatalf("ioutil.TempDir() failed: %v", err)
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
 	}
 	defer os.RemoveAll(dir)
 

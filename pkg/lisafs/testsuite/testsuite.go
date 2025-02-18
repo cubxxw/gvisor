@@ -19,8 +19,6 @@ package testsuite
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
-	"math/rand"
 	"os"
 	"testing"
 	"time"
@@ -30,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/lisafs"
+	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/unet"
 )
@@ -46,12 +45,15 @@ type Tester interface {
 	// SetUserGroupIDSupported returns true if the backing server supports
 	// changing UID/GID for files.
 	SetUserGroupIDSupported() bool
+
+	// BindSupported returns true if the backing server supports BindAt.
+	BindSupported() bool
 }
 
 // RunAllLocalFSTests runs all local FS tests as subtests.
 func RunAllLocalFSTests(t *testing.T, tester Tester) {
 	for name, testFn := range localFSTests {
-		mountPath, err := ioutil.TempDir(os.Getenv("TEST_TMPDIR"), "")
+		mountPath, err := os.MkdirTemp(os.Getenv("TEST_TMPDIR"), "")
 		if err != nil {
 			t.Fatalf("creation of temporary mountpoint failed: %v", err)
 		}
@@ -540,7 +542,7 @@ func testWalk(ctx context.Context, t *testing.T, tester Tester, root lisafs.Clie
 		closeFD(ctx, t, root.Client().NewFD(inode.ControlFD))
 	}
 
-	// Test WalkStat which additonally returns Statx for root because the first
+	// Test WalkStat which additionally returns Statx for root because the first
 	// path component is "".
 	dirNames = append([]string{""}, dirNames...)
 	gotStats := walkStat(ctx, t, root, dirNames)
@@ -606,6 +608,9 @@ func testMknod(ctx context.Context, t *testing.T, tester Tester, root lisafs.Cli
 }
 
 func testUDS(ctx context.Context, t *testing.T, tester Tester, root lisafs.ClientFD) {
+	if !tester.BindSupported() {
+		t.Skipf("server does not support BindAt RPC")
+	}
 	const name = "sock"
 	file, socket, stat := bind(ctx, t, root, name, unix.SOCK_STREAM)
 	defer closeFD(ctx, t, file)

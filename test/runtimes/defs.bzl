@@ -1,6 +1,6 @@
 """Defines a rule for runtime test targets."""
 
-load("//tools:defs.bzl", "go_test")
+load("//tools:defs.bzl", "go_test", "local_test_tags")
 
 def _runtime_test_impl(ctx):
     # Construct arguments.
@@ -63,6 +63,12 @@ _runtime_test = rule(
             executable = True,
             cfg = "target",
         ),
+        # runsc is needed to invalidate the bazel cache in case of any code changes.
+        "_runsc": attr.label(
+            default = "//runsc:runsc",
+            executable = True,
+            cfg = "target",
+        ),
     },
     test = True,
 )
@@ -72,9 +78,9 @@ def runtime_test(name, **kwargs):
         name = name,
         image = name,  # Resolved as images/runtimes/%s.
         tags = [
-            "local",
+            "no-sandbox",
             "manual",
-        ],
+        ] + local_test_tags,
         **kwargs
     )
 

@@ -19,6 +19,8 @@
 #include <linux/if.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <linux/veth.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -107,7 +109,7 @@ INSTANTIATE_TEST_SUITE_P(
                         absl::StrFormat("NETLINK_ROUTE (%d)", NETLINK_ROUTE)),
         std::make_tuple(SO_PASSCRED, IsEqual(0), "0")));
 
-// Validates the reponses to RTM_GETLINK + NLM_F_DUMP.
+// Validates the responses to RTM_GETLINK + NLM_F_DUMP.
 void CheckGetLinkResponse(const struct nlmsghdr* hdr, int seq, int port) {
   EXPECT_THAT(hdr->nlmsg_type, AnyOf(Eq(RTM_NEWLINK), Eq(NLMSG_DONE)));
 
@@ -160,11 +162,23 @@ void CheckLinkMsg(const struct nlmsghdr* hdr, const Link& link) {
       reinterpret_cast<const struct ifinfomsg*>(NLMSG_DATA(hdr));
   EXPECT_EQ(msg->ifi_index, link.index);
 
-  const struct rtattr* rta = FindRtAttr(hdr, msg, IFLA_IFNAME);
-  EXPECT_NE(nullptr, rta) << "IFLA_IFNAME not found in message.";
-  if (rta != nullptr) {
-    std::string name(reinterpret_cast<const char*>(RTA_DATA(rta)));
+  const struct rtattr* rta_name = FindRtAttr(hdr, msg, IFLA_IFNAME);
+  EXPECT_NE(nullptr, rta_name) << "IFLA_IFNAME not found in message.";
+  if (rta_name != nullptr) {
+    std::string name(reinterpret_cast<const char*>(RTA_DATA(rta_name)));
     EXPECT_EQ(name, link.name);
+  }
+  const struct rtattr* rta_mtu = FindRtAttr(hdr, msg, IFLA_MTU);
+  EXPECT_NE(nullptr, rta_mtu) << "IFLA_MTU not found in message.";
+  if (rta_mtu != nullptr) {
+    const auto mtu = *(uint32_t*)(RTA_DATA(rta_mtu));
+    EXPECT_EQ(mtu, link.mtu);
+  }
+  const struct rtattr* rta_address = FindRtAttr(hdr, msg, IFLA_ADDRESS);
+  EXPECT_NE(nullptr, rta_address) << "IFLA_ADDRESS not found in message.";
+  if (rta_address != nullptr) {
+    std::string address(reinterpret_cast<const char*>(RTA_DATA(rta_address)));
+    EXPECT_EQ(address, link.address);
   }
 }
 
@@ -196,6 +210,213 @@ TEST(NetlinkRouteTest, GetLinkByIndex) {
       },
       false));
   EXPECT_TRUE(found) << "Netlink response does not contain any links.";
+}
+
+// NetlinkRouteTest with a single parameter that must be RTM_NEWLINK or
+// RTM_SETLINK.
+using NetlinkSetLinkTest = ::testing::TestWithParam<int>;
+
+INSTANTIATE_TEST_SUITE_P(_, NetlinkSetLinkTest,
+                         ::testing::Values(RTM_NEWLINK, RTM_SETLINK));
+
+TEST_P(NetlinkSetLinkTest, ChangeLinkName) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  SKIP_IF(IsRunningWithHostinet());
+  // Hosts that run with old kernel allow renaming only when
+  // the interface is down. The restriction has been removed.
+  SKIP_IF(!IsRunningOnGvisor());
+  Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  struct request {
+    struct nlmsghdr hdr;
+    struct ifinfomsg ifm;
+    struct rtattr rtattr;
+    char ifname[IFNAMSIZ];
+    char pad[NLMSG_ALIGNTO + RTA_ALIGNTO];
+  };
+
+  const std::string new_linkname = "notloopback";
+
+  // Change the link name.
+  struct request req = {};
+  req.hdr.nlmsg_len = sizeof(req);
+  req.hdr.nlmsg_type = GetParam();
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  req.hdr.nlmsg_seq = kSeq;
+  req.ifm.ifi_family = AF_UNSPEC;
+  req.ifm.ifi_index = loopback_link.index;
+  req.rtattr.rta_type = IFLA_IFNAME;
+  req.rtattr.rta_len = RTA_LENGTH(new_linkname.size() + 1);
+  strncpy(req.ifname, new_linkname.c_str(), sizeof(req.ifname));
+  req.hdr.nlmsg_len =
+      NLMSG_LENGTH(sizeof(req.ifm)) + NLMSG_ALIGN(req.rtattr.rta_len);
+  EXPECT_NO_ERRNO(NetlinkRequestAckOrError(fd, kSeq, &req, sizeof(req)));
+
+  // Search the link by the new name.
+  loopback_link.name = new_linkname;
+  req.hdr.nlmsg_type = RTM_GETLINK;
+  req.ifm.ifi_index = 0;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST;
+  req.rtattr.rta_type = IFLA_IFNAME;
+  req.rtattr.rta_len = RTA_LENGTH(new_linkname.size() + 1);
+  strncpy(req.ifname, new_linkname.c_str(), sizeof(req.ifname));
+  req.hdr.nlmsg_len =
+      NLMSG_LENGTH(sizeof(req.ifm)) + NLMSG_ALIGN(req.rtattr.rta_len);
+
+  bool found = false;
+  ASSERT_NO_ERRNO(NetlinkRequestResponse(
+      fd, &req, sizeof(req),
+      [&](const struct nlmsghdr* hdr) {
+        CheckLinkMsg(hdr, loopback_link);
+        found = true;
+      },
+      false));
+  EXPECT_TRUE(found) << "Netlink response does not contain any links.";
+}
+
+TEST_P(NetlinkSetLinkTest, ChangeMTU) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  SKIP_IF(IsRunningWithHostinet());
+  SKIP_IF(!IsRunningOnGvisor());
+  Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  struct request {
+    struct nlmsghdr hdr;
+    struct ifinfomsg ifm;
+    struct rtattr rtattr;
+    uint32_t mtu;
+  } req = {};
+
+  // Change the MTU.
+  req.hdr.nlmsg_len = sizeof(req);
+  req.hdr.nlmsg_type = GetParam();
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  req.hdr.nlmsg_seq = kSeq;
+  req.ifm.ifi_family = AF_UNSPEC;
+  req.ifm.ifi_index = loopback_link.index;
+  req.rtattr.rta_type = IFLA_MTU;
+  req.rtattr.rta_len = RTA_LENGTH(sizeof(uint32_t));
+  req.mtu = loopback_link.mtu + 10;
+  EXPECT_NO_ERRNO(NetlinkRequestAckOrError(fd, kSeq, &req, sizeof(req)));
+
+  // Update the local loopback_link's MTU to the requested value.
+  loopback_link.mtu = req.mtu;
+  // Verify the new MTU.
+  struct searchrequest {
+    struct nlmsghdr hdr;
+    struct ifinfomsg ifm;
+  } search = {};
+  search.hdr.nlmsg_len = sizeof(search);
+  search.hdr.nlmsg_type = RTM_GETLINK;
+  search.hdr.nlmsg_flags = NLM_F_REQUEST;
+  search.hdr.nlmsg_seq = kSeq;
+  search.ifm.ifi_family = AF_UNSPEC;
+  search.ifm.ifi_index = loopback_link.index;
+
+  bool found = false;
+  ASSERT_NO_ERRNO(NetlinkRequestResponse(
+      fd, &search, sizeof(search),
+      [&](const struct nlmsghdr* hdr) {
+        CheckLinkMsg(hdr, loopback_link);
+        found = true;
+      },
+      false));
+  EXPECT_TRUE(found) << "Netlink response does not contain any links.";
+}
+
+TEST_P(NetlinkSetLinkTest, ChangeMACAddress) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(IsRunningWithHostinet());
+  Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  struct request {
+    struct nlmsghdr hdr;
+    struct ifinfomsg ifm;
+    struct rtattr rtattr;
+    char address[1024];
+  };
+
+  const int address_size = 6;
+  const char address[address_size + 1] = {static_cast<char>(0xa1),
+                                          static_cast<char>(0xa2),
+                                          static_cast<char>(0xa3),
+                                          static_cast<char>(0xa4),
+                                          static_cast<char>(0xa5),
+                                          static_cast<char>(0xa6),
+                                          '\0'};
+
+  // Change the link MAC address.
+  struct request req = {};
+  req.hdr.nlmsg_type = GetParam();
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  req.hdr.nlmsg_seq = kSeq;
+  req.ifm.ifi_family = AF_UNSPEC;
+  req.ifm.ifi_index = loopback_link.index;
+  req.rtattr.rta_type = IFLA_ADDRESS;
+  req.rtattr.rta_len = RTA_LENGTH(address_size);
+  strncpy(req.address, address, sizeof(req.address));
+  req.hdr.nlmsg_len =
+      NLMSG_LENGTH(sizeof(req.ifm)) + NLMSG_ALIGN(req.rtattr.rta_len);
+  EXPECT_NO_ERRNO(NetlinkRequestAckOrError(fd, kSeq, &req, sizeof(req)));
+
+  loopback_link.address = std::string(address);
+  // Search the link by its index.
+  struct searchrequest {
+    struct nlmsghdr hdr;
+    struct ifinfomsg ifm;
+  } search = {};
+  search.hdr.nlmsg_len = sizeof(search);
+  search.hdr.nlmsg_type = RTM_GETLINK;
+  search.hdr.nlmsg_flags = NLM_F_REQUEST;
+  search.hdr.nlmsg_seq = kSeq;
+  search.ifm.ifi_family = AF_UNSPEC;
+  search.ifm.ifi_index = loopback_link.index;
+
+  bool found = false;
+  ASSERT_NO_ERRNO(NetlinkRequestResponse(
+      fd, &search, sizeof(search),
+      [&](const struct nlmsghdr* hdr) {
+        CheckLinkMsg(hdr, loopback_link);
+        found = true;
+      },
+      false));
+  EXPECT_TRUE(found) << "Netlink response does not contain any links.";
+}
+
+TEST(NetlinkRouteTest, LinkUp) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  SKIP_IF(IsRunningWithHostinet());
+
+  Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  struct request {
+    struct nlmsghdr hdr;
+    struct ifinfomsg ifm;
+  };
+
+  struct request req = {};
+  req.hdr.nlmsg_len = sizeof(req);
+  req.hdr.nlmsg_type = RTM_NEWLINK;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  req.hdr.nlmsg_seq = kSeq;
+  req.ifm.ifi_family = AF_UNSPEC;
+  req.ifm.ifi_index = loopback_link.index;
+  req.ifm.ifi_change = IFF_UP;
+  req.ifm.ifi_flags = IFF_UP;
+  EXPECT_NO_ERRNO(NetlinkRequestAckOrError(fd, kSeq, &req, sizeof(req)));
 }
 
 TEST(NetlinkRouteTest, GetLinkByName) {
@@ -629,6 +850,8 @@ TEST(NetlinkRouteTest, AddAndRemoveAddr) {
   // Don't do cooperative save/restore because netstack state is not restored.
   // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
   const DisableSave ds;
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
 
   Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
 
@@ -636,30 +859,65 @@ TEST(NetlinkRouteTest, AddAndRemoveAddr) {
   ASSERT_EQ(inet_pton(AF_INET, "10.0.0.1", &addr), 1);
 
   // Create should succeed, as no such address in kernel.
-  ASSERT_NO_ERRNO(LinkAddLocalAddr(loopback_link.index, AF_INET,
+  ASSERT_NO_ERRNO(LinkAddLocalAddr(fd, loopback_link.index, AF_INET,
                                    /*prefixlen=*/24, &addr, sizeof(addr)));
 
-  Cleanup defer_addr_removal = Cleanup(
-      [loopback_link = std::move(loopback_link), addr = std::move(addr)] {
-        // First delete should succeed, as address exists.
-        EXPECT_NO_ERRNO(LinkDelLocalAddr(loopback_link.index, AF_INET,
-                                         /*prefixlen=*/24, &addr,
-                                         sizeof(addr)));
+  Cleanup defer_addr_removal = Cleanup([&] {
+    // First delete should succeed, as address exists.
+    EXPECT_NO_ERRNO(LinkDelLocalAddr(fd, loopback_link.index, AF_INET,
+                                     /*prefixlen=*/24, &addr, sizeof(addr)));
 
-        // Second delete should fail, as address no longer exists.
-        EXPECT_THAT(LinkDelLocalAddr(loopback_link.index, AF_INET,
-                                     /*prefixlen=*/24, &addr, sizeof(addr)),
-                    PosixErrorIs(EADDRNOTAVAIL, _));
-      });
+    // Second delete should fail, as address no longer exists.
+    EXPECT_THAT(LinkDelLocalAddr(fd, loopback_link.index, AF_INET,
+                                 /*prefixlen=*/24, &addr, sizeof(addr)),
+                PosixErrorIs(EADDRNOTAVAIL, _));
+  });
 
   // Replace an existing address should succeed.
-  ASSERT_NO_ERRNO(LinkReplaceLocalAddr(loopback_link.index, AF_INET,
+  ASSERT_NO_ERRNO(LinkReplaceLocalAddr(fd, loopback_link.index, AF_INET,
                                        /*prefixlen=*/24, &addr, sizeof(addr)));
 
   // Create exclusive should fail, as we created the address above.
-  EXPECT_THAT(LinkAddExclusiveLocalAddr(loopback_link.index, AF_INET,
+  EXPECT_THAT(LinkAddExclusiveLocalAddr(fd, loopback_link.index, AF_INET,
                                         /*prefixlen=*/24, &addr, sizeof(addr)),
               PosixErrorIs(EEXIST, _));
+}
+
+TEST(NetlinkRouteTest, LinkedToNetns) {
+  SKIP_IF(IsRunningWithHostinet());
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  // Don't do cooperative save/restore because netstack state is not restored.
+  // TODO(gvisor.dev/issue/4595): enable cooperative save tests.
+  const DisableSave ds;
+
+  FileDescriptor root_netns_nlsk =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  const FileDescriptor nsfd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/net", O_RDONLY));
+  Cleanup defer_netns = Cleanup([&] {
+    ASSERT_THAT(setns(nsfd.get(), CLONE_NEWNET), SyscallSucceedsWithValue(0));
+  });
+  ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceedsWithValue(0));
+  FileDescriptor nlsk =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+
+  struct in_addr addr;
+  ASSERT_EQ(inet_pton(AF_INET, "10.0.0.1", &addr), 1);
+
+  // Create should succeed, as no such address in kernel.
+  ASSERT_NO_ERRNO(LinkAddLocalAddr(nlsk, loopback_link.index, AF_INET,
+                                   /*prefixlen=*/24, &addr, sizeof(addr)));
+
+  // No such address in the root network namespace.
+  EXPECT_THAT(LinkDelLocalAddr(root_netns_nlsk, loopback_link.index, AF_INET,
+                               /*prefixlen=*/24, &addr, sizeof(addr)),
+              PosixErrorIs(EADDRNOTAVAIL, _));
+  // The address exists in the current namespace.
+  EXPECT_NO_ERRNO(LinkDelLocalAddr(nlsk, loopback_link.index, AF_INET,
+                                   /*prefixlen=*/24, &addr, sizeof(addr)));
 }
 
 // GetRouteDump tests a RTM_GETROUTE + NLM_F_DUMP request.
@@ -686,7 +944,7 @@ TEST(NetlinkRouteTest, GetRouteDump) {
   ASSERT_NO_ERRNO(NetlinkRequestResponse(
       fd, &req, sizeof(req),
       [&](const struct nlmsghdr* hdr) {
-        // Validate the reponse to RTM_GETROUTE + NLM_F_DUMP.
+        // Validate the response to RTM_GETROUTE + NLM_F_DUMP.
         EXPECT_THAT(hdr->nlmsg_type, AnyOf(Eq(RTM_NEWROUTE), Eq(NLMSG_DONE)));
 
         EXPECT_TRUE((hdr->nlmsg_flags & NLM_F_MULTI) == NLM_F_MULTI)
@@ -784,7 +1042,7 @@ TEST(NetlinkRouteTest, GetRouteRequest) {
   bool rtDstFound = false;
   ASSERT_NO_ERRNO(NetlinkRequestResponseSingle(
       fd, &req, sizeof(req), [&](const struct nlmsghdr* hdr) {
-        // Validate the reponse to RTM_GETROUTE request with RTM_F_LOOKUP_TABLE
+        // Validate the response to RTM_GETROUTE request with RTM_F_LOOKUP_TABLE
         // flag.
         EXPECT_THAT(hdr->nlmsg_type, RTM_NEWROUTE);
 
@@ -836,6 +1094,209 @@ using NetlinkRouteIpInvariantTest = ::testing::TestWithParam<int>;
 INSTANTIATE_TEST_SUITE_P(NetlinkRouteIpv4AndIpv6Tests,
                          NetlinkRouteIpInvariantTest,
                          ::testing::Values(AF_INET, AF_INET6));
+
+TEST_P(NetlinkRouteIpInvariantTest, NewRoute) {
+  // CAP_NET_ADMIN is required to modify the routing table.
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(IsRunningWithHostinet());
+  // Routes are not savable.
+  DisableSave ds;
+
+  const std::string dst_v4_address = "192.0.2.0";
+  const std::string dst_v6_address = "2001:db8::";
+
+  // Based on the test parameter, build an IPv4 or IPv6 destination subnet.
+  int family = GetParam();
+  void* dst = nullptr;
+  int dst_len;
+  int prefixlen;
+  struct in_addr dst_v4;
+  struct in6_addr dst_v6;
+  switch (family) {
+    case AF_INET:
+      ASSERT_EQ(inet_pton(family, dst_v4_address.c_str(), &dst_v4), 1);
+      prefixlen = 24;
+      dst = &dst_v4;
+      dst_len = sizeof(dst_v4);
+      break;
+    case AF_INET6:
+      ASSERT_EQ(inet_pton(family, dst_v6_address.c_str(), &dst_v6), 1);
+      prefixlen = 64;
+      dst = &dst_v6;
+      dst_len = sizeof(dst_v6);
+      break;
+    default:
+      FAIL() << "address family must be AF_INET or AF_INET6";
+  }
+
+  Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+
+  ASSERT_NO_ERRNO(
+      AddUnicastRoute(loopback_link.index, family, prefixlen, dst, dst_len));
+
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  struct request {
+    struct nlmsghdr hdr;
+    struct rtmsg rtm;
+  };
+
+  struct request req = {};
+  req.hdr.nlmsg_len = sizeof(req);
+  req.hdr.nlmsg_type = RTM_GETROUTE;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+  req.hdr.nlmsg_seq = kSeq;
+  req.rtm.rtm_family = AF_UNSPEC;
+
+  bool routeDstFound = false;
+  ASSERT_NO_ERRNO(NetlinkRequestResponse(
+      fd, &req, sizeof(req),
+      [&](const struct nlmsghdr* hdr) {
+        // Validate the response to RTM_GETROUTE + NLM_F_DUMP.
+        EXPECT_THAT(hdr->nlmsg_type, AnyOf(Eq(RTM_NEWROUTE), Eq(NLMSG_DONE)));
+        // The test should not proceed if it's not a RTM_NEWROUTE message.
+        if (hdr->nlmsg_type != RTM_NEWROUTE) {
+          return;
+        }
+        const struct rtmsg* msg =
+            reinterpret_cast<const struct rtmsg*>(NLMSG_DATA(hdr));
+        int len = RTM_PAYLOAD(hdr);
+        for (struct rtattr* attr = RTM_RTA(msg); RTA_OK(attr, len);
+             attr = RTA_NEXT(attr, len)) {
+          if (attr->rta_type == RTA_DST) {
+            char v4_address[INET_ADDRSTRLEN] = {};
+            char v6_address[INET6_ADDRSTRLEN] = {};
+            switch (family) {
+              case AF_INET:
+                inet_ntop(AF_INET, RTA_DATA(attr), v4_address,
+                          sizeof(v4_address));
+                if (strcmp(v4_address, dst_v4_address.c_str()) == 0) {
+                  routeDstFound = true;
+                  return;
+                }
+                break;
+              case AF_INET6:
+                inet_ntop(AF_INET6, RTA_DATA(attr), v6_address,
+                          sizeof(v6_address));
+                if (strcmp(v6_address, dst_v6_address.c_str()) == 0) {
+                  routeDstFound = true;
+                  return;
+                }
+                break;
+            }
+          }
+        }
+      },
+      false));
+  EXPECT_TRUE(routeDstFound);
+}
+
+TEST_P(NetlinkRouteIpInvariantTest, DeleteRoute) {
+  // CAP_NET_ADMIN is required to modify the routing table.
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(IsRunningWithHostinet());
+  // Routes are not savable.
+  DisableSave ds;
+
+  const std::string dst_v4_address = "192.0.3.0";
+  const std::string dst_v6_address = "2011:db8::";
+
+  // Based on the test parameter, build an IPv4 or IPv6 destination subnet.
+  int family = GetParam();
+  void* dst = nullptr;
+  int dst_len;
+  int prefixlen;
+  struct in_addr dst_v4;
+  struct in6_addr dst_v6;
+  switch (family) {
+    case AF_INET:
+      ASSERT_EQ(inet_pton(family, dst_v4_address.c_str(), &dst_v4), 1);
+      prefixlen = 24;
+      dst = &dst_v4;
+      dst_len = sizeof(dst_v4);
+      break;
+    case AF_INET6:
+      ASSERT_EQ(inet_pton(family, dst_v6_address.c_str(), &dst_v6), 1);
+      prefixlen = 64;
+      dst = &dst_v6;
+      dst_len = sizeof(dst_v6);
+      break;
+    default:
+      FAIL() << "address family must be AF_INET or AF_INET6";
+  }
+
+  Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+
+  ASSERT_NO_ERRNO(
+      AddUnicastRoute(loopback_link.index, family, prefixlen, dst, dst_len));
+  ASSERT_NO_ERRNO(
+      DelUnicastRoute(loopback_link.index, family, prefixlen, dst, dst_len));
+
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  struct request {
+    struct nlmsghdr hdr;
+    struct rtmsg rtm;
+  };
+
+  struct request req = {};
+  req.hdr.nlmsg_len = sizeof(req);
+  req.hdr.nlmsg_type = RTM_GETROUTE;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+  req.hdr.nlmsg_seq = kSeq;
+  req.rtm.rtm_family = AF_UNSPEC;
+
+  bool routeDstFound = false;
+  ASSERT_NO_ERRNO(NetlinkRequestResponse(
+      fd, &req, sizeof(req),
+      [&](const struct nlmsghdr* hdr) {
+        // Validate the response to RTM_GETROUTE.
+        EXPECT_THAT(hdr->nlmsg_type, AnyOf(Eq(RTM_NEWROUTE), Eq(NLMSG_DONE)));
+        // The test should not proceed if it's not a RTM_NEWROUTE message.
+        if (hdr->nlmsg_type != RTM_NEWROUTE) {
+          return;
+        }
+        const struct rtmsg* msg =
+            reinterpret_cast<const struct rtmsg*>(NLMSG_DATA(hdr));
+        int len = RTM_PAYLOAD(hdr);
+        for (struct rtattr* attr = RTM_RTA(msg); RTA_OK(attr, len);
+             attr = RTA_NEXT(attr, len)) {
+          if (attr->rta_type == RTA_DST) {
+            char v4_address[INET_ADDRSTRLEN] = {};
+            char v6_address[INET6_ADDRSTRLEN] = {};
+            switch (family) {
+              case AF_INET:
+                inet_ntop(AF_INET, RTA_DATA(attr), v4_address,
+                          sizeof(v4_address));
+                if (strcmp(v4_address, dst_v4_address.c_str()) == 0) {
+                  routeDstFound = true;
+                  return;
+                }
+                break;
+              case AF_INET6:
+                inet_ntop(AF_INET6, RTA_DATA(attr), v6_address,
+                          sizeof(v6_address));
+                if (strcmp(v6_address, dst_v6_address.c_str()) == 0) {
+                  routeDstFound = true;
+                  return;
+                }
+                break;
+            }
+          }
+        }
+      },
+      false));
+  // No route that matches the given destination address can be found.
+  EXPECT_FALSE(routeDstFound);
+  // Removing a route that doesn't exist returns an error.
+  EXPECT_THAT(
+      DelUnicastRoute(loopback_link.index, family, prefixlen, dst, dst_len),
+      PosixErrorIs(ESRCH, _));
+}
 
 TEST_P(NetlinkRouteIpInvariantTest, AddAndRemoveRoute) {
   // Gvisor does not support `RTM_NEWROUTE` or `RTM_DELROUTE`.
@@ -1256,6 +1717,76 @@ TEST(NetlinkRouteTest, PasscredCreds) {
   EXPECT_THAT(creds.gid, AnyOf(Eq(0), Eq(65534)));
 }
 
+#ifndef NLMSG_TAIL
+#define NLMSG_TAIL(nmsg) \
+  ((struct rtattr*)(((char*)(nmsg)) + NLMSG_ALIGN((nmsg)->nlmsg_len)))
+#endif
+
+void addattr(struct nlmsghdr* n, int maxlen, int type, const void* data,
+             int alen) {
+  int len = NLA_HDRLEN + alen;
+  struct rtattr* rta;
+
+  ASSERT_LE(NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len), maxlen);
+
+  rta = NLMSG_TAIL(n);
+  rta->rta_type = type;
+  rta->rta_len = len;
+  memcpy(RTA_DATA(rta), data, alen);
+  n->nlmsg_len = NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len);
+}
+
+TEST(NetlinkRouteTest, VethAdd) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  SKIP_IF(IsRunningWithHostinet());
+
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  struct request {
+    struct nlmsghdr hdr;
+    struct ifinfomsg ifm;
+    char buf[1024];
+  };
+
+  struct request req = {};
+  req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+  req.hdr.nlmsg_type = RTM_NEWLINK;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
+  req.hdr.nlmsg_seq = kSeq;
+  req.ifm.ifi_family = AF_UNSPEC;
+  req.ifm.ifi_index = 0;
+  req.ifm.ifi_change = IFF_UP;
+  req.ifm.ifi_flags = IFF_UP;
+
+  const char veth_first[] = "veth_first";
+  addattr(&req.hdr, sizeof(req), IFLA_IFNAME, veth_first, strlen(veth_first));
+
+  struct rtattr* linkinfo;
+  linkinfo = NLMSG_TAIL(&req.hdr);
+  {
+    addattr(&req.hdr, sizeof(req), IFLA_LINKINFO, nullptr, 0);
+    addattr(&req.hdr, sizeof(req), IFLA_INFO_KIND, "veth", 4);
+
+    struct rtattr *veth_data, *peer_data;
+    veth_data = NLMSG_TAIL(&req.hdr);
+    {
+      addattr(&req.hdr, sizeof(req), IFLA_INFO_DATA, NULL, 0);
+      peer_data = NLMSG_TAIL(&req.hdr);
+      {
+        struct ifinfomsg ifm = {};
+        addattr(&req.hdr, sizeof(req), VETH_INFO_PEER, &ifm, sizeof(ifm));
+        const char veth_second[] = "veth_second";
+        addattr(&req.hdr, sizeof(req), IFLA_IFNAME, veth_second,
+                strlen(veth_second));
+      }
+      peer_data->rta_len = (uint64_t)NLMSG_TAIL(&req.hdr) - (uint64_t)peer_data;
+    }
+    veth_data->rta_len = (uint64_t)NLMSG_TAIL(&req.hdr) - (uint64_t)veth_data;
+  }
+  linkinfo->rta_len = (uint64_t)NLMSG_TAIL(&req.hdr) - (uint64_t)linkinfo;
+  EXPECT_NO_ERRNO(NetlinkRequestAckOrError(fd, kSeq, &req, req.hdr.nlmsg_len));
+}
 }  // namespace
 
 }  // namespace testing

@@ -23,12 +23,13 @@ import (
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/test/benchmarks/harness"
 	"gvisor.dev/gvisor/test/benchmarks/tools"
+	"gvisor.dev/gvisor/test/metricsviz"
 )
 
 // BenchmarkNode runs requests using 'hey' against a Node server run on
 // 'runtime'. The server responds to requests by grabbing some data in a
-// redis instance and returns the data in its reponse. The test loops through
-// increasing amounts of concurency for requests.
+// redis instance and returns the data in its response. The test loops through
+// increasing amounts of concurrency for requests.
 func BenchmarkNode(b *testing.B) {
 	concurrency := []int{1, 5, 10, 25}
 	for _, c := range concurrency {
@@ -78,6 +79,7 @@ func runNode(b *testing.B, hey *tools.Hey) {
 		b.Fatalf("failed to spawn redis instance: %v", err)
 	}
 	defer redis.CleanUp(ctx)
+	defer metricsviz.FromContainerLogs(ctx, b, redis)
 
 	if out, err := redis.WaitForOutput(ctx, "Ready to accept connections", 3*time.Second); err != nil {
 		b.Fatalf("failed to start redis server: %v %s", err, out)

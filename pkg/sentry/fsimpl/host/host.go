@@ -30,9 +30,9 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/eventfd"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/hostfd"
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	unixsocket "gvisor.dev/gvisor/pkg/sentry/socket/unix"
@@ -101,17 +101,22 @@ type inode struct {
 	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary // This holds no meaning as this inode can't be Looked up and is always valid.
 	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	locks vfs.FileLocks
 
 	// When the reference count reaches zero, the host fd is closed.
 	inodeRefs
 
-	// hostFD contains the host fd that this file was originally created from,
-	// which must be available at time of restore.
+	// hostFD contains the host fd that this file was originally created from.
+	// Upon restore, it must be remapped using restoreKey and vfs.CtxRestoreFilesystemFDMap
+	// from the restore context.
 	//
 	// This field is initialized at creation time and is immutable.
-	hostFD int
+	hostFD int `state:"nosave"`
+
+	// restoreKey is used to identify the `hostFD` after a restore is performed.
+	restoreKey vfs.RestoreID
 
 	// ino is an inode number unique within this filesystem.
 	//
@@ -167,7 +172,7 @@ type inode struct {
 	buf     []byte
 }
 
-func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, fileType linux.FileMode, isTTY bool, readonly bool) (*inode, error) {
+func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, restoreKey vfs.RestoreID, fileType linux.FileMode, isTTY bool, readonly bool) (*inode, error) {
 	// Determine if hostFD is seekable.
 	_, err := unix.Seek(hostFD, 0, linux.SEEK_CUR)
 	seekable := !linuxerr.Equals(linuxerr.ESPIPE, err)
@@ -179,14 +184,15 @@ func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, fil
 	}
 
 	i := &inode{
-		hostFD:    hostFD,
-		ino:       fs.NextIno(),
-		ftype:     uint16(fileType),
-		epollable: isEpollable(hostFD),
-		seekable:  seekable,
-		isTTY:     isTTY,
-		savable:   savable,
-		readonly:  readonly,
+		hostFD:     hostFD,
+		ino:        fs.NextIno(),
+		ftype:      uint16(fileType),
+		epollable:  isEpollable(hostFD),
+		seekable:   seekable,
+		isTTY:      isTTY,
+		savable:    savable,
+		restoreKey: restoreKey,
+		readonly:   readonly,
 	}
 	i.InitRefs()
 	i.CachedMappable.Init(hostFD)
@@ -207,9 +213,13 @@ func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, fil
 // NewFDOptions contains options to NewFD.
 type NewFDOptions struct {
 	// If Savable is true, the host file descriptor may be saved/restored by
-	// numeric value; the sandbox API requires a corresponding host FD with the
-	// same numeric value to be provided at time of restore.
+	// numeric value. RestoreKey is used to map the FD after restore.
 	Savable bool
+
+	// RestoreKey is only used when Savable==true. It uniquely identifies the
+	// host FD so that a mapping to the corresponding FD can be provided during
+	// restore.
+	RestoreKey vfs.RestoreID
 
 	// If IsTTY is true, the file descriptor is a TTY.
 	IsTTY bool
@@ -272,7 +282,12 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 	}
 
 	fileType := linux.FileMode(stat.Mode).FileType()
-	i, err := newInode(ctx, fs, hostFD, opts.Savable, fileType, opts.IsTTY, opts.Readonly)
+	if fileType == 0 && isHostEventFdDevice(stat.Dev) {
+		// This is an event fd. No inode needed.
+		vfsObj := mnt.Filesystem().VirtualFilesystem()
+		return eventfd.NewFromHost(ctx, vfsObj, hostFD, flags)
+	}
+	i, err := newInode(ctx, fs, hostFD, opts.Savable, opts.RestoreKey, fileType, opts.IsTTY, opts.Readonly)
 	if err != nil {
 		return nil, err
 	}
@@ -656,18 +671,11 @@ func (i *inode) open(ctx context.Context, d *kernfs.Dentry, mnt *vfs.Mount, file
 			return nil, err
 		}
 		// Currently, we only allow Unix sockets to be imported.
-		return unixsocket.NewFileDescription(ep, ep.Type(), flags, mnt, d.VFSDentry(), &i.locks)
+		return unixsocket.NewFileDescription(ep, ep.Type(), flags, nil, mnt, d.VFSDentry(), &i.locks)
 
 	case unix.S_IFREG, unix.S_IFIFO, unix.S_IFCHR:
 		if i.isTTY {
-			fd := &TTYFileDescription{
-				fileDescription: fileDescription{inode: i},
-				termios:         linux.DefaultReplicaTermios,
-			}
-			if task := kernel.TaskFromContext(ctx); task != nil {
-				fd.fgProcessGroup = task.ThreadGroup().ProcessGroup()
-				fd.session = fd.fgProcessGroup.Session()
-			}
+			fd := NewTTYFileDescription(i)
 			fd.LockFD.Init(&i.locks)
 			vfsfd := &fd.vfsfd
 			if err := vfsfd.Init(fd, flags, mnt, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
@@ -1024,4 +1032,29 @@ func (f *fileDescription) Ioctl(ctx context.Context, uio usermem.IO, sysno uintp
 	}
 
 	return f.FileDescriptionDefaultImpl.Ioctl(ctx, uio, sysno, args)
+}
+
+// hostEventFdDevice is the host device that host event fds are associated
+// with. It is calculated once lazily.
+var hostEventFdDevice uint64
+var hostEventFdDeviceOnce sync.Once
+
+// isHostEventFdDevice initializes hostEventFdDevice and compares it to the
+// given host device id.
+func isHostEventFdDevice(dev uint64) bool {
+	hostEventFdDeviceOnce.Do(func() {
+		efd, _, err := unix.RawSyscall(unix.SYS_EVENTFD2, 0, 0, 0)
+		if err != 0 {
+			log.Warningf("failed to create dummy eventfd: %v. Importing eventfds will fail", error(err))
+			return
+		}
+		defer unix.Close(int(efd))
+		var stat unix.Stat_t
+		if err := unix.Fstat(int(efd), &stat); err != nil {
+			log.Warningf("failed to stat dummy eventfd: %v. Importing eventfds will fail", error(err))
+			return
+		}
+		hostEventFdDevice = stat.Dev
+	})
+	return dev == hostEventFdDevice
 }

@@ -12,9 +12,11 @@ go_library(
         "sh.go",
         "testutil.go",
         "testutil_runfiles.go",
+        "tree.go",
     ],
     visibility = ["//:sandbox"],
     deps = [
+        "//pkg/rand",
         "//pkg/sentry/watchdog",
         "//pkg/sync",
         "//runsc/config",

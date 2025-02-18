@@ -21,6 +21,7 @@ import (
 
 	"github.com/google/subcommands"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -33,8 +34,9 @@ const (
 
 // Wait implements subcommands.Command for the "wait" command.
 type Wait struct {
-	rootPID int
-	pid     int
+	rootPID    int
+	pid        int
+	checkpoint bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -49,13 +51,14 @@ func (*Wait) Synopsis() string {
 
 // Usage implements subcommands.Command.Usage.
 func (*Wait) Usage() string {
-	return `wait [flags] <container id>`
+	return "wait [flags] <container id>\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
 func (wt *Wait) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&wt.rootPID, "rootpid", unsetPID, "select a PID in the sandbox root PID namespace to wait on instead of the container's root process")
 	f.IntVar(&wt.pid, "pid", unsetPID, "select a PID in the container's PID namespace to wait on instead of the container's root process")
+	f.BoolVar(&wt.checkpoint, "checkpoint", false, "wait for the next checkpoint to complete")
 }
 
 // Execute implements subcommands.Command.Execute. It waits for a process in a
@@ -76,6 +79,16 @@ func (wt *Wait) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	c, err := container.Load(conf.RootDir, container.FullID{ContainerID: id}, container.LoadOpts{})
 	if err != nil {
 		util.Fatalf("loading container: %v", err)
+	}
+
+	if wt.checkpoint {
+		if wt.rootPID != unsetPID || wt.pid != unsetPID {
+			log.Warningf("waiting for checkpoint to complete, ignoring -pid and -rootpid")
+		}
+		if err := c.WaitCheckpoint(); err != nil {
+			util.Fatalf("waiting for checkpoint to complete: %v", err)
+		}
+		return subcommands.ExitSuccess
 	}
 
 	var waitStatus unix.WaitStatus

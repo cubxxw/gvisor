@@ -15,7 +15,6 @@
 package ipv6
 
 import (
-	"bytes"
 	"math/rand"
 	"strings"
 	"testing"
@@ -480,7 +479,7 @@ func TestNeighborSolicitationResponse(t *testing.T) {
 					t.Fatalf("got invalid = %d, want = 1", got)
 				}
 
-				if p := e.Read(); !p.IsNil() {
+				if p := e.Read(); p != nil {
 					t.Fatalf("unexpected response to an invalid NS = %+v", p)
 				}
 
@@ -495,7 +494,7 @@ func TestNeighborSolicitationResponse(t *testing.T) {
 			if test.performsLinkResolution {
 				c.clock.RunImmediatelyScheduledJobs()
 				p := e.Read()
-				if p.IsNil() {
+				if p == nil {
 					t.Fatal("expected an NDP NS response")
 				}
 
@@ -558,7 +557,7 @@ func TestNeighborSolicitationResponse(t *testing.T) {
 
 			c.clock.RunImmediatelyScheduledJobs()
 			p := e.Read()
-			if p.IsNil() {
+			if p == nil {
 				t.Fatal("expected an NDP NA response")
 			}
 			defer p.DecRef()
@@ -1286,21 +1285,9 @@ func TestCheckDuplicateAddress(t *testing.T) {
 		RetransmitTimer:        time.Second,
 	}
 
-	nonces := [...][]byte{
-		{1, 2, 3, 4, 5, 6},
-		{7, 8, 9, 10, 11, 12},
-	}
-
-	var secureRNGBytes []byte
-	for _, n := range nonces {
-		secureRNGBytes = append(secureRNGBytes, n...)
-	}
-	var secureRNG bytes.Reader
-	secureRNG.Reset(secureRNGBytes[:])
 	s := stack.New(stack.Options{
 		Clock:      clock,
 		RandSource: rand.NewSource(time.Now().UnixNano()),
-		SecureRNG:  &secureRNG,
 		NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocolWithOptions(Options{
 			DADConfigs: dadConfigs,
 		})},
@@ -1325,7 +1312,7 @@ func TestCheckDuplicateAddress(t *testing.T) {
 	checkDADMsg := func() {
 		clock.RunImmediatelyScheduledJobs()
 		p := e.Read()
-		if p.IsNil() {
+		if p == nil {
 			t.Fatalf("expected %d-th DAD message", dadPacketsSent)
 		}
 		defer p.DecRef()
@@ -1346,7 +1333,6 @@ func TestCheckDuplicateAddress(t *testing.T) {
 			checker.TTL(header.NDPHopLimit),
 			checker.NDPNS(
 				checker.NDPNSTargetAddress(lladdr0),
-				checker.NDPNSOptions([]header.NDPOption{header.NDPNonceOption(nonces[dadPacketsSent])}),
 			))
 	}
 	protocolAddr := tcpip.ProtocolAddress{
@@ -1405,7 +1391,7 @@ func TestCheckDuplicateAddress(t *testing.T) {
 	}
 
 	// Should have no more packets.
-	if p := e.Read(); !p.IsNil() {
+	if p := e.Read(); p != nil {
 		t.Errorf("got unexpected packet = %#v", p)
 	}
 }

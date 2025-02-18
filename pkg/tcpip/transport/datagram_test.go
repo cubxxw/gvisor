@@ -142,6 +142,7 @@ type mockEndpoint struct {
 func (*mockEndpoint) MTU() uint32 {
 	return math.MaxUint32
 }
+func (*mockEndpoint) SetMTU(uint32) {}
 func (*mockEndpoint) Capabilities() stack.LinkEndpointCapabilities {
 	return 0
 }
@@ -149,9 +150,9 @@ func (*mockEndpoint) MaxHeaderLength() uint16 {
 	return 0
 }
 func (*mockEndpoint) LinkAddress() tcpip.LinkAddress {
-	var l tcpip.LinkAddress
-	return l
+	return ""
 }
+func (*mockEndpoint) SetLinkAddress(tcpip.LinkAddress) {}
 func (e *mockEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	if e.writeErr != nil {
 		return 0, e.writeErr
@@ -168,8 +169,8 @@ func (e *mockEndpoint) Attach(d stack.NetworkDispatcher)      { e.disp = d }
 func (e *mockEndpoint) IsAttached() bool                      { return e.disp != nil }
 func (*mockEndpoint) Wait()                                   {}
 func (*mockEndpoint) ARPHardwareType() header.ARPHardwareType { return header.ARPHardwareNone }
-func (*mockEndpoint) AddHeader(stack.PacketBufferPtr)         {}
-func (*mockEndpoint) ParseHeader(stack.PacketBufferPtr) bool  { return true }
+func (*mockEndpoint) AddHeader(*stack.PacketBuffer)           {}
+func (*mockEndpoint) ParseHeader(*stack.PacketBuffer) bool    { return true }
 func (e *mockEndpoint) releasePackets() {
 	e.pkts.DecRef()
 	e.pkts = stack.PacketBufferList{}
@@ -182,6 +183,12 @@ func (e *mockEndpoint) pktsSize() int {
 	}
 	return s
 }
+
+// Close implements stack.LinkEndpoint.
+func (*mockEndpoint) Close() {}
+
+// SetOnCloseAction implements stack.LinkEndpoint.SetOnCloseAction.
+func (*mockEndpoint) SetOnCloseAction(func()) {}
 
 func TestSndBuf(t *testing.T) {
 	const nicID = 1
@@ -1097,7 +1104,7 @@ func TestIPv6PacketInfo(t *testing.T) {
 
 					{
 						p := e1.Read()
-						if p.IsNil() {
+						if p == nil {
 							t.Fatal("packet didn't arrive at ep1")
 						}
 
@@ -1107,7 +1114,7 @@ func TestIPv6PacketInfo(t *testing.T) {
 						)
 					}
 
-					if p := e2.Read(); !p.IsNil() {
+					if p := e2.Read(); p != nil {
 						t.Errorf("unexpected packet from ep2 = %#v", p)
 					}
 				})

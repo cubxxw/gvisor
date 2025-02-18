@@ -51,7 +51,7 @@ var (
 // validateIgmpPacket checks that a passed packet is an IPv4 IGMP packet sent
 // to the provided address with the passed fields set. Raises a t.Error if any
 // field does not match.
-func validateIgmpPacket(t *testing.T, pkt stack.PacketBufferPtr, igmpType header.IGMPType, maxRespTime byte, srcAddr, dstAddr, groupAddress tcpip.Address) {
+func validateIgmpPacket(t *testing.T, pkt *stack.PacketBuffer, igmpType header.IGMPType, maxRespTime byte, srcAddr, dstAddr, groupAddress tcpip.Address) {
 	t.Helper()
 
 	payload := stack.PayloadSince(pkt.NetworkHeader())
@@ -70,7 +70,7 @@ func validateIgmpPacket(t *testing.T, pkt stack.PacketBufferPtr, igmpType header
 	)
 }
 
-func validateIgmpv3ReportPacket(t *testing.T, pkt stack.PacketBufferPtr, srcAddr, groupAddress tcpip.Address) {
+func validateIgmpv3ReportPacket(t *testing.T, pkt *stack.PacketBuffer, srcAddr, groupAddress tcpip.Address) {
 	t.Helper()
 
 	payload := stack.PayloadSince(pkt.NetworkHeader())
@@ -174,7 +174,7 @@ func TestIGMPV1Present(t *testing.T) {
 	// the IGMPv1 General Membership Query in.
 	{
 		p := e.Read()
-		if p.IsNil() {
+		if p == nil {
 			t.Fatal("unable to Read IGMP packet, expected V3MembershipReport")
 		}
 		if got := s.Stats().IGMP.PacketsSent.V3MembershipReport.Value(); got != 1 {
@@ -203,13 +203,13 @@ func TestIGMPV1Present(t *testing.T) {
 
 	// Verify the solicited Membership Report is sent. Now that this NIC has seen
 	// an IGMPv1 query, it should send an IGMPv1 Membership Report.
-	if p := e.Read(); !p.IsNil() {
+	if p := e.Read(); p != nil {
 		t.Fatalf("sent unexpected packet, expected V1MembershipReport only after advancing the clock = %+v", p)
 	}
 	ctx.clock.Advance(ipv4.UnsolicitedReportIntervalMax)
 	{
 		p := e.Read()
-		if p.IsNil() {
+		if p == nil {
 			t.Fatal("unable to Read IGMP packet, expected V1MembershipReport")
 		}
 		if got := s.Stats().IGMP.PacketsSent.V1MembershipReport.Value(); got != 1 {
@@ -228,7 +228,7 @@ func TestIGMPV1Present(t *testing.T) {
 	}
 	{
 		p := e.Read()
-		if p.IsNil() {
+		if p == nil {
 			t.Fatal("unable to Read IGMP packet, expected V2MembershipReport")
 		}
 		if got := s.Stats().IGMP.PacketsSent.V3MembershipReport.Value(); got != 2 {
@@ -322,7 +322,7 @@ func TestSendQueuedIGMPReports(t *testing.T) {
 				}
 			}
 			test.checkStats(t, s, reportCounter, doneCounter, reportV2Counter)
-			if p := e.Read(); !p.IsNil() {
+			if p := e.Read(); p != nil {
 				t.Fatalf("got unexpected packet = %#v", p)
 			}
 
@@ -358,7 +358,7 @@ func TestSendQueuedIGMPReports(t *testing.T) {
 			// Should have no more packets to send after the initial set of unsolicited
 			// reports.
 			clock.Advance(time.Hour)
-			if p := e.Read(); !p.IsNil() {
+			if p := e.Read(); p != nil {
 				t.Fatalf("got unexpected packet = %#v", p)
 			}
 		})
@@ -540,7 +540,7 @@ func TestGetSetIGMPVersion(t *testing.T) {
 	if err := s.JoinGroup(ipv4.ProtocolNumber, nicID, multicastAddr1); err != nil {
 		t.Fatalf("JoinGroup(ipv4, nic, %s) = %s", multicastAddr1, err)
 	}
-	if p := e.Read(); p.IsNil() {
+	if p := e.Read(); p == nil {
 		t.Fatal("expected a report message to be sent")
 	} else {
 		validateIgmpv3ReportPacket(t, p, stackAddr, multicastAddr1)
@@ -556,7 +556,7 @@ func TestGetSetIGMPVersion(t *testing.T) {
 	if err := s.JoinGroup(ipv4.ProtocolNumber, nicID, multicastAddr2); err != nil {
 		t.Fatalf("JoinGroup(ipv4, nic, %s) = %s", multicastAddr2, err)
 	}
-	if p := e.Read(); p.IsNil() {
+	if p := e.Read(); p == nil {
 		t.Fatal("expected a report message to be sent")
 	} else {
 		validateIgmpPacket(t, p, header.IGMPv2MembershipReport, 0, stackAddr, multicastAddr2, multicastAddr2)
@@ -572,7 +572,7 @@ func TestGetSetIGMPVersion(t *testing.T) {
 	if err := s.JoinGroup(ipv4.ProtocolNumber, nicID, multicastAddr3); err != nil {
 		t.Fatalf("JoinGroup(ipv4, nic, %s) = %s", multicastAddr3, err)
 	}
-	if p := e.Read(); p.IsNil() {
+	if p := e.Read(); p == nil {
 		t.Fatal("expected a report message to be sent")
 	} else {
 		validateIgmpPacket(t, p, header.IGMPv1MembershipReport, 0, stackAddr, multicastAddr3, multicastAddr3)
@@ -588,7 +588,7 @@ func TestGetSetIGMPVersion(t *testing.T) {
 	if err := s.JoinGroup(ipv4.ProtocolNumber, nicID, multicastAddr4); err != nil {
 		t.Fatalf("JoinGroup(ipv4, nic, %s) = %s", multicastAddr4, err)
 	}
-	if p := e.Read(); p.IsNil() {
+	if p := e.Read(); p == nil {
 		t.Fatal("expected a report message to be sent")
 	} else {
 		validateIgmpv3ReportPacket(t, p, stackAddr, multicastAddr4)

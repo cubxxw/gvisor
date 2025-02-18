@@ -131,6 +131,8 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/cpuid",
         "//pkg/hostarch",
+        "//pkg/hostsyscall",
+        "//pkg/sentry/platform",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )

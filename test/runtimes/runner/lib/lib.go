@@ -62,7 +62,7 @@ func (p ProctorSettings) ToArgs() []string {
 type Filter func(test string) bool
 
 // RunTests is a helper that is called by main. It exists so that we can run
-// defered functions before exiting. It returns an exit code that should be
+// deferred functions before exiting. It returns an exit code that should be
 // passed to os.Exit.
 func RunTests(lang, image string, filter Filter, batchSize int, timeout time.Duration, proctorSettings ProctorSettings) int {
 	// Construct the shared docker instance.
@@ -266,6 +266,9 @@ func (f testDeps) ReadCorpus(string, []reflect.Type) ([]corpusEntry, error) { re
 func (f testDeps) CheckCorpus([]any, []reflect.Type) error                  { return nil }
 func (f testDeps) ResetCoverage()                                           {}
 func (f testDeps) SnapshotCoverage()                                        {}
+func (f testDeps) InitRuntimeCoverage() (mode string, tearDown func(string, string) (string, error), snapcov func() float64) {
+	return
+}
 
 // Copied from testing/fuzz.go.
 type corpusEntry = struct {

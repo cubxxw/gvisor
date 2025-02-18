@@ -195,7 +195,7 @@ class AddrFDSocketPair : public SocketPair {
   size_t second_addr_len() const override { return second_len_; }
 
  private:
-  // to_storage coverts a sockaddr_* to a sockaddr_storage.
+  // to_storage converts a sockaddr_* to a sockaddr_storage.
   static struct sockaddr_storage to_storage(const sockaddr_un& addr);
   static struct sockaddr_storage to_storage(const sockaddr_in& addr);
   static struct sockaddr_storage to_storage(const sockaddr_in6& addr);
@@ -400,9 +400,6 @@ SocketPairKind NoOp(SocketPairKind const& base);
 // specified FDs. Note that calls to this function should be wrapped in
 // ASSERT_NO_FATAL_FAILURE().
 void TransferTest(int fd1, int fd2);
-
-// Fills [buf, buf+len) with random bytes.
-void RandomizeBuffer(char* buf, size_t len);
 
 // Base test fixture for tests that operate on pairs of connected sockets.
 class SocketPairTest : public ::testing::TestWithParam<SocketPairKind> {

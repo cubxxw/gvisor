@@ -143,7 +143,7 @@ func newTestContext(t *testing.T, mtu, bufferSize uint32, addr tcpip.LinkAddress
 	return c
 }
 
-func (c *testContext) DeliverNetworkPacket(proto tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+func (c *testContext) DeliverNetworkPacket(proto tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	c.mu.Lock()
 	c.packets = append(c.packets, packetInfo{
 		proto: proto,
@@ -154,7 +154,7 @@ func (c *testContext) DeliverNetworkPacket(proto tcpip.NetworkProtocolNumber, pk
 	c.packetCh <- struct{}{}
 }
 
-func (c *testContext) DeliverLinkPacket(tcpip.NetworkProtocolNumber, stack.PacketBufferPtr) {
+func (c *testContext) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {
 	c.t.Fatal("DeliverLinkPacket not implemented")
 }
 
@@ -171,7 +171,7 @@ func (c *testContext) waitForPackets(n int, to <-chan time.Time, errorStr string
 		select {
 		case <-c.packetCh:
 		case <-to:
-			c.t.Fatalf(errorStr)
+			c.t.Fatal(errorStr)
 		}
 	}
 }
@@ -819,6 +819,34 @@ func TestCloseWhileWaitingToPost(t *testing.T) {
 	c.cleanup()
 	cleaned = true
 	c.ep.Wait()
+}
+
+func TestSetLinkAddress(t *testing.T) {
+	c := newTestContext(t, 20000, 1500, tcpip.LinkAddress("xyz"))
+	defer c.cleanup()
+
+	addrs := []tcpip.LinkAddress{"abc", "def"}
+	for _, addr := range addrs {
+		c.ep.SetLinkAddress(addr)
+
+		if want, v := addr, c.ep.LinkAddress(); want != v {
+			t.Errorf("LinkAddress() = %v, want %v", v, want)
+		}
+	}
+}
+
+func TestMTU(t *testing.T) {
+	c := newTestContext(t, 20000, 1500, "")
+	defer c.cleanup()
+
+	mtus := []uint32{1000, 2000}
+	for _, mtu := range mtus {
+		c.ep.SetMTU(mtu)
+
+		if want, v := mtu, c.ep.MTU(); want != v {
+			t.Errorf("MTU() = %v, want %v", v, want)
+		}
+	}
 }
 
 func TestMain(m *testing.M) {

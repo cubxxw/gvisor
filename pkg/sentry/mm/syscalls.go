@@ -33,6 +33,7 @@ import (
 //
 // Preconditions: mm.as != nil.
 func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr, at hostarch.AccessType, sp hostarch.Addr) error {
+	addr = hostarch.UntaggedUserAddr(addr)
 	ar, ok := addr.RoundDown().ToRange(hostarch.PageSize)
 	if !ok {
 		return linuxerr.EFAULT
@@ -53,7 +54,7 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 
 	// Ensure that we have a usable pma.
 	mm.activeMu.Lock()
-	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, at)
+	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */)
 	mm.mappingMu.RUnlock()
 	if err != nil {
 		mm.activeMu.Unlock()
@@ -65,7 +66,7 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 	mm.activeMu.DowngradeLock()
 
 	// Map the faulted page into the active AddressSpace.
-	err = mm.mapASLocked(pseg, ar, false)
+	err = mm.mapASLocked(pseg, ar, memmap.PlatformEffectDefault)
 	mm.activeMu.RUnlock()
 	return err
 }
@@ -114,12 +115,16 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 	}
 
 	// Get the new vma.
-	var droppedIDs []memmap.MappingIdentity
 	mm.mappingMu.Lock()
 	if opts.MLockMode < mm.defMLockMode {
 		opts.MLockMode = mm.defMLockMode
 	}
-	vseg, ar, droppedIDs, err := mm.createVMALocked(ctx, opts, droppedIDs)
+	vseg, ar, droppedIDs, err := mm.createVMALocked(ctx, opts, nil /* droppedIDs */)
+	defer func() {
+		for _, id := range droppedIDs {
+			id.DecRef(ctx)
+		}
+	}()
 	if err != nil {
 		mm.mappingMu.Unlock()
 		return 0, err
@@ -131,25 +136,33 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 	// mm/util.c:vm_mmap_pgoff() => mm/gup.c:__mm_populate() =>
 	// populate_vma_page_range(). Confirm this behavior.
 	switch {
-	case opts.Precommit || opts.MLockMode == memmap.MLockEager:
-		// Get pmas and map with precommit as requested.
-		mm.populateVMAAndUnlock(ctx, vseg, ar, true)
+	case opts.PlatformEffect >= memmap.PlatformEffectPopulate:
+		if opts.RequirePlatformEffect {
+			if err := mm.populateVMA(ctx, vseg, ar, opts.PlatformEffect); err != nil {
+				_, droppedIDs = mm.unmapLocked(ctx, ar, droppedIDs)
+				mm.mappingMu.Unlock()
+				return 0, err
+			}
+			mm.mappingMu.Unlock()
+			break
+		}
+		fallthrough
 
-	case opts.Mappable == nil && length <= privateAllocUnit:
+	case opts.MLockMode == memmap.MLockEager:
+		// Get pmas and map as requested.
+		mm.populateVMAAndUnlock(ctx, vseg, ar, opts.PlatformEffect)
+
+	case opts.Mappable == nil && length <= hostarch.HugePageSize:
 		// NOTE(b/63077076, b/63360184): Get pmas and map eagerly in the hope
 		// that doing so will save on future page faults. We only do this for
 		// anonymous mappings, since otherwise the cost of
 		// memmap.Mappable.Translate is unknown; and only for small mappings,
 		// to avoid needing to allocate large amounts of memory that we may
 		// subsequently need to checkpoint.
-		mm.populateVMAAndUnlock(ctx, vseg, ar, false)
+		mm.populateVMAAndUnlock(ctx, vseg, ar, memmap.PlatformEffectDefault)
 
 	default:
 		mm.mappingMu.Unlock()
-	}
-
-	for _, id := range droppedIDs {
-		id.DecRef(ctx)
 	}
 
 	return ar.Start, nil
@@ -161,11 +174,11 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 // Preconditions:
 //   - mm.mappingMu must be locked.
 //   - vseg.Range().IsSupersetOf(ar).
-func (mm *MemoryManager) populateVMA(ctx context.Context, vseg vmaIterator, ar hostarch.AddrRange, precommit bool) {
+func (mm *MemoryManager) populateVMA(ctx context.Context, vseg vmaIterator, ar hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect) error {
 	if !vseg.ValuePtr().effectivePerms.Any() {
-		// Linux doesn't populate inaccessible pages. See
-		// mm/gup.c:populate_vma_page_range.
-		return
+		// mm.mapASLocked() will no-op due to platform.AddressSpace.MapFile()
+		// precondition.
+		return nil
 	}
 
 	mm.activeMu.Lock()
@@ -175,32 +188,29 @@ func (mm *MemoryManager) populateVMA(ctx context.Context, vseg vmaIterator, ar h
 	// AddressSpace.
 	if mm.as == nil {
 		mm.activeMu.Unlock()
-		return
+		return nil
 	}
 
 	// Ensure that we have usable pmas.
-	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, hostarch.NoAccess)
+	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, hostarch.NoAccess, platformEffect == memmap.PlatformEffectCommit)
 	if err != nil {
-		// mm/util.c:vm_mmap_pgoff() ignores the error, if any, from
-		// mm/gup.c:mm_populate(). If it matters, we'll get it again when
-		// userspace actually tries to use the failing page.
 		mm.activeMu.Unlock()
-		return
+		return err
 	}
 
 	// Downgrade to a read-lock on activeMu since we don't need to mutate pmas
 	// anymore.
 	mm.activeMu.DowngradeLock()
-
-	// As above, errors are silently ignored.
-	mm.mapASLocked(pseg, ar, precommit)
+	err = mm.mapASLocked(pseg, ar, platformEffect)
 	mm.activeMu.RUnlock()
+	return err
 }
 
 // populateVMAAndUnlock is equivalent to populateVMA, but also unconditionally
-// unlocks mm.mappingMu. In cases where populateVMAAndUnlock is usable, it is
-// preferable to populateVMA since it unlocks mm.mappingMu before performing
-// expensive operations that don't require it to be locked.
+// unlocks mm.mappingMu and discards errors. In cases where
+// populateVMAAndUnlock is usable, it is preferable to populateVMA since it
+// unlocks mm.mappingMu before performing expensive operations that don't
+// require it to be locked.
 //
 // Preconditions:
 //   - mm.mappingMu must be locked for writing.
@@ -208,14 +218,16 @@ func (mm *MemoryManager) populateVMA(ctx context.Context, vseg vmaIterator, ar h
 //
 // Postconditions: mm.mappingMu will be unlocked.
 // +checklocksrelease:mm.mappingMu
-func (mm *MemoryManager) populateVMAAndUnlock(ctx context.Context, vseg vmaIterator, ar hostarch.AddrRange, precommit bool) {
-	// See populateVMA above for commentary.
+func (mm *MemoryManager) populateVMAAndUnlock(ctx context.Context, vseg vmaIterator, ar hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect) {
 	if !vseg.ValuePtr().effectivePerms.Any() {
+		// Linux doesn't populate inaccessible pages. See
+		// mm/gup.c:populate_vma_page_range.
 		mm.mappingMu.Unlock()
 		return
 	}
 
 	mm.activeMu.Lock()
+	// Can't defer mm.activeMu.Unlock(); see below.
 
 	if mm.as == nil {
 		mm.activeMu.Unlock()
@@ -226,15 +238,19 @@ func (mm *MemoryManager) populateVMAAndUnlock(ctx context.Context, vseg vmaItera
 	// mm.mappingMu doesn't need to be write-locked for getPMAsLocked, and it
 	// isn't needed at all for mapASLocked.
 	mm.mappingMu.DowngradeLock()
-	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, hostarch.NoAccess)
+	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, hostarch.NoAccess, platformEffect == memmap.PlatformEffectCommit)
 	mm.mappingMu.RUnlock()
 	if err != nil {
+		// mm/util.c:vm_mmap_pgoff() ignores the error, if any, from
+		// mm/gup.c:mm_populate(). If it matters, we'll get it again when
+		// userspace actually tries to use the failing page.
 		mm.activeMu.Unlock()
 		return
 	}
 
+	// As above, errors are silently ignored.
 	mm.activeMu.DowngradeLock()
-	mm.mapASLocked(pseg, ar, precommit)
+	mm.mapASLocked(pseg, ar, platformEffect)
 	mm.activeMu.RUnlock()
 }
 
@@ -268,11 +284,8 @@ func (mm *MemoryManager) MapStack(ctx context.Context) (hostarch.AddrRange, erro
 		return hostarch.AddrRange{}, linuxerr.ENOMEM
 	}
 	stackStart := stackEnd - szaddr
-	var droppedIDs []memmap.MappingIdentity
-	var ar hostarch.AddrRange
-	var err error
 	mm.mappingMu.Lock()
-	_, ar, droppedIDs, err = mm.createVMALocked(ctx, memmap.MMapOpts{
+	_, ar, droppedIDs, err := mm.createVMALocked(ctx, memmap.MMapOpts{
 		Length:    sz,
 		Addr:      stackStart,
 		Perms:     hostarch.ReadWrite,
@@ -280,8 +293,9 @@ func (mm *MemoryManager) MapStack(ctx context.Context) (hostarch.AddrRange, erro
 		Private:   true,
 		GrowsDown: true,
 		MLockMode: mm.defMLockMode,
-		Hint:      "[stack]",
-	}, droppedIDs)
+		Name:      "[stack]",
+		NameMut:   memmap.NameMutAnon,
+	}, nil /* droppedIDs */)
 	mm.mappingMu.Unlock()
 	for _, id := range droppedIDs {
 		id.DecRef(ctx)
@@ -291,6 +305,7 @@ func (mm *MemoryManager) MapStack(ctx context.Context) (hostarch.AddrRange, erro
 
 // MUnmap implements the semantics of Linux's munmap(2).
 func (mm *MemoryManager) MUnmap(ctx context.Context, addr hostarch.Addr, length uint64) error {
+	addr = hostarch.UntaggedUserAddr(addr)
 	if addr != addr.RoundDown() {
 		return linuxerr.EINVAL
 	}
@@ -306,9 +321,8 @@ func (mm *MemoryManager) MUnmap(ctx context.Context, addr hostarch.Addr, length 
 		return linuxerr.EINVAL
 	}
 
-	var droppedIDs []memmap.MappingIdentity
 	mm.mappingMu.Lock()
-	_, droppedIDs = mm.unmapLocked(ctx, ar, droppedIDs)
+	_, droppedIDs := mm.unmapLocked(ctx, ar, nil /* droppedIDs */)
 	mm.mappingMu.Unlock()
 
 	for _, id := range droppedIDs {
@@ -346,6 +360,8 @@ const (
 
 // MRemap implements the semantics of Linux's mremap(2).
 func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldSize uint64, newSize uint64, opts MRemapOpts) (hostarch.Addr, error) {
+	oldAddr = hostarch.UntaggedUserAddr(oldAddr)
+
 	// "Note that old_address has to be page aligned." - mremap(2)
 	if oldAddr.RoundDown() != oldAddr {
 		return 0, linuxerr.EINVAL
@@ -449,12 +465,14 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 			MaxPerms:        vma.maxPerms,
 			Private:         vma.private,
 			GrowsDown:       vma.growsDown,
+			Stack:           vma.isStack,
 			MLockMode:       vma.mlockMode,
-			Hint:            vma.hint,
+			Name:            vma.name,
+			NameMut:         vma.nameMut,
 		}, droppedIDs)
 		if err == nil {
 			if vma.mlockMode == memmap.MLockEager {
-				mm.populateVMA(ctx, vseg, ar, true)
+				mm.populateVMA(ctx, vseg, ar, memmap.PlatformEffectCommit)
 			}
 			return oldAddr, nil
 		}
@@ -561,7 +579,7 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 		if vma.mlockMode != memmap.MLockNone {
 			mm.lockedAS += uint64(newAR.Length())
 			if vma.mlockMode == memmap.MLockEager {
-				mm.populateVMA(ctx, vseg, newAR, true)
+				mm.populateVMA(ctx, vseg, newAR, memmap.PlatformEffectCommit)
 			}
 		}
 		return newAR.Start, nil
@@ -605,7 +623,7 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 	}
 
 	if vma.mlockMode == memmap.MLockEager {
-		mm.populateVMA(ctx, vseg, newAR, true)
+		mm.populateVMA(ctx, vseg, newAR, memmap.PlatformEffectCommit)
 	}
 
 	return newAR.Start, nil
@@ -613,6 +631,7 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 
 // MProtect implements the semantics of Linux's mprotect(2).
 func (mm *MemoryManager) MProtect(addr hostarch.Addr, length uint64, realPerms hostarch.AccessType, growsDown bool) error {
+	addr = hostarch.UntaggedUserAddr(addr)
 	if addr.RoundDown() != addr {
 		return linuxerr.EINVAL
 	}
@@ -657,10 +676,10 @@ func (mm *MemoryManager) MProtect(addr hostarch.Addr, length uint64, realPerms h
 	mm.activeMu.Lock()
 	defer mm.activeMu.Unlock()
 	defer func() {
-		mm.vmas.MergeRange(ar)
-		mm.vmas.MergeAdjacent(ar)
-		mm.pmas.MergeRange(ar)
-		mm.pmas.MergeAdjacent(ar)
+		mm.vmas.MergeInsideRange(ar)
+		mm.vmas.MergeOutsideRange(ar)
+		mm.pmas.MergeInsideRange(ar)
+		mm.pmas.MergeOutsideRange(ar)
 	}()
 	pseg := mm.pmas.LowerBoundSegment(ar.Start)
 	var didUnmapAS bool
@@ -787,7 +806,8 @@ func (mm *MemoryManager) Brk(ctx context.Context, addr hostarch.Addr) (hostarch.
 			// Linux: mm/mmap.c:sys_brk() => do_brk_flags() includes
 			// mm->def_flags.
 			MLockMode: mm.defMLockMode,
-			Hint:      "[heap]",
+			Name:      "[heap]",
+			NameMut:   memmap.NameMutAnon,
 		}, droppedIDs)
 		if err != nil {
 			addr = mm.brk.End
@@ -796,7 +816,7 @@ func (mm *MemoryManager) Brk(ctx context.Context, addr hostarch.Addr) (hostarch.
 		}
 		mm.brk.End = addr
 		if mm.defMLockMode == memmap.MLockEager {
-			mm.populateVMAAndUnlock(ctx, vseg, ar, true)
+			mm.populateVMAAndUnlock(ctx, vseg, ar, memmap.PlatformEffectCommit)
 		} else {
 			mm.mappingMu.Unlock()
 		}
@@ -816,6 +836,7 @@ func (mm *MemoryManager) Brk(ctx context.Context, addr hostarch.Addr) (hostarch.
 // MLock implements the semantics of Linux's mlock()/mlock2()/munlock(),
 // depending on mode.
 func (mm *MemoryManager) MLock(ctx context.Context, addr hostarch.Addr, length uint64, mode memmap.MLockMode) error {
+	addr = hostarch.UntaggedUserAddr(addr)
 	// Linux allows this to overflow.
 	la, _ := hostarch.Addr(length + addr.PageOffset()).RoundUp()
 	ar, ok := addr.RoundDown().ToRange(uint64(la))
@@ -869,8 +890,8 @@ func (mm *MemoryManager) MLock(ctx context.Context, addr hostarch.Addr, length u
 		}
 		vseg, _ = vseg.NextNonEmpty()
 	}
-	mm.vmas.MergeRange(ar)
-	mm.vmas.MergeAdjacent(ar)
+	mm.vmas.MergeInsideRange(ar)
+	mm.vmas.MergeOutsideRange(ar)
 	if unmapped {
 		mm.mappingMu.Unlock()
 		return linuxerr.ENOMEM
@@ -890,7 +911,7 @@ func (mm *MemoryManager) MLock(ctx context.Context, addr hostarch.Addr, length u
 				mm.mappingMu.RUnlock()
 				return linuxerr.ENOMEM
 			}
-			_, _, err := mm.getPMAsLocked(ctx, vseg, vseg.Range().Intersect(ar), hostarch.NoAccess)
+			_, _, err := mm.getPMAsLocked(ctx, vseg, vseg.Range().Intersect(ar), hostarch.NoAccess, true /* callerIndirectCommit */)
 			if err != nil {
 				mm.activeMu.Unlock()
 				mm.mappingMu.RUnlock()
@@ -909,7 +930,7 @@ func (mm *MemoryManager) MLock(ctx context.Context, addr hostarch.Addr, length u
 		mm.mappingMu.RUnlock()
 		if mm.as != nil {
 			mm.activeMu.DowngradeLock()
-			err := mm.mapASLocked(mm.pmas.LowerBoundSegment(ar.Start), ar, true /* precommit */)
+			err := mm.mapASLocked(mm.pmas.LowerBoundSegment(ar.Start), ar, memmap.PlatformEffectCommit)
 			mm.activeMu.RUnlock()
 			if err != nil {
 				return err
@@ -985,7 +1006,7 @@ func (mm *MemoryManager) MLockAll(ctx context.Context, opts MLockAllOpts) error 
 		mm.mappingMu.DowngradeLock()
 		for vseg := mm.vmas.FirstSegment(); vseg.Ok(); vseg = vseg.NextSegment() {
 			if vseg.ValuePtr().effectivePerms.Any() {
-				mm.getPMAsLocked(ctx, vseg, vseg.Range(), hostarch.NoAccess)
+				mm.getPMAsLocked(ctx, vseg, vseg.Range(), hostarch.NoAccess, true /* callerIndirectCommit */)
 			}
 		}
 
@@ -993,7 +1014,7 @@ func (mm *MemoryManager) MLockAll(ctx context.Context, opts MLockAllOpts) error 
 		mm.mappingMu.RUnlock()
 		if mm.as != nil {
 			mm.activeMu.DowngradeLock()
-			mm.mapASLocked(mm.pmas.FirstSegment(), mm.applicationAddrRange(), true /* precommit */)
+			mm.mapASLocked(mm.pmas.FirstSegment(), mm.applicationAddrRange(), memmap.PlatformEffectCommit)
 			mm.activeMu.RUnlock()
 		} else {
 			mm.activeMu.Unlock()
@@ -1034,8 +1055,8 @@ func (mm *MemoryManager) SetNumaPolicy(addr hostarch.Addr, length uint64, policy
 	mm.mappingMu.Lock()
 	defer mm.mappingMu.Unlock()
 	defer func() {
-		mm.vmas.MergeRange(ar)
-		mm.vmas.MergeAdjacent(ar)
+		mm.vmas.MergeInsideRange(ar)
+		mm.vmas.MergeOutsideRange(ar)
 	}()
 	vseg := mm.vmas.LowerBoundSegment(ar.Start)
 	lastEnd := ar.Start
@@ -1057,37 +1078,42 @@ func (mm *MemoryManager) SetNumaPolicy(addr hostarch.Addr, length uint64, policy
 	}
 }
 
-// SetDontFork implements the semantics of madvise MADV_DONTFORK.
-func (mm *MemoryManager) SetDontFork(addr hostarch.Addr, length uint64, dontfork bool) error {
-	ar, ok := addr.ToRange(length)
+// madviseAddrRange converts addr and length to an AddrRange as for madvise(2)
+// (and prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME) =>
+// mm/madvise.c:madvise_vma_anon_name().)
+func madviseAddrRange(addr hostarch.Addr, length uint64) (hostarch.AddrRange, error) {
+	// All quotes from the man page:
+	// "madvise() only operates on whole pages, therefore addr must be
+	// page-aligned."
+	if !addr.IsPageAligned() {
+		// "EINVAL: addr is not page-aligned or length is negative." Note that
+		// length is size_t which is unsigned, so "length is negative" is
+		// impossible, but we take this as referring to the next check (for
+		// which Linux also returns EINVAL).
+		return hostarch.AddrRange{}, linuxerr.EINVAL
+	}
+	// "The value of length is rounded up to a multiple of page size."
+	lengthRounded, ok := hostarch.PageRoundUp(length)
 	if !ok {
-		return linuxerr.EINVAL
+		return hostarch.AddrRange{}, linuxerr.EINVAL
 	}
-
-	mm.mappingMu.Lock()
-	defer mm.mappingMu.Unlock()
-	defer func() {
-		mm.vmas.MergeRange(ar)
-		mm.vmas.MergeAdjacent(ar)
-	}()
-
-	for vseg := mm.vmas.LowerBoundSegment(ar.Start); vseg.Ok() && vseg.Start() < ar.End; vseg = vseg.NextSegment() {
-		vseg = mm.vmas.Isolate(vseg, ar)
-		vma := vseg.ValuePtr()
-		vma.dontfork = dontfork
+	ar, ok := addr.ToRange(lengthRounded)
+	if !ok {
+		// Not specified, but Linux also returns EINVAL in this case.
+		return hostarch.AddrRange{}, linuxerr.EINVAL
 	}
-
-	if mm.vmas.SpanRange(ar) != ar.Length() {
-		return linuxerr.ENOMEM
-	}
-	return nil
+	return ar, nil
 }
 
 // Decommit implements the semantics of Linux's madvise(MADV_DONTNEED).
 func (mm *MemoryManager) Decommit(addr hostarch.Addr, length uint64) error {
-	ar, ok := addr.ToRange(length)
-	if !ok {
-		return linuxerr.EINVAL
+	addr = hostarch.UntaggedUserAddr(addr)
+	ar, err := madviseAddrRange(addr, length)
+	if err != nil {
+		return err
+	}
+	if length == 0 {
+		return nil
 	}
 
 	mm.mappingMu.RLock()
@@ -1096,11 +1122,24 @@ func (mm *MemoryManager) Decommit(addr hostarch.Addr, length uint64) error {
 	defer mm.activeMu.Unlock()
 
 	// This is invalidateLocked(invalidatePrivate=true, invalidateShared=true),
-	// with the additional wrinkle that we must refuse to invalidate pmas under
-	// mlocked vmas.
-	var didUnmapAS bool
+	// but:
+	//
+	//	- We must refuse to invalidate pmas under mlocked vmas.
+	//
+	//	- If at least one byte in ar is not covered by a vma, decommit the rest
+	//	but return ENOMEM.
+	//
+	//	- If we would invalidate only part of a huge page that we own (is not
+	//	copy-on-write), use MemoryFile.Decommit() instead to keep the allocated
+	//	huge page intact for future use.
+	didUnmapAS := false
 	pseg := mm.pmas.LowerBoundSegment(ar.Start)
-	for vseg := mm.vmas.LowerBoundSegment(ar.Start); vseg.Ok() && vseg.Start() < ar.End; vseg = vseg.NextSegment() {
+	vseg := mm.vmas.LowerBoundSegment(ar.Start)
+	if !vseg.Ok() {
+		return linuxerr.ENOMEM
+	}
+	hadvgap := ar.Start < vseg.Start()
+	for vseg.Ok() && vseg.Start() < ar.End {
 		vma := vseg.ValuePtr()
 		if vma.mlockMode != memmap.MLockNone {
 			return linuxerr.EINVAL
@@ -1114,32 +1153,192 @@ func (mm *MemoryManager) Decommit(addr hostarch.Addr, length uint64) error {
 			}
 		}
 		for pseg.Ok() && pseg.Start() < vsegAR.End {
-			pseg = mm.pmas.Isolate(pseg, vsegAR)
 			pma := pseg.ValuePtr()
+			if pma.huge && !mm.isPMACopyOnWriteLocked(vseg, pseg) {
+				psegAR := pseg.Range().Intersect(vsegAR)
+				if !psegAR.IsHugePageAligned() {
+					firstHugeStart := psegAR.Start.HugeRoundDown()
+					firstHugeEnd := firstHugeStart + hostarch.HugePageSize
+					lastWholeHugeEnd := psegAR.End.HugeRoundDown()
+					if firstHugeStart != psegAR.Start {
+						// psegAR.Start is not hugepage-aligned.
+						if psegAR.End <= firstHugeEnd {
+							// All of psegAR falls within a single huge page.
+							mm.mf.Decommit(pseg.fileRangeOf(psegAR))
+							pseg = pseg.NextSegment()
+							continue
+						}
+						if firstHugeEnd == lastWholeHugeEnd && lastWholeHugeEnd != psegAR.End {
+							// All of psegAR falls within two huge pages, and
+							// psegAR.End is also not hugepage-aligned. The
+							// logic below would handle this correctly, but
+							// would make two separate calls to
+							// MemoryFile.Decommit() for the first and last
+							// huge pages respectively.
+							mm.mf.Decommit(pseg.fileRangeOf(psegAR))
+							pseg = pseg.NextSegment()
+							continue
+						}
+						mm.mf.Decommit(pseg.fileRangeOf(hostarch.AddrRange{psegAR.Start, firstHugeEnd}))
+						psegAR.Start = firstHugeEnd
+					}
+					// Drop whole huge pages between psegAR.Start (which after the above
+					// is either firstHugeStart or firstHugeEnd) and lastWholeHugeEnd
+					// normally.
+					if psegAR.Start < lastWholeHugeEnd {
+						pseg = mm.pmas.Isolate(pseg, hostarch.AddrRange{psegAR.Start, lastWholeHugeEnd})
+						pma = pseg.ValuePtr()
+						if !didUnmapAS {
+							// Unmap all of ar, not just pseg.Range(), to minimize host
+							// syscalls. AddressSpace mappings must be removed before
+							// pma.file.DecRef().
+							mm.unmapASLocked(ar)
+							didUnmapAS = true
+						}
+						pma.file.DecRef(pseg.fileRange())
+						mm.removeRSSLocked(pseg.Range())
+						pseg = mm.pmas.Remove(pseg).NextSegment()
+					}
+					if lastWholeHugeEnd != psegAR.End {
+						// psegAR.End is not hugepage-aligned.
+						mm.mf.Decommit(pseg.fileRangeOf(hostarch.AddrRange{lastWholeHugeEnd, psegAR.End}))
+						pseg = pseg.NextSegment()
+					}
+					continue
+				}
+			}
+			pseg = mm.pmas.Isolate(pseg, vsegAR)
+			pma = pseg.ValuePtr()
 			if !didUnmapAS {
 				// Unmap all of ar, not just pseg.Range(), to minimize host
 				// syscalls. AddressSpace mappings must be removed before
-				// mm.decPrivateRef().
+				// pma.file.DecRef().
 				mm.unmapASLocked(ar)
 				didUnmapAS = true
-			}
-			if pma.private {
-				mm.decPrivateRef(pseg.fileRange())
 			}
 			pma.file.DecRef(pseg.fileRange())
 			mm.removeRSSLocked(pseg.Range())
 			pseg = mm.pmas.Remove(pseg).NextSegment()
 		}
+		if ar.End <= vseg.End() {
+			break
+		}
+		vgap := vseg.NextGap()
+		if !vgap.IsEmpty() {
+			hadvgap = true
+		}
+		vseg = vgap.NextSegment()
 	}
 
 	// "If there are some parts of the specified address space that are not
 	// mapped, the Linux version of madvise() ignores them and applies the call
 	// to the rest (but returns ENOMEM from the system call, as it should)." -
 	// madvise(2)
-	if mm.vmas.SpanRange(ar) != ar.Length() {
+	if hadvgap {
 		return linuxerr.ENOMEM
 	}
 	return nil
+}
+
+// madviseMutateVMAs is similar to mm.vmas.MutateRange(), but:
+//
+// - madviseMutateVMAs locks mm.mappingMu for writing, as required to mutate
+// mm.vmas.
+//
+// - If f returns a non-nil error, madviseMutateVMAs stops iteration and
+// returns the error.
+//
+// - Consistent with Linux madvise(): "If there are some parts of the specified
+// address range that are not mapped, the Linux version of madvise() ignores
+// them and applies the call to the rest (but returns ENOMEM from the system
+// call, as it should)."
+func (mm *MemoryManager) madviseMutateVMAs(addr hostarch.Addr, length uint64, f func(vseg vmaIterator) error) error {
+	ar, err := madviseAddrRange(addr, length)
+	if err != nil {
+		return err
+	}
+	if length == 0 {
+		return nil
+	}
+
+	mm.mappingMu.Lock()
+	defer mm.mappingMu.Unlock()
+	vseg := mm.vmas.LowerBoundSegmentSplitBefore(ar.Start)
+	if !vseg.Ok() {
+		return linuxerr.ENOMEM
+	}
+	hadvgap := ar.Start < vseg.Start()
+	for vseg.Start() < ar.End {
+		vseg = mm.vmas.SplitAfter(vseg, ar.End)
+		err := f(vseg)
+		vseg = mm.vmas.MergePrev(vseg)
+		if err != nil {
+			mm.vmas.MergeNext(vseg)
+			return err
+		}
+		if ar.End <= vseg.End() {
+			mm.vmas.MergeNext(vseg)
+			break
+		}
+		vgap := vseg.NextGap()
+		if !vgap.IsEmpty() {
+			hadvgap = true
+		}
+		vseg = vgap.NextSegment()
+		if !vseg.Ok() {
+			// No VMA reaching to the end of ar.
+			return linuxerr.ENOMEM
+		}
+	}
+	if hadvgap {
+		return linuxerr.ENOMEM
+	}
+	return nil
+}
+
+// SetDontFork implements the semantics of madvise MADV_DONTFORK.
+//
+// Preconditions: addr and length are page-aligned.
+func (mm *MemoryManager) SetDontFork(addr hostarch.Addr, length uint64, dontfork bool) error {
+	addr = hostarch.UntaggedUserAddr(addr)
+	return mm.madviseMutateVMAs(addr, length, func(vseg vmaIterator) error {
+		vseg.ValuePtr().dontfork = dontfork
+		return nil
+	})
+}
+
+// SetVMAAnonName implements the semantics of Linux's
+// prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME).
+func (mm *MemoryManager) SetVMAAnonName(addr hostarch.Addr, length uint64, name string, nameIsNil bool) error {
+	// Check that name contains only valid characters; compare Linux
+	// kernel/sys.c:is_valid_name_char(). `for ... := range string`
+	// iterates Unicode runes, not bytes.
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c <= 0x1f || c >= 0x7f || c == '\\' || c == '`' || c == '$' || c == '[' || c == ']' {
+			return linuxerr.EINVAL
+		}
+	}
+
+	return mm.madviseMutateVMAs(addr, length, func(vseg vmaIterator) error {
+		vma := vseg.ValuePtr()
+		if vma.nameMut == memmap.NameMutDisallowed {
+			return linuxerr.EBADF
+		}
+		if nameIsNil {
+			vma.name = ""
+			return nil
+		}
+		switch vma.nameMut {
+		case memmap.NameMutAnon:
+			vma.name = fmt.Sprintf("[anon:%s]", name)
+		case memmap.NameMutAnonShmem:
+			vma.name = fmt.Sprintf("[anon_shmem:%s]", name)
+		default:
+			panic(fmt.Sprintf("unknown memmap.NameMut: %d", vma.nameMut))
+		}
+		return nil
+	})
 }
 
 // MSyncOpts holds options to MSync.
@@ -1153,6 +1352,7 @@ type MSyncOpts struct {
 
 // MSync implements the semantics of Linux's msync().
 func (mm *MemoryManager) MSync(ctx context.Context, addr hostarch.Addr, length uint64, opts MSyncOpts) error {
+	addr = hostarch.UntaggedUserAddr(addr)
 	if addr != addr.RoundDown() {
 		return linuxerr.EINVAL
 	}
@@ -1322,7 +1522,7 @@ func (mm *MemoryManager) IsMembarrierRSeqEnabled() bool {
 }
 
 // FindVMAByName finds a vma with the specified name and returns its start address and offset.
-func (mm *MemoryManager) FindVMAByName(ar hostarch.AddrRange, hint string) (hostarch.Addr, uint64, error) {
+func (mm *MemoryManager) FindVMAByName(ar hostarch.AddrRange, name string) (hostarch.Addr, uint64, error) {
 	mm.mappingMu.RLock()
 	defer mm.mappingMu.RUnlock()
 
@@ -1333,9 +1533,9 @@ func (mm *MemoryManager) FindVMAByName(ar hostarch.AddrRange, hint string) (host
 		}
 		vma := vseg.ValuePtr()
 
-		if vma.hint == hint {
+		if vma.name == name {
 			return start, vma.off, nil
 		}
 	}
-	return 0, 0, fmt.Errorf("could not find \"%s\" in %s", hint, ar)
+	return 0, 0, fmt.Errorf("could not find %q in %s", name, ar)
 }

@@ -118,6 +118,7 @@ type fdDirInode struct {
 	kernfs.InodeTemporary
 	kernfs.InodeWatches
 	kernfs.OrderedChildren
+	kernfs.InodeFSOwned
 }
 
 var _ kernfs.Inode = (*fdDirInode)(nil)
@@ -202,6 +203,7 @@ type fdSymlink struct {
 	kernfs.InodeNotAnonymous
 	kernfs.InodeSymlink
 	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	fs   *filesystem
 	task *kernel.Task
@@ -245,7 +247,7 @@ func (s *fdSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.VirtualDen
 }
 
 // Valid implements kernfs.Inode.Valid.
-func (s *fdSymlink) Valid(ctx context.Context) bool {
+func (s *fdSymlink) Valid(ctx context.Context, parent *kernfs.Dentry, name string) bool {
 	return taskFDExists(ctx, s.fs, s.task, s.fd)
 }
 
@@ -264,6 +266,7 @@ type fdInfoDirInode struct {
 	kernfs.InodeTemporary
 	kernfs.InodeWatches
 	kernfs.OrderedChildren
+	kernfs.InodeFSOwned
 }
 
 var _ kernfs.Inode = (*fdInfoDirInode)(nil)
@@ -349,6 +352,6 @@ func (d *fdInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 }
 
 // Valid implements kernfs.Inode.Valid.
-func (d *fdInfoData) Valid(ctx context.Context) bool {
+func (d *fdInfoData) Valid(ctx context.Context, parent *kernfs.Dentry, name string) bool {
 	return taskFDExists(ctx, d.fs, d.task, d.fd)
 }

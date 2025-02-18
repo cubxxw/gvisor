@@ -305,7 +305,11 @@ func (d *commData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 // Write implements vfs.WritableDynamicBytesSource.Write.
 func (d *commData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
 	srclen := src.NumBytes()
-	name := make([]byte, srclen)
+	nameLen := int64(linux.TASK_COMM_LEN - 1)
+	if srclen < nameLen {
+		nameLen = srclen
+	}
+	name := make([]byte, nameLen)
 	if _, err := src.CopyIn(ctx, name); err != nil {
 		return 0, err
 	}
@@ -418,6 +422,7 @@ type memInode struct {
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
 	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	task  *kernel.Task
 	locks vfs.FileLocks
@@ -739,6 +744,7 @@ type statusInode struct {
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
 	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	task  *kernel.Task
 	pidns *kernel.PIDNamespace
@@ -977,6 +983,7 @@ type exeSymlink struct {
 	kernfs.InodeNotAnonymous
 	kernfs.InodeSymlink
 	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	fs   *filesystem
 	task *kernel.Task
@@ -1050,6 +1057,7 @@ type cwdSymlink struct {
 	kernfs.InodeNotAnonymous
 	kernfs.InodeSymlink
 	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	fs   *filesystem
 	task *kernel.Task
@@ -1112,6 +1120,7 @@ type rootSymlink struct {
 	kernfs.InodeNotAnonymous
 	kernfs.InodeSymlink
 	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	fs   *filesystem
 	task *kernel.Task
@@ -1192,8 +1201,7 @@ func (i *mountInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		return nil
 	}
 	defer i.fs.SafeDecRef(ctx, rootDir)
-	i.task.Kernel().VFS().GenerateProcMountInfo(ctx, rootDir, buf)
-	return nil
+	return i.task.Kernel().VFS().GenerateProcMountInfo(ctx, rootDir, buf)
 }
 
 // mountsData is used to implement /proc/[pid]/mounts.
@@ -1224,8 +1232,7 @@ func (i *mountsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		return nil
 	}
 	defer i.fs.SafeDecRef(ctx, rootDir)
-	i.task.Kernel().VFS().GenerateProcMounts(ctx, rootDir, buf)
-	return nil
+	return i.task.Kernel().VFS().GenerateProcMounts(ctx, rootDir, buf)
 }
 
 // +stateify savable
@@ -1356,6 +1363,7 @@ type namespaceInode struct {
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
 	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	locks vfs.FileLocks
 }

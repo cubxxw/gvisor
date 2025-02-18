@@ -36,8 +36,8 @@ go_template_instance(
     prefix = "endpoint",
     template = "//pkg/ilist:generic_list",
     types = {
-        "Element": "*endpoint",
-        "Linker": "*endpoint",
+        "Element": "*Endpoint",
+        "Linker": "*Endpoint",
     },
 )
 
@@ -66,6 +66,7 @@ go_library(
         "segment_state.go",
         "segment_unsafe.go",
         "snd.go",
+        "state.go",
         "tcp_endpoint_list.go",
         "tcp_segment_list.go",
         "tcp_segment_refs.go",
@@ -99,6 +100,7 @@ go_test(
     name = "tcp_test",
     size = "small",
     srcs = [
+        "cubic_test.go",
         "main_test.go",
         "segment_test.go",
         "timer_test.go",
@@ -108,7 +110,9 @@ go_test(
         "//pkg/buffer",
         "//pkg/refs",
         "//pkg/sleep",
+        "//pkg/tcpip",
         "//pkg/tcpip/faketime",
+        "//pkg/tcpip/seqnum",
         "//pkg/tcpip/stack",
         "@com_github_google_go_cmp//cmp:go_default_library",
     ],

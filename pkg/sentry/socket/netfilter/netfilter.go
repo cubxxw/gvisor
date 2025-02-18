@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -34,7 +35,7 @@ import (
 // enableLogging controls whether to log the (de)serialization of netfilter
 // structs between userspace and netstack. These logs are useful when
 // developing iptables, but can pollute sentry logs otherwise.
-const enableLogging = false
+const enableLogging = true
 
 // nflog logs messages related to the writing and reading of iptables.
 func nflog(format string, args ...any) {
@@ -173,9 +174,15 @@ func setHooksAndUnderflow(info *linux.IPTGetinfo, table stack.Table, offset uint
 	}
 }
 
+// An IDMapper maps UIDs and GIDs to KUIDs and KGIDs.
+type IDMapper interface {
+	MapToKUID(uid auth.UID) auth.KUID
+	MapToKGID(uid auth.GID) auth.KGID
+}
+
 // SetEntries sets iptables rules for a single table. See
 // net/ipv4/netfilter/ip_tables.c:translate_table for reference.
-func SetEntries(task *kernel.Task, stk *stack.Stack, optVal []byte, ipv6 bool) *syserr.Error {
+func SetEntries(mapper IDMapper, stk *stack.Stack, optVal []byte, ipv6 bool) *syserr.Error {
 	var replace linux.IPTReplace
 	optVal = replace.UnmarshalBytes(optVal)
 
@@ -193,9 +200,9 @@ func SetEntries(task *kernel.Task, stk *stack.Stack, optVal []byte, ipv6 bool) *
 	var err *syserr.Error
 	var offsets map[uint32]int
 	if ipv6 {
-		offsets, err = modifyEntries6(task, stk, optVal, &replace, &table)
+		offsets, err = modifyEntries6(mapper, stk, optVal, &replace, &table)
 	} else {
-		offsets, err = modifyEntries4(task, stk, optVal, &replace, &table)
+		offsets, err = modifyEntries4(mapper, stk, optVal, &replace, &table)
 	}
 	if err != nil {
 		return err
@@ -270,20 +277,6 @@ func SetEntries(task *kernel.Task, stk *stack.Stack, optVal []byte, ipv6 bool) *
 		table.Rules[ruleIdx] = rule
 	}
 
-	// Since we don't support FORWARD, yet, make sure all other chains point to
-	// ACCEPT rules.
-	for hook, ruleIdx := range table.BuiltinChains {
-		if hook := stack.Hook(hook); hook == stack.Forward {
-			if ruleIdx == stack.HookUnset {
-				continue
-			}
-			if !isUnconditionalAccept(table.Rules[ruleIdx], ipv6) {
-				nflog("hook %d is unsupported.", hook)
-				return syserr.ErrInvalidArgument
-			}
-		}
-	}
-
 	// TODO(gvisor.dev/issue/6167): Check the following conditions:
 	//	- There are no loops.
 	//	- There are no chains without an unconditional final rule.
@@ -295,7 +288,7 @@ func SetEntries(task *kernel.Task, stk *stack.Stack, optVal []byte, ipv6 bool) *
 
 // parseMatchers parses 0 or more matchers from optVal. optVal should contain
 // only the matchers.
-func parseMatchers(task *kernel.Task, filter stack.IPHeaderFilter, optVal []byte) ([]stack.Matcher, error) {
+func parseMatchers(mapper IDMapper, filter stack.IPHeaderFilter, optVal []byte) ([]stack.Matcher, error) {
 	nflog("set entries: parsing matchers of size %d", len(optVal))
 	var matchers []stack.Matcher
 	for len(optVal) > 0 {
@@ -317,11 +310,14 @@ func parseMatchers(task *kernel.Task, filter stack.IPHeaderFilter, optVal []byte
 			return nil, fmt.Errorf("optVal has insufficient size for match: %d", len(optVal))
 		}
 
-		// Parse the specific matcher.
-		matcher, err := unmarshalMatcher(task, match, filter, optVal[linux.SizeOfXTEntryMatch:match.MatchSize])
+		// Starting with the highest supported revision, try to unmarshal
+		// with each revision down to 0; if all revisions fail, give up.
+		matcher, err := unmarshalMatcherRevs(mapper, &match, filter, optVal)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create matcher: %v", err)
+			return nil, fmt.Errorf("failed to create matcher: %v", match)
 		}
+
+		nflog("set entries: found matcher for: %+v", match)
 		matchers = append(matchers, matcher)
 
 		// TODO(gvisor.dev/issue/6167): Check the revision field.
@@ -333,6 +329,49 @@ func parseMatchers(task *kernel.Task, filter stack.IPHeaderFilter, optVal []byte
 	}
 
 	return matchers, nil
+}
+
+// unmarshalMatcherRevs tries to unmarshal matchers with the same name,
+// starting with the highest revision down to 0. If all revisions fail,
+// it returns the most recent (lowest revision's) "unmarshalMatcher"
+// error.
+func unmarshalMatcherRevs(mapper IDMapper, match *linux.XTEntryMatch, filter stack.IPHeaderFilter, optVal []byte) (stack.Matcher, error) {
+	var (
+		matcher stack.Matcher
+		err     error
+	)
+
+	// Get the highest supported revision for the matcher.
+	maxRev, found := matchMakerRevision(match.Name.String(), 0)
+	if !found {
+		return nil, fmt.Errorf(
+			"unmarshalMatcherRevs: failed to find matcher with name: %s",
+			match.Name,
+		)
+	}
+
+	for {
+		match.Revision = maxRev
+
+		nflog("unmarshalMatcherRevs: attempting to find matcher: %+v", match)
+		matcher, err = unmarshalMatcher(
+			mapper, match, filter,
+			optVal[linux.SizeOfXTEntryMatch:match.MatchSize],
+		)
+
+		// A match was found.
+		if err == nil {
+			break
+		}
+
+		if maxRev == 0 {
+			break
+		}
+
+		maxRev--
+	}
+
+	return matcher, err
 }
 
 func validUnderflow(rule stack.Rule, ipv6 bool) bool {
@@ -374,6 +413,31 @@ func hookFromLinux(hook int) stack.Hook {
 	panic(fmt.Sprintf("Unknown hook %d does not correspond to a builtin chain", hook))
 }
 
+// MatchRevision returns a "linux.XTGetRevision" for a given
+// matcher. It sets "Revision" to the highest supported value,
+// unless the provided revision number is higher.
+func MatchRevision(t *kernel.Task, revPtr hostarch.Addr) (linux.XTGetRevision, *syserr.Error) {
+	// Read in the matcher name and version.
+	var rev linux.XTGetRevision
+
+	if _, err := rev.CopyIn(t, revPtr); err != nil {
+		return linux.XTGetRevision{}, syserr.FromError(err)
+	}
+
+	maxSupported, ok := matchMakerRevision(rev.Name.String(), rev.Revision)
+	if !ok {
+		// Return ENOENT if there's no matcher with that name.
+		return linux.XTGetRevision{}, syserr.ErrNoFileOrDir
+	}
+
+	if maxSupported < rev.Revision {
+		// Return EPROTONOSUPPORT if we have an insufficient revision.
+		return linux.XTGetRevision{}, syserr.ErrProtocolNotSupported
+	}
+
+	return rev, nil
+}
+
 // TargetRevision returns a linux.XTGetRevision for a given target. It sets
 // Revision to the highest supported value, unless the provided revision number
 // is larger.
@@ -385,9 +449,13 @@ func TargetRevision(t *kernel.Task, revPtr hostarch.Addr, netProto tcpip.Network
 	}
 	maxSupported, ok := targetRevision(rev.Name.String(), netProto, rev.Revision)
 	if !ok {
+		// Return ENOENT if there's no target with that name.
+		return linux.XTGetRevision{}, syserr.ErrNoFileOrDir
+	}
+	if maxSupported < rev.Revision {
+		// Return EPROTONOSUPPORT if we have an insufficient revision.
 		return linux.XTGetRevision{}, syserr.ErrProtocolNotSupported
 	}
-	rev.Revision = maxSupported
 	return rev, nil
 }
 

@@ -15,7 +15,7 @@
 //go:build linux
 // +build linux
 
-// Package sharedmem provides the implemention of data-link layer endpoints
+// Package sharedmem provides the implementation of data-link layer endpoints
 // backed by shared memory.
 //
 // Shared memory endpoints can be used in the networking stack by calling New()
@@ -30,10 +30,10 @@ import (
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/eventfd"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/rawfile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sharedmem/queue"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -41,6 +41,8 @@ import (
 // QueueConfig holds all the file descriptors needed to describe a tx or rx
 // queue over shared memory. It is used when creating new shared memory
 // endpoints to describe tx and rx queues.
+//
+// +stateify savable
 type QueueConfig struct {
 	// DataFD is a file descriptor for the file that contains the data to
 	// be transmitted via this queue. Descriptors contain offsets within
@@ -92,6 +94,8 @@ func QueueConfigFromFDs(fds []int) (QueueConfig, error) {
 }
 
 // Options specify the details about the sharedmem endpoint to be created.
+//
+// +stateify savable
 type Options struct {
 	// MTU is the mtu to use for this endpoint.
 	MTU uint32
@@ -142,18 +146,11 @@ type Options struct {
 var _ stack.LinkEndpoint = (*endpoint)(nil)
 var _ stack.GSOEndpoint = (*endpoint)(nil)
 
+// +stateify savable
 type endpoint struct {
-	// mtu (maximum transmission unit) is the maximum size of a packet.
-	// mtu is immutable.
-	mtu uint32
-
 	// bufferSize is the size of each individual buffer.
 	// bufferSize is immutable.
 	bufferSize uint32
-
-	// addr is the local address of this endpoint.
-	// addr is immutable.
-	addr tcpip.LinkAddress
 
 	// peerFD is an fd to the peer that can be used to detect when the
 	// peer is gone.
@@ -187,10 +184,11 @@ type endpoint struct {
 
 	// onClosed is a function to be called when the FD's peer (if any) closes
 	// its end of the communication pipe.
-	onClosed func(tcpip.Error)
+	// TODO(b/341946753): Restore when netstack is savable.
+	onClosed func(tcpip.Error) `state:"nosave"`
 
 	// mu protects the following fields.
-	mu sync.Mutex
+	mu endpointRWMutex `state:"nosave"`
 
 	// tx is the transmit queue.
 	// +checklocks:mu
@@ -199,6 +197,14 @@ type endpoint struct {
 	// workerStarted specifies whether the worker goroutine was started.
 	// +checklocks:mu
 	workerStarted bool
+
+	// addr is the local address of this endpoint.
+	//
+	// +checklocks:mu
+	addr tcpip.LinkAddress
+	// mtu (maximum transmission unit) is the maximum size of a packet.
+	// +checklocks:mu
+	mtu uint32
 }
 
 // New creates a new shared-memory-based endpoint. Buffers will be broken up
@@ -247,12 +253,18 @@ func New(opts Options) (stack.LinkEndpoint, error) {
 	return e, nil
 }
 
+// SetOnCloseAction implements stack.LinkEndpoint.SetOnCloseAction.
+func (e *endpoint) SetOnCloseAction(func()) {}
+
 // Close frees most resources associated with the endpoint. Wait() must be
 // called after Close() in order to free the rest.
 func (e *endpoint) Close() {
 	// Tell dispatch goroutine to stop, then write to the eventfd so that
 	// it wakes up in case it's sleeping.
-	e.stopRequested.Store(1)
+	if e.stopRequested.Swap(1) == 1 {
+		// It is already closed.
+		return
+	}
 	e.rx.eventFD.Notify()
 
 	// Cleanup the queues inline if the worker hasn't started yet; we also
@@ -294,9 +306,13 @@ func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
 				b := make([]byte, 1)
 				// When sharedmem endpoint is in use the peerFD is never used for any data
 				// transfer and this Read should only return if the peer is shutting down.
-				_, err := rawfile.BlockingRead(e.peerFD, b)
+				_, errno := rawfile.BlockingRead(e.peerFD, b)
 				if e.onClosed != nil {
-					e.onClosed(err)
+					if errno == 0 {
+						e.onClosed(nil)
+					} else {
+						e.onClosed(tcpip.TranslateErrno(errno))
+					}
 				}
 			}()
 		}
@@ -316,10 +332,17 @@ func (e *endpoint) IsAttached() bool {
 	return e.workerStarted
 }
 
-// MTU implements stack.LinkEndpoint.MTU. It returns the value initialized
-// during construction.
+// MTU implements stack.LinkEndpoint.MTU.
 func (e *endpoint) MTU() uint32 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.mtu
+}
+
+func (e *endpoint) SetMTU(mtu uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mtu = mtu
 }
 
 // Capabilities implements stack.LinkEndpoint.Capabilities.
@@ -336,11 +359,22 @@ func (e *endpoint) MaxHeaderLength() uint16 {
 // LinkAddress implements stack.LinkEndpoint.LinkAddress. It returns the local
 // link address.
 func (e *endpoint) LinkAddress() tcpip.LinkAddress {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.addr
 }
 
+// SetLinkAddress implements stack.LinkEndpoint.SetLinkAddress.
+func (e *endpoint) SetLinkAddress(addr tcpip.LinkAddress) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.addr = addr
+}
+
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (e *endpoint) AddHeader(pkt stack.PacketBufferPtr) {
+func (e *endpoint) AddHeader(pkt *stack.PacketBuffer) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	// Add ethernet header if needed.
 	if len(e.addr) == 0 {
 		return
@@ -354,13 +388,15 @@ func (e *endpoint) AddHeader(pkt stack.PacketBufferPtr) {
 	})
 }
 
-func (e *endpoint) parseHeader(pkt stack.PacketBufferPtr) bool {
+func (e *endpoint) parseHeader(pkt *stack.PacketBuffer) bool {
 	_, ok := pkt.LinkHeader().Consume(header.EthernetMinimumSize)
 	return ok
 }
 
 // ParseHeader implements stack.LinkEndpoint.ParseHeader.
-func (e *endpoint) ParseHeader(pkt stack.PacketBufferPtr) bool {
+func (e *endpoint) ParseHeader(pkt *stack.PacketBuffer) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	// Add ethernet header if needed.
 	if len(e.addr) == 0 {
 		return true
@@ -369,13 +405,13 @@ func (e *endpoint) ParseHeader(pkt stack.PacketBufferPtr) bool {
 	return e.parseHeader(pkt)
 }
 
-func (e *endpoint) AddVirtioNetHeader(pkt stack.PacketBufferPtr) {
+func (e *endpoint) AddVirtioNetHeader(pkt *stack.PacketBuffer) {
 	virtio := header.VirtioNetHeader(pkt.VirtioNetHeader().Push(header.VirtioNetHeaderSize))
 	virtio.Encode(&header.VirtioNetHeaderFields{})
 }
 
 // +checklocks:e.mu
-func (e *endpoint) writePacketLocked(r stack.RouteInfo, protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) tcpip.Error {
+func (e *endpoint) writePacketLocked(r stack.RouteInfo, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
 	if e.virtioNetHeaderRequired {
 		e.AddVirtioNetHeader(pkt)
 	}
@@ -462,7 +498,10 @@ func (e *endpoint) dispatchLoop(d stack.NetworkDispatcher) {
 		}
 
 		var proto tcpip.NetworkProtocolNumber
-		if len(e.addr) != 0 {
+		e.mu.RLock()
+		addrLen := len(e.addr)
+		e.mu.RUnlock()
+		if addrLen != 0 {
 			if !e.parseHeader(pkt) {
 				pkt.DecRef()
 				continue
@@ -487,7 +526,6 @@ func (e *endpoint) dispatchLoop(d stack.NetworkDispatcher) {
 				continue
 			}
 		}
-
 		// Send packet up the stack.
 		d.DeliverNetworkPacket(proto, pkt)
 		pkt.DecRef()
@@ -515,5 +553,5 @@ func (e *endpoint) GSOMaxSize() uint32 {
 
 // SupportsGSO implements stack.GSOEndpoint.
 func (e *endpoint) SupportedGSO() stack.SupportedGSO {
-	return stack.GvisorGSOSupported
+	return stack.GVisorGSOSupported
 }

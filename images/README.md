@@ -7,7 +7,7 @@ Note that all these images must be pushed to the testing project hosted on
 continuous integration. This will speed up loading as images will not need to be
 built from scratch for each test run.
 
-Image tooling is accessible via `make`, specifically via `images/Makefile`.
+Image tooling is accessible via `make`, specifically via `tools/images.mk`.
 
 ## Why make?
 
@@ -29,7 +29,7 @@ image infrastructure.
 
 The continuous integration system can either take fine-grained dependencies on
 single images via individual `load` targets, or pull all images via a single
-`load-all-images` invocation.
+`load-all-test-images` invocation.
 
 ## Adding new images
 
@@ -52,9 +52,8 @@ if available.
 ## Building and pushing images
 
 All images can be built manually by running `build-<image>` and pushed using
-`push-<image>`. Note that you can also use `build-all-images` and
-`push-all-images`. Note that pushing will require appropriate permissions in the
-project.
+`push-<image>`. Note that you can also use `push-all-images`. Note that pushing
+will require appropriate permissions in the project.
 
 The continuous integration system can either take fine-grained dependencies on
 individual `push` targets, or ensure all images are up-to-date with a single

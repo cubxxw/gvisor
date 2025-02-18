@@ -16,17 +16,18 @@
 package dockerutil
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/test/testutil"
@@ -38,6 +39,9 @@ var (
 	// containers. Note that the default here ("runsc") corresponds to the
 	// default used by the installations.
 	runtime = flag.String("runtime", os.Getenv("RUNTIME"), "specify which runtime to use")
+
+	// dockerCLI is the path to the docker CLI binary.
+	dockerCLI = flag.String("docker_cli", os.Getenv("DOCKER_CLI_PATH"), "path to the docker client command-line binary")
 
 	// config is the default Docker daemon configuration path.
 	config = flag.String("config_path", "/etc/docker/daemon.json", "configuration file for reading paths")
@@ -56,6 +60,7 @@ var (
 	pprofCPU   = flag.Bool("pprof-cpu", false, "enables CPU profiling with runsc debug")
 	pprofHeap  = flag.Bool("pprof-heap", false, "enables heap profiling with runsc debug")
 	pprofMutex = flag.Bool("pprof-mutex", false, "enables mutex profiling with runsc debug")
+	trace      = flag.Bool("go-trace", false, "enables collecting a go trace with runsc debug")
 
 	// This matches the string "native.cgroupdriver=systemd" (including optional
 	// whitespace), which can be found in a docker daemon configuration file's
@@ -63,9 +68,17 @@ var (
 	useSystemdRgx = regexp.MustCompile("\\s*(native\\.cgroupdriver)\\s*=\\s*(systemd)\\s*")
 )
 
+// dockerCLIPath returns the path to the docker CLI binary.
+func dockerCLIPath() string {
+	if *dockerCLI != "" {
+		return *dockerCLI
+	}
+	return "docker"
+}
+
 // PrintDockerConfig prints the whole Docker configuration file to the log.
 func PrintDockerConfig() {
-	configBytes, err := ioutil.ReadFile(*config)
+	configBytes, err := os.ReadFile(*config)
 	if err != nil {
 		log.Fatalf("Cannot read Docker config at %v: %v", *config, err)
 	}
@@ -76,10 +89,10 @@ func PrintDockerConfig() {
 //
 // This logs directly to stderr, as it is typically called from a Main wrapper.
 func EnsureSupportedDockerVersion() {
-	cmd := exec.Command("docker", "version")
+	cmd := exec.Command(dockerCLIPath(), "version")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Fatalf("error running %q: %v", "docker version", err)
+		log.Fatalf("error running %q: %v", dockerCLIPath()+" version", err)
 	}
 	re := regexp.MustCompile(`Version:\s+(\d+)\.(\d+)\.\d.*`)
 	matches := re.FindStringSubmatch(string(out))
@@ -95,10 +108,10 @@ func EnsureSupportedDockerVersion() {
 
 // EnsureDockerExperimentalEnabled ensures that Docker has experimental features enabled.
 func EnsureDockerExperimentalEnabled() {
-	cmd := exec.Command("docker", "version", "--format={{.Server.Experimental}}")
+	cmd := exec.Command(dockerCLIPath(), "version", "--format={{.Server.Experimental}}")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Fatalf("error running %s: %v", "docker version --format='{{.Server.Experimental}}'", err)
+		log.Fatalf("error running %s: %v", dockerCLIPath()+" version --format='{{.Server.Experimental}}'", err)
 	}
 	if strings.TrimSpace(string(out)) != "true" {
 		PrintDockerConfig()
@@ -121,12 +134,51 @@ func RuntimePath() (string, error) {
 	return p, nil
 }
 
+// RuntimeArgs returns the arguments for the current runtime.
+func RuntimeArgs() ([]string, error) {
+	rs, err := runtimeMap()
+	if err != nil {
+		return nil, err
+	}
+	argsAny, ok := rs["runtimeArgs"]
+	if !ok {
+		// The runtime does not have any arguments.
+		return nil, nil
+	}
+	argsAnySlice, ok := argsAny.([]any)
+	if !ok {
+		return nil, fmt.Errorf("runtime arguments should be a list of strings, got: %q (type: %T)", argsAny, argsAny)
+	}
+	args := make([]string, 0, len(argsAnySlice))
+	for i, argAny := range argsAnySlice {
+		arg, ok := argAny.(string)
+		if !ok {
+			return nil, fmt.Errorf("runtime arguments should be a list of strings, got: %q (index %d is %q which has unexpected type %T)", argsAny, i, argAny, argAny)
+		}
+		args = append(args, arg)
+	}
+	return args, nil
+}
+
+// IsGVisorRuntime returns whether the default container runtime used by
+// `dockerutil` is gVisor-based or not.
+func IsGVisorRuntime(ctx context.Context, t *testing.T) (bool, error) {
+	output, err := MakeContainer(ctx, t).Run(ctx, RunOpts{Image: "basic/alpine"}, "dmesg")
+	if err != nil {
+		if strings.Contains(output, "dmesg: klogctl: Operation not permitted") {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to run dmesg: %v (output: %q)", err, output)
+	}
+	return strings.Contains(output, "gVisor"), nil
+}
+
 // UsingSystemdCgroup returns true if the docker configuration has the
 // native.cgroupdriver=systemd option set in "exec-opts", or if the
 // system is using cgroupv2, in which case systemd is the default driver.
 func UsingSystemdCgroup() (bool, error) {
 	// Read the configuration data; the file must exist.
-	configBytes, err := ioutil.ReadFile(*config)
+	configBytes, err := os.ReadFile(*config)
 	if err != nil {
 		return false, err
 	}
@@ -156,7 +208,7 @@ func UsingSystemdCgroup() (bool, error) {
 
 func runtimeMap() (map[string]any, error) {
 	// Read the configuration data; the file must exist.
-	configBytes, err := ioutil.ReadFile(*config)
+	configBytes, err := os.ReadFile(*config)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +250,7 @@ func runtimeMap() (map[string]any, error) {
 //
 // This is called by criutil in order to import imports.
 func Save(logger testutil.Logger, image string, w io.Writer) error {
-	cmd := testutil.Command(logger, "docker", "save", testutil.ImageByName(image))
+	cmd := testutil.Command(logger, dockerCLIPath(), "save", testutil.ImageByName(image))
 	cmd.Stdout = w // Send directly to the writer.
 	return cmd.Run()
 }

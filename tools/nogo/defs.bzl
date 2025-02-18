@@ -1,7 +1,7 @@
 """Nogo rules."""
 
+load("//tools:arch.bzl", "arch_transition")
 load("//tools/bazeldefs:go.bzl", "go_context", "go_embed_libraries", "go_importpath", "go_rule")
-load("//tools:arch.bzl", "arch_transition", "transition_allowlist")
 
 NogoConfigInfo = provider(
     "information about a nogo configuration",
@@ -417,9 +417,6 @@ nogo_test = rule(
         "_target": attr.label(
             default = "//tools/nogo:target",
             cfg = arch_transition,
-        ),
-        "_allowlist_function_transition": attr.label(
-            default = transition_allowlist,
         ),
     },
     test = True,

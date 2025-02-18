@@ -27,12 +27,12 @@ The following `make` targets will run an entire runtime test suite locally.
 Note: java runtime test take 1+ hours with 16 cores.
 
 Language | Version | Running the test suite
--------- | ------- | ----------------------------------
-Go       | 1.20    | `make go1.20-runtime-tests`
-Java     | 17      | `make java17-runtime-tests`
-NodeJS   | 16.13.2 | `make nodejs16.13.2-runtime-tests`
-Php      | 8.1.1   | `make php8.1.1-runtime-tests`
-Python   | 3.10.2  | `make python3.10.2-runtime-tests`
+-------- | ------- | ---------------------------------
+Go       | 1.22    | `make go1.22-runtime-tests`
+Java     | 21      | `make java21-runtime-tests`
+NodeJS   | 22.2.0  | `make nodejs22.2.0-runtime-tests`
+Php      | 8.3.7   | `make php8.3.7-runtime-tests`
+Python   | 3.12.3  | `make python3.12.3-runtime-tests`
 
 You can modify the runtime test behaviors by passing in the following `make`
 variables:
@@ -80,20 +80,22 @@ docker system prune  # Remove unused data.
 
 To bump the version of an existing runtime test:
 
-1.  Create a new [Docker image](runtime-images) for the new runtime version.
-    This will likely look similar to the older version, so start by copying the
-    older one. Update any packages or downloaded urls to point to the new
-    version. Test building the image with `docker build
-    images/runtime/<new_runtime>`
+1.  Update the [Docker image](../../images/runtimes) for with the new runtime
+    version. Rename the `Dockerfile` directory name and update any packages or
+    downloaded urls to point to the new version. Test building the image with
+    `docker build images/runtimes/<new_runtime>`.
 
-2.  Create a new [`runtime_test`](BUILD) target. The `name` field must be the
-    dirctory name for the Docker image you created in Step 1.
+2.  Update [`runtime_test`](BUILD) target. The `name` field must be the
+    directory name for the `Dockerfile` created in Step 1.
 
-3.  Run the tests, and triage any failures. Some language tests are flaky (or
+3.  Update [Buildkite pipeline](../../.buildkite/pipeline.yaml).
+
+4.  Run the tests, and triage any failures. Some language tests are flaky (or
     never pass at all), other failures may indicate a gVisor bug or divergence
-    from Linux behavior. Known or expected failures can be added to the
-    [exclude](exclude) file for the new version, and they will be skipped in
-    future runs.
+    from Linux behavior.
+
+5.  Update the [exclude](exclude) file by renaming it with the right version and
+    adding any failing tests to it with a reason.
 
 ### Cleaning up exclude files
 
@@ -128,5 +130,3 @@ except that Step 1 is a bit harder. You have to figure out how to download and
 run the language tests in a Docker container. Once you have that, you must also
 implement the [`proctor/TestRunner`](proctor/lib/lib.go) interface for that
 language, so that proctor can list and run the tests in the image you created.
-
-[runtime-images]: ../../images/runtimes/

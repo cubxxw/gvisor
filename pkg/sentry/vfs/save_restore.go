@@ -15,6 +15,8 @@
 package vfs
 
 import (
+	goContext "context"
+	"fmt"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/context"
@@ -32,6 +34,18 @@ type ErrCorruption struct {
 // Error returns a sensible description of the restore error.
 func (e ErrCorruption) Error() string {
 	return "restore failed due to external file system state in corruption: " + e.Err.Error()
+}
+
+// PrependErrMsg prepends the passed prefix to the error while preserving
+// special vfs errors as the outer most error.
+func PrependErrMsg(prefix string, err error) error {
+	switch terr := err.(type) {
+	case ErrCorruption:
+		terr.Err = fmt.Errorf("%s: %w", prefix, terr.Err)
+		return terr
+	default:
+		return fmt.Errorf("%s: %w", prefix, err)
+	}
 }
 
 // FilesystemImplSaveRestoreExtension is an optional extension to
@@ -66,7 +80,7 @@ func (vfs *VirtualFilesystem) CompleteRestore(ctx context.Context, opts *Complet
 		if ext, ok := fs.impl.(FilesystemImplSaveRestoreExtension); ok {
 			if err := ext.CompleteRestore(ctx, *opts); err != nil {
 				fs.DecRef(ctx)
-				return err
+				return PrependErrMsg(fmt.Sprintf("failed to complete restore for filesystem type %q", fs.fsType.Name()), err)
 			}
 		}
 		fs.DecRef(ctx)
@@ -106,8 +120,18 @@ func (vfs *VirtualFilesystem) saveMounts() []*Mount {
 // saveKey is called by stateify.
 func (mnt *Mount) saveKey() VirtualDentry { return mnt.getKey() }
 
+// saveMountPromises is called by stateify.
+func (vfs *VirtualFilesystem) saveMountPromises() map[VirtualDentry]*mountPromise {
+	m := make(map[VirtualDentry]*mountPromise)
+	vfs.mountPromises.Range(func(key any, val any) bool {
+		m[key.(VirtualDentry)] = val.(*mountPromise)
+		return true
+	})
+	return m
+}
+
 // loadMounts is called by stateify.
-func (vfs *VirtualFilesystem) loadMounts(mounts []*Mount) {
+func (vfs *VirtualFilesystem) loadMounts(_ goContext.Context, mounts []*Mount) {
 	if mounts == nil {
 		return
 	}
@@ -118,18 +142,40 @@ func (vfs *VirtualFilesystem) loadMounts(mounts []*Mount) {
 }
 
 // loadKey is called by stateify.
-func (mnt *Mount) loadKey(vd VirtualDentry) { mnt.setKey(vd) }
+func (mnt *Mount) loadKey(_ goContext.Context, vd VirtualDentry) { mnt.setKey(vd) }
+
+// loadMountPromises is called by stateify.
+func (vfs *VirtualFilesystem) loadMountPromises(_ goContext.Context, mps map[VirtualDentry]*mountPromise) {
+	for vd, mp := range mps {
+		vfs.mountPromises.Store(vd, mp)
+	}
+}
 
 // afterLoad is called by stateify.
-func (mnt *Mount) afterLoad() {
+func (mnt *Mount) afterLoad(goContext.Context) {
 	if mnt.refs.Load() != 0 {
 		refs.Register(mnt)
 	}
 }
 
 // afterLoad is called by stateify.
-func (epi *epollInterest) afterLoad() {
+func (epi *epollInterest) afterLoad(goContext.Context) {
 	// Mark all epollInterests as ready after restore so that the next call to
 	// EpollInstance.ReadEvents() rechecks their readiness.
 	epi.waiter.NotifyEvent(waiter.EventMaskFromLinux(epi.mask))
+}
+
+// RestoreID is a unique ID that is used to identify resources between save/restore sessions.
+// Example of resources are host files, gofer connection for mount points, etc.
+//
+// +stateify savable
+type RestoreID struct {
+	// ContainerName is the name of the container that the resource belongs to.
+	ContainerName string
+	// Path is the path of the resource.
+	Path string
+}
+
+func (f RestoreID) String() string {
+	return fmt.Sprintf("%s:%s", f.ContainerName, f.Path)
 }
