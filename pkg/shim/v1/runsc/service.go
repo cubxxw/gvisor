@@ -532,13 +532,13 @@ func (s *runscService) checkProcesses(ctx context.Context, e proc.Exit) {
 	// Find the container whose process exited.
 	s.mu.Lock()
 	var (
-		exitingCID string
-		exitingP   process.Process
+		containerID string
+		exitingP    process.Process
 	)
 	for cid, c := range s.containers {
 		for _, p := range c.All() {
 			if p.ID() == e.ID {
-				exitingCID = cid
+				containerID = cid
 				exitingP = p
 				break
 			}
@@ -574,11 +574,11 @@ func (s *runscService) checkProcesses(ctx context.Context, e proc.Exit) {
 	// ContainerID="", containerd's CRI would drop the TaskOOM at
 	// containerStore.Get("") → ErrEmptyPrefix, and kubelet would report
 	// reason:Error instead of reason:OOMKilled.
-	if isInit && s.oomPoller.isOOM(exitingCID) {
-		s.send(&events.TaskOOM{ContainerID: exitingCID})
+	if isInit && s.oomPoller.isOOM(containerID) {
+		s.send(&events.TaskOOM{ContainerID: containerID})
 	}
 	s.send(&events.TaskExit{
-		ContainerID: exitingCID,
+		ContainerID: containerID,
 		ID:          p.ID(),
 		Pid:         uint32(p.Pid()),
 		ExitStatus:  uint32(e.Status),
