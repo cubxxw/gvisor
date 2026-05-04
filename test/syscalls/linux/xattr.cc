@@ -15,7 +15,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdint.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -46,6 +49,7 @@ using ::gvisor::testing::IsTmpfs;
 using ::testing::AnyOf;
 
 constexpr char kUnshareAndSetTrustedXattrInNewUserns[] = "--set_trusted_xattr";
+constexpr int kNobodyUID = 65534;
 
 class XattrTest : public FileTest {};
 
@@ -123,6 +127,52 @@ TEST_F(XattrTest, SecurityCapacityXattr) {
   EXPECT_THAT(lgetxattr(path, name, &buf, /*size=*/128),
               SyscallFailsWithErrno(AnyOf(ENODATA, EOPNOTSUPP)));
   EXPECT_THAT(lremovexattr(path, name), SyscallFailsWithErrno(EOPNOTSUPP));
+}
+
+TEST_F(XattrTest, WriteRemovesSecurityCapability) {
+  SKIP_IF(getuid() != 0);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETFCAP)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+
+  const char* path = test_file_name_.c_str();
+  const char name[] = "security.capability";
+
+  struct {
+    uint32_t magic_etc;
+    uint32_t permitted_lo;
+    uint32_t inheritable_lo;
+    uint32_t permitted_hi;
+    uint32_t inheritable_hi;
+  } cap_data = {};
+  cap_data.magic_etc = 0x02000000 | 0x000001;  // VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE
+  cap_data.permitted_lo = 1 << 7;               // CAP_SETUID
+
+  ASSERT_THAT(chmod(path, 0666), SyscallSucceeds());
+  ASSERT_THAT(setxattr(path, name, &cap_data, sizeof(cap_data), 0),
+              SyscallSucceeds());
+
+  char buf[sizeof(cap_data)] = {};
+  ASSERT_THAT(getxattr(path, name, buf, sizeof(buf)),
+              SyscallSucceedsWithValue(sizeof(cap_data)));
+
+  pid_t pid = fork();
+  ASSERT_THAT(pid, SyscallSucceeds());
+  if (pid == 0) {
+    if (syscall(SYS_setuid, kNobodyUID) < 0) _exit(1);
+    char data[] = "overwritten";
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) _exit(2);
+    if (write(fd, data, sizeof(data)) < 0) _exit(3);
+    close(fd);
+    _exit(0);
+  }
+  int status;
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceedsWithValue(pid));
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "child exited with status " << status;
+
+  EXPECT_THAT(getxattr(path, name, buf, sizeof(buf)),
+              SyscallFailsWithErrno(ENODATA));
 }
 
 // Do not allow save/restore cycles after making the test file read-only, as
