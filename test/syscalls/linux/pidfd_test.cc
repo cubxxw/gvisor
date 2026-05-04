@@ -20,9 +20,11 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -1168,6 +1170,23 @@ TEST(PidfdTest, PidfdThreadTracedLeaderNotification) {
   // Tracer's ack of the exit.
   ASSERT_THAT(waitpid(child, &status, 0), SyscallSucceedsWithValue(child));
   ASSERT_TRUE(WIFEXITED(status));
+}
+
+TEST(PidfdTest, FasyncIsUnsupported) {
+  pid_t child;
+  auto pidfd = ASSERT_NO_ERRNO_AND_VALUE(Clone3Pidfd(child, []() {
+    pause();
+    _exit(0);
+  }));
+  ScopedChildReaper cleanup(child);
+
+  int flags = fcntl(pidfd.get(), F_GETFL);
+  ASSERT_THAT(flags, SyscallSucceeds());
+  ASSERT_THAT(fcntl(pidfd.get(), F_SETFL, flags | FASYNC), SyscallSucceeds());
+  int who = getpid();
+
+  EXPECT_THAT(ioctl(pidfd.get(), FIOSETOWN, &who),
+              SyscallFailsWithErrno(ENOTTY));
 }
 
 }  // namespace
