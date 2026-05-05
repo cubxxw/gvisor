@@ -264,10 +264,9 @@ func SaveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode) error {
 	contID := leader.ContainerID()
 	mntns := leader.MountNamespace()
 	if mntns == nil || !mntns.TryIncRef() {
-		log.Warningf("PID %d in container %q has exited, skipping CUDA checkpoint for it", leader.ThreadGroup().ID(), contID)
+		log.Warningf("PID %d in container %q has exited, skipping save/restore exec for it", leader.ThreadGroup().ID(), contID)
 		return nil
 	}
-	mntns.IncRef()
 	root := mntns.Root(sctx)
 	cu := cleanup.Make(func() {
 		root.DecRef(sctx)
