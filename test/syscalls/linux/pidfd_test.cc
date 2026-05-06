@@ -1200,8 +1200,16 @@ TEST(PidfdTest, FasyncIsUnsupported) {
   ASSERT_THAT(fcntl(pidfd.get(), F_SETFL, flags | FASYNC), SyscallSucceeds());
   int who = getpid();
 
+  int want_errno = EINVAL;
+  if (!IsRunningOnGvisor()) {
+    KernelVersion version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+    if (version.major < 6 || (version.major == 6 && version.minor < 9)) {
+      want_errno = ENOTTY;
+    }
+  }
+
   EXPECT_THAT(ioctl(pidfd.get(), FIOSETOWN, &who),
-              SyscallFailsWithErrno(ENOTTY));
+              SyscallFailsWithErrno(want_errno));
 }
 
 }  // namespace
