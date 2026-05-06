@@ -712,6 +712,46 @@ func (t *TestCluster) applyCommonPodConfigurations(ctx context.Context, np *Node
 	}
 	// Apply the runtime we've chosen, whether by override or autodetection.
 	applyRuntime.ApplyPodSpec(podSpec)
+	if applyRuntime.RequiresExplicitResourceLimits() {
+		const (
+			overheadMargin = 0.2
+			leftoverRatio  = 1.0 - overheadMargin
+		)
+		cores := int(float64(np.spec.NumCores) * leftoverRatio)
+		if cores < 1 {
+			cores = 1
+		}
+		memMiB := int(float64(np.spec.MemoryGiB) * 1024 * leftoverRatio)
+		resCPU := resource.MustParse(fmt.Sprintf("%d", cores))
+		resMem := resource.MustParse(fmt.Sprintf("%dMi", memMiB))
+		for _, containers := range [][]v13.Container{
+			podSpec.InitContainers,
+			podSpec.Containers,
+		} {
+			for i := range containers {
+				if containers[i].Resources.Limits == nil {
+					containers[i].Resources.Limits = make(v13.ResourceList)
+				}
+				if containers[i].Resources.Requests == nil {
+					containers[i].Resources.Requests = make(v13.ResourceList)
+				}
+				for _, res := range []struct {
+					key v13.ResourceName
+					val resource.Quantity
+				}{
+					{v13.ResourceCPU, resCPU},
+					{v13.ResourceMemory, resMem},
+				} {
+					if _, ok := containers[i].Resources.Requests[res.key]; !ok {
+						containers[i].Resources.Requests[res.key] = res.val
+					}
+					if _, ok := containers[i].Resources.Limits[res.key]; !ok {
+						containers[i].Resources.Limits[res.key] = res.val
+					}
+				}
+			}
+		}
+	}
 
 	// If the nodepool has accelerators, copy the number of them as a node
 	// selector option.

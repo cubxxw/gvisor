@@ -408,6 +408,13 @@ func (t RuntimeType) KataShimName() (string, error) {
 	}
 }
 
+// RequiresExplicitResourceLimits returns true if the runtime requires
+// explicit resource limits on pods in order to function correctly.
+func (t RuntimeType) RequiresExplicitResourceLimits() bool {
+	// Kata containers requires VMs which require explicit sizing.
+	return t.IsKata()
+}
+
 // ApplyNodepool modifies the nodepool to configure it to use the runtime.
 func (t RuntimeType) ApplyNodepool(nodepool *cspb.NodePool) {
 	if nodepool.GetConfig().GetLabels() == nil {
