@@ -172,6 +172,7 @@ go_test(
         "//pkg/sentry/control",
         "//pkg/sentry/kernel/auth",
         "//pkg/test/testutil",
+        "//runsc/boot",
         "//runsc/cmd/sandboxsetup",
         "//runsc/cmd/util",
         "//runsc/config",
