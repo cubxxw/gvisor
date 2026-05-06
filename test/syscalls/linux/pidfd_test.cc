@@ -47,6 +47,7 @@
 #include "test/util/file_descriptor.h"
 #include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
+#include "test/util/memory_util.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/test_util.h"
@@ -316,6 +317,20 @@ TEST(PidfdTest, SendSignalViaPidfdOpenPidfdToDeadChildFails) {
 
   EXPECT_THAT(PidfdSendSignal(pidfd.get(), 0, nullptr, 0),
               SyscallFailsWithErrno(ESRCH));
+}
+
+TEST(PidfdTest, Clone3InvalidFdAddrFails) {
+  auto mapping =
+      ASSERT_NO_ERRNO_AND_VALUE(MmapAnon(kPageSize, PROT_NONE, MAP_PRIVATE));
+
+  clone_args ca = {};
+  ca.flags = CLONE_PIDFD;
+  ca.exit_signal = SIGCHLD;
+  ca.pidfd = static_cast<uint64_t>(mapping.addr());
+
+  pid_t child = syscall(SYS_clone3, &ca, sizeof(ca));
+  ASSERT_LT(child, 0);
+  EXPECT_EQ(errno, EFAULT);
 }
 
 TEST(PidfdTest, SendSignalToDeadChildFails) {
