@@ -498,7 +498,7 @@ else
 		sudo tar -C "$$(dirname $$(which containerd))" -zxvf - containerd-shim-runsc-v1
 endif
 	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME) -test.v)
-containerd-tests-min: containerd-test-1.6.2
+containerd-tests-min: containerd-test-1.7.31
 
 # Test runsc go binding.
 go-binding-test: $(RUNTIME_BIN)
