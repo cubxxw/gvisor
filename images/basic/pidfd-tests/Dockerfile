@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /src/linux
 RUN git init && \
-    git remote add origin https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git && \
+    git remote add origin https://github.com/torvalds/linux.git && \
     git sparse-checkout init --cone && \
     git sparse-checkout set \
         tools/testing/selftests \
