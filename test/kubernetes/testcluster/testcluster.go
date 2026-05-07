@@ -30,6 +30,7 @@ import (
 	testpb "gvisor.dev/gvisor/test/kubernetes/test_range_config_go_proto"
 	appsv1 "k8s.io/api/apps/v1"
 	v13 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -1146,4 +1147,16 @@ Outer:
 		return loopError
 	}
 	return groupErr
+}
+
+// ListPodEvents lists the events for a given pod.
+func (t *TestCluster) ListPodEvents(ctx context.Context, pod *v13.Pod) (*eventsv1.EventList, error) {
+	return request(ctx, t.client, func(ctx context.Context, client kubernetes.Interface) (*eventsv1.EventList, error) {
+		// Using `events.k8s.io/v1` rather than the `v1.Event` API is required for
+		// microsecond-level timestamps.
+		return client.EventsV1().Events(pod.GetNamespace()).List(ctx, v1.ListOptions{
+			// `events.k8s.io/v1` uses "regarding" instead of "involvedObject".
+			FieldSelector: fmt.Sprintf("regarding.name=%s", pod.Name),
+		})
+	})
 }
