@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/capability.h>
 #include <stdint.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -144,9 +145,8 @@ TEST_F(XattrTest, WriteRemovesSecurityCapability) {
     uint32_t permitted_hi;
     uint32_t inheritable_hi;
   } cap_data = {};
-  cap_data.magic_etc =
-      0x02000000 | 0x000001;  // VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE
-  cap_data.permitted_lo = 1 << 7;  // CAP_SETUID
+  cap_data.magic_etc = VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE;
+  cap_data.permitted_lo = 1 << CAP_SETUID;
 
   ASSERT_THAT(chmod(path, 0666), SyscallSucceeds());
   ASSERT_THAT(setxattr(path, name, &cap_data, sizeof(cap_data), 0),
