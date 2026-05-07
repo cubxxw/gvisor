@@ -15,11 +15,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <linux/capability.h>
 #include <stdint.h>
 #include <sys/types.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
+#include <string>
 #include <vector>
 
 #include "gmock/gmock.h"
@@ -53,7 +55,7 @@ struct VfsCapData {
 
 int SetSecurityCapability(const std::string& path) {
   VfsCapData cap_data = {};
-  cap_data.magic_etc = 0x02000000 | 0x000001;
+  cap_data.magic_etc = VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE;
   cap_data.permitted_lo = 1u << CAP_SETUID;
 
   if (setxattr(path.c_str(), "security.capability", &cap_data, sizeof(cap_data),
