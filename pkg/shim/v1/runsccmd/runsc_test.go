@@ -17,6 +17,7 @@
 package runsccmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -83,5 +84,40 @@ exit 0
 	}
 	if got.Memory == nil || got.Memory.Limit == nil || *got.Memory.Limit != limit {
 		t.Fatalf("stdin resources: got %+v, want memory limit %d", got.Memory, limit)
+	}
+}
+
+func TestNetworkConfig(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	script := filepath.Join(dir, "fake-runsc")
+	scriptBody := `#!/bin/sh
+case "$*" in
+  *network-config*)
+    printf '{"data":"network-config-output"}'
+    exit 0
+    ;;
+  *)
+    printf 'unexpected args: %s' "$*" >&2
+    exit 1
+    ;;
+esac
+`
+	if err := os.WriteFile(script, []byte(scriptBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &Runsc{
+		Command: script,
+		Root:    filepath.Join(dir, "root"),
+	}
+	got, err := r.NetworkConfig(ctx, "cid-1")
+	if err != nil {
+		t.Fatalf("NetworkConfig: %v", err)
+	}
+
+	want := []byte(`{"data":"network-config-output"}`)
+	if !bytes.Equal(got, want) {
+		t.Errorf("NetworkConfig() got %q, want %q", string(got), string(want))
 	}
 }
