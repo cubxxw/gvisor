@@ -254,7 +254,7 @@ func (r *restorer) restore(l *Loader) error {
 		}
 	}
 
-	log.Debugf("Restore using fdmap: %v", fdmap)
+	log.Debugf("Restore using fdmap: %#v", fdmap)
 	ctx := l.k.SupervisorContext()
 	ctx = context.WithValue(ctx, vfs.CtxRestoreFilesystemFDMap, fdmap)
 	log.Debugf("Restore using mfmap: %v", mfmap)
