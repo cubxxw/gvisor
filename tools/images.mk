@@ -31,11 +31,15 @@
 # ARCH is the architecture used for the build. This may be overridden at the
 # command line in order to perform a cross-build (in a limited capacity).
 ARCH := $(shell uname -m)
-ifneq ($(ARCH),$(shell uname -m))
-DOCKER_PLATFORM_ARGS := --platform=$(ARCH)
+ifeq ($(ARCH),x86_64)
+  DOCKER_ARCH := amd64
+else ifeq ($(ARCH),aarch64)
+  DOCKER_ARCH := arm64
 else
-DOCKER_PLATFORM_ARGS :=
+  DOCKER_ARCH := $(ARCH)
 endif
+DOCKER_PLATFORM_ARGS := --platform=linux/$(DOCKER_ARCH)
+
 
 DOCKER_BUILD_ARGS ?=
 
