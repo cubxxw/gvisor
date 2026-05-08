@@ -208,9 +208,9 @@ DOCKER_PUSH_AS_LATEST ?= false
 push-%:
 	$(call image_manifest,$*) >&2 || \
 	( $(call rebuild,$*) && \
-	  docker image push $(call remote_image,$*):$(call tag,$*) >&2 && \
+	  docker image push $(DOCKER_PLATFORM_ARGS) $(call remote_image,$*):$(call tag,$*) >&2 && \
 	  ( test $(DOCKER_PUSH_AS_LATEST) '!=' true || \
-	    docker image push $(call remote_image,$*):latest >&2 \
+	    docker image push $(DOCKER_PLATFORM_ARGS) $(call remote_image,$*):latest >&2 \
 	  ) \
 	)
 
