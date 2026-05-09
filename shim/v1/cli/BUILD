@@ -14,6 +14,7 @@ go_library(
     ],
     deps = [
         "//pkg/shim/v1",
+        "//pkg/shim/v1/plugin",
         "@com_github_containerd_containerd//runtime/v2/shim:go_default_library",
     ],
 )
