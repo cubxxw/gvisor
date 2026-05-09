@@ -946,6 +946,9 @@ func runPodStartup(t *testing.T, enableGrouping bool, numPods, numContsPerPod in
 // TestShimGroupingPerformance measures startup time difference with and
 // without shim grouping.
 func TestShimGroupingPerformance(t *testing.T) {
+	if os.Getenv("RUN_SHIM_GROUPING_PERFORMANCE_TEST") != "true" {
+		t.Skip("skipping grouping performance test")
+	}
 	const numPods = 10
 	const numContsPerPod = 5
 	var durationWithGrouping, durationWithoutGrouping time.Duration

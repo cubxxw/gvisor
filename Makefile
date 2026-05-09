@@ -500,6 +500,10 @@ endif
 	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME) -test.v)
 containerd-tests-min: containerd-test-1.7.31
 
+containerd-performance-test-%:
+	@export RUN_SHIM_GROUPING_PERFORMANCE_TEST=true; $(MAKE) containerd-test-$*
+.PHONY: containerd-performance-test-%
+
 # Test runsc go binding.
 go-binding-test: $(RUNTIME_BIN)
 	@export RUNSC_PATH="$(RUNTIME_BIN)"; $(call sudo,test/root:go_binding_test, -test.v $(ARGS))
