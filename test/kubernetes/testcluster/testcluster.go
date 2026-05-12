@@ -69,6 +69,10 @@ type NodePoolType string
 
 // Nodepool names.
 const (
+	// DefaultNodepoolName is the value that marks the default nodepool, which must exist
+	// in the cluster to house system components.
+	DefaultNodepoolName NodePoolType = "default-nodepool"
+
 	// TestRuntimeNodepoolName is the value that marks a "test-runtime-nodepool", or a nodepool where
 	// w/ the runtime under test.
 	TestRuntimeNodepoolName NodePoolType = "test-runtime-nodepool"
