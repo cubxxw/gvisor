@@ -157,7 +157,10 @@ func newPipeFD(ctx context.Context, mode linux.FileMode) (*vfs.FileDescription, 
 }
 
 func TestParseSize(t *testing.T) {
-	var tests = []struct {
+	// 4 GiB of host memory
+	SetTotalHostMem(4096 * 1024 * 1024)
+
+	tests := []struct {
 		s         string
 		want      uint64
 		wantError bool
@@ -169,6 +172,7 @@ func TestParseSize(t *testing.T) {
 		{"5t", (5 * 1024 * 1024 * 1024 * 1024), false},
 		{"5P", (5 * 1024 * 1024 * 1024 * 1024 * 1024), false},
 		{"5e", (5 * 1024 * 1024 * 1024 * 1024 * 1024 * 1024), false},
+		{"5%", (5 * (totalHostMem / 100)), false},
 		{"5e3", 0, true},
 		{"", 0, true},
 		{"9999999999999999P", 0, true},

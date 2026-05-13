@@ -42,6 +42,7 @@ import (
 	"gvisor.dev/gvisor/pkg/control/server"
 	"gvisor.dev/gvisor/pkg/coverage"
 	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/hostos"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/sentry/control"
@@ -1250,7 +1251,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		cmd.Args = append(cmd.Args, "--profiling-metrics-fd-lossy=false")
 	}
 
-	totalSysMem, err := totalSystemMemory()
+	totalSysMem, err := hostos.TotalSystemMemory()
 	if err != nil {
 		return err
 	}
