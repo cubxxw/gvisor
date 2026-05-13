@@ -260,10 +260,12 @@ func (r *restorer) restore(l *Loader) error {
 
 	log.Debugf("Restore using fdmap: %#v", fdmap)
 	ctx := l.k.SupervisorContext()
-	ctx = context.WithValue(ctx, vfs.CtxRestoreFilesystemFDMap, fdmap)
 	log.Debugf("Restore using mfmap: %v", mfmap)
-	ctx = context.WithValue(ctx, pgalloc.CtxMemoryFileMap, mfmap)
-	ctx = context.WithValue(ctx, devutil.CtxDevGoferClientProvider, l.k)
+	ctx = context.WithValues(ctx, map[any]any{
+		vfs.CtxRestoreFilesystemFDMap:     fdmap,
+		pgalloc.CtxMemoryFileMap:          mfmap,
+		devutil.CtxDevGoferClientProvider: l.k,
+	})
 
 	if r.asyncMFLoader != nil {
 		// Now that private memory files are known, kick off their loading in the
