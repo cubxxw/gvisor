@@ -424,6 +424,9 @@ type Args struct {
 
 	SaveFDs      []*fd.FD
 	FSRestoreFDs []*fd.FD
+	// If FSRestoreCheckpointGofer is true, Args.FSRestoreFDs contains only one
+	// FD, which is a socket connected to a checkpoint gofer.
+	FSRestoreCheckpointGofer bool
 
 	ArgsExtra
 
@@ -532,7 +535,7 @@ func New(args Args) (*Loader, error) {
 	// Start filesystem checkpoint restore as soon as possible to maximize
 	// parallel loading.
 	if len(args.FSRestoreFDs) != 0 {
-		fsrOpts, err := makeFSRestoreOptsImpl(&args)
+		fsrOpts, err := makeFSRestoreOpts(&args)
 		if err != nil {
 			return nil, fmt.Errorf("failed to set up filesystem checkpoint restore: %w", err)
 		}

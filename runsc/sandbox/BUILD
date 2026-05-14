@@ -48,6 +48,7 @@ go_library(
         "//runsc/boot",
         "//runsc/boot/procfs",
         "//runsc/cgroup",
+        "//runsc/checkpointgofer",
         "//runsc/config",
         "//runsc/console",
         "//runsc/donation",

@@ -1,4 +1,4 @@
-// Copyright 2026 The gVisor Authors.
+// Copyright 2025 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,21 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !false
-// +build !false
-
-package boot
-
-import (
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
-)
-
-type FSSaveArgsExtra struct{}
-
-func setKernelFSSaveOptsFilesImpl(args *FSSaveArgs, opts *kernel.FSSaveOpts) error {
-	return setKernelFSSaveOptsFilesForLocalCheckpoint(args, opts)
-}
-
-func makeFSRestoreOptsImpl(args *Args) (fsRestoreOpts, error) {
-	return makeFSRestoreOptsForLocalCheckpoint(args)
-}
+// Package stateipc proxies stateio interfaces across process boundaries. It
+// uses URPC to negotiate per-file Flipcall connections that carry I/O
+// submissions and completions. Servers perform reads to / writes from local
+// mappings of client-provided files to avoid unnecessary copying of data.
+package stateipc
