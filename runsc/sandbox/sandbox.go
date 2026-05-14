@@ -525,7 +525,7 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 }
 
 // Restore sends the restore call for a container in the sandbox.
-func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, direct, background bool) error {
+func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, direct, background bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
 	if err := hostsettings.Handle(conf); err != nil {
 		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
 	}
@@ -559,14 +559,21 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	}
 	defer conn.Close()
 
-	var disableIPv6 bool
-	disableIPv6, err = getDisableIPv6(spec)
-	if err != nil {
-		return err
-	}
-	// Configure the network.
-	if err := setupNetwork(conn, s.Pid.Load(), conf, disableIPv6); err != nil {
-		return fmt.Errorf("setting up network: %w", err)
+	if networkArgs == nil {
+		var disableIPv6 bool
+		disableIPv6, err = getDisableIPv6(spec)
+		if err != nil {
+			return err
+		}
+		// Configure the network.
+		if err := setupNetwork(conn, s.Pid.Load(), conf, disableIPv6); err != nil {
+			return fmt.Errorf("setting up network: %w", err)
+		}
+	} else {
+		log.Debugf("Setting up network, config: %+v", networkArgs)
+		if err := conn.Call(boot.ContMgrCreateLinksAndRoutes, networkArgs, nil); err != nil {
+			return fmt.Errorf("creating links and routes: %w", err)
+		}
 	}
 
 	// Restore the container and start the root container.
