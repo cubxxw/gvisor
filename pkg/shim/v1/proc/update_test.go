@@ -19,9 +19,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/containerd/containerd/pkg/stdio"
+	"github.com/containerd/containerd/v2/pkg/protobuf/types"
+	"github.com/containerd/containerd/v2/pkg/stdio"
 	"github.com/containerd/errdefs"
-	"github.com/gogo/protobuf/types"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
 )
 

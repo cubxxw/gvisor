@@ -18,7 +18,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/containerd/containerd/runtime/v2/task"
+	task "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/errdefs"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/shim/v1/utils"
