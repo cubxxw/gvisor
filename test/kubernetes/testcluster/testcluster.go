@@ -297,6 +297,14 @@ func (t *TestCluster) OverrideTestNodepoolRuntime(testRuntime RuntimeType) {
 	t.testNodepoolRuntimeOverride = testRuntime
 }
 
+// Do executes a function with a Kubernetes client.
+func (t *TestCluster) Do(ctx context.Context, fn func(ctx context.Context, client kubernetes.Interface) error) error {
+	_, err := request(ctx, t.client, func(ctx context.Context, client kubernetes.Interface) (bool, error) {
+		return true, fn(ctx, client)
+	})
+	return err
+}
+
 // createNamespace creates a namespace.
 func (t *TestCluster) createNamespace(ctx context.Context, namespace *v13.Namespace) (*v13.Namespace, error) {
 	return request(ctx, t.client, func(ctx context.Context, client kubernetes.Interface) (*v13.Namespace, error) {
