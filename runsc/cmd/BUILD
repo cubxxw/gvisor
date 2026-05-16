@@ -93,6 +93,7 @@ go_library(
         "//pkg/cpuid",
         "//pkg/fd",
         "//pkg/hostarch",
+        "//pkg/lisafs",
         "//pkg/log",
         "//pkg/metric",
         "//pkg/prometheus",

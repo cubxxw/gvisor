@@ -170,6 +170,7 @@ go_test(
         "//pkg/control/server",
         "//pkg/cpuid",
         "//pkg/fspath",
+        "//pkg/lisafs",
         "//pkg/log",
         "//pkg/sentry/fsimpl/erofs",
         "//pkg/sentry/kernel/auth",
