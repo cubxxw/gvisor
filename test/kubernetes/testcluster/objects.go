@@ -139,7 +139,7 @@ func (n *Namespace) NewPod(name string) *v13.Pod {
 
 // GetPersistentVolume gets a persistent volume spec for benchmarks.
 func (n *Namespace) GetPersistentVolume(name, size string) *v13.PersistentVolumeClaim {
-	return &v13.PersistentVolumeClaim{
+	pvc := &v13.PersistentVolumeClaim{
 		TypeMeta: v1.TypeMeta{
 			Kind:       "PersistentVolumeClaim",
 			APIVersion: apiV1,
@@ -150,13 +150,24 @@ func (n *Namespace) GetPersistentVolume(name, size string) *v13.PersistentVolume
 		},
 		Spec: v13.PersistentVolumeClaimSpec{
 			AccessModes: []v13.PersistentVolumeAccessMode{v13.ReadWriteOnce},
-			Resources: v13.ResourceRequirements{
-				Requests: v13.ResourceList{
-					v13.ResourceStorage: resource.MustParse(size),
-				},
-			},
 		},
 	}
+
+	// Use reflection to set Spec.Resources.Requests in a compatible way for
+	// both k8s.io/api v0.23 (ResourceRequirements) and v0.32+
+	// (VolumeResourceRequirements).
+	vSpec := reflect.ValueOf(&pvc.Spec).Elem()
+	vResources := vSpec.FieldByName("Resources")
+	if vResources.IsValid() {
+		vRequests := vResources.FieldByName("Requests")
+		if vRequests.IsValid() && vRequests.CanSet() {
+			reqs := v13.ResourceList{
+				v13.ResourceStorage: resource.MustParse(size),
+			}
+			vRequests.Set(reflect.ValueOf(reqs))
+		}
+	}
+	return pvc
 }
 
 // GetService gets a service spec for benchmarks.
